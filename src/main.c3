@@ -9,38 +9,44 @@ enum PortType : uint {
   AUXILIARY
 }
 
+enum AgentType {
+  REPLICATOR,
+  FAN,
+  ERRASER,
+
+}
 
 struct AuxiliaryPortProperties {
   uint position;
   uint deltaLevel;
 }
 
-
 struct Endpoint {
   uint nodeId;
+  uint wireId;
   PortType port;
   Maybe{AuxiliaryPortProperties} properties;
 }
 
-
 struct Wire {
-  Endpoint[] edges;
+  uint a;
+  uint b;
   bool alive;
 }
 
 struct Fan {
-  Wire principal;
-  Wire left;
-  Wire right;
+  uint principal;
+  uint left;
+  uint right;
 }
 
 struct Erraser {
-  Wire wireId;
+  uint wireId;
 }
 
 struct Replicator {
-  Wire [] wireId;
-  Wire principal;
+  uint [] auxilaries;
+  uint principal;
   uint level_delta;
 
 }
@@ -50,6 +56,19 @@ union Agent {
   Erraser erraser;
   Replicator replicator;
 }
+
+struct Node {
+  Agent agent;
+  AgentType type;
+}
+
+struct Net {
+
+  Endpoint [] endpoints;
+  Wire [] wires ;
+  Node [] nodes;
+}
+
 
 
 fn int main(String[] args)
