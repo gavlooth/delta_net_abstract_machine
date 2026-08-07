@@ -16,17 +16,18 @@ enum AgentType {
 
 }
 
-struct AuxiliaryPortProperties {
-  uint position;
-  uint deltaLevel;
-}
-
 struct Port {
   uint nodeId;
   uint wireId;
   PortType port;
   Maybe{AuxiliaryPortProperties} properties;
 }
+
+struct AuxiliaryPortProperties {
+  uint position;
+  uint deltaLevel;
+}
+
 
 struct Wire {
   uint a;
@@ -47,8 +48,6 @@ struct Erraser {
 struct Replicator {
   uint [] auxilaries;
   uint principal;
-  uint level_delta;
-
 }
 
 union Agent {
@@ -63,10 +62,48 @@ struct Node {
 }
 
 struct Net {
+  List{Port} ports;
+  List{Wire} wires;
+  List{Node} nodes;
+}
 
-  Port [] ports;
-  Wire [] wires ;
-  Node [] nodes;
+
+
+
+fn void interact (Net net, uint node_id)  {
+  Node node = net.nodes[node_id];
+
+  switch (node.type)  {
+  case  ERRASER:
+    io::printn("Erraser");
+    uint wire_id = node.agent.erraser.wireId ;
+    Wire wire = net.wires[wire_id];
+    Port port_a = net.ports[wire.a];
+    Port the_port  =  (port_a.nodeId != node_id) ? port_a : net.ports[wire.b];
+    Node end_node = net.nodes[the_port.nodeId];
+    switch (end_node.type) {
+
+    case  REPLICATOR:
+      io::printn("Replicator");
+      foreach (endpoint:end_node.agent.replicator.auxilaries)
+      {
+      }
+  case FAN:
+    io::printn("Fan");
+
+  case ERRASER:
+    io::printn("ERRASER");
+  }
+
+//find the node in the other end of the wire
+
+case  REPLICATOR:
+  io::printn("Replicator");
+
+case FAN:
+  io::printn("Fan");
+}
+
 }
 
 
