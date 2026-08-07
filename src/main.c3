@@ -21,7 +21,7 @@ struct AuxiliaryPortProperties {
   uint deltaLevel;
 }
 
-struct Endpoint {
+struct Port {
   uint nodeId;
   uint wireId;
   PortType port;
@@ -64,7 +64,7 @@ struct Node {
 
 struct Net {
 
-  Endpoint [] endpoints;
+  Port [] ports;
   Wire [] wires ;
   Node [] nodes;
 }
