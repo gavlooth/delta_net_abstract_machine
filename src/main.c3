@@ -1,5 +1,27 @@
 module delta_net_abstract_machine;
 import std::core::main_stub, std::io, std::collections;
+import delta_net_abstract_machine::stable_index_vector;
+
+
+//  ### Usage
+//
+//  ```c3
+// StableIndexVector{Node} nodes;
+// nodes.init();
+// defer nodes.free();
+//
+// StableId id = nodes.push(node);
+// Node* value = nodes.get_ref(id);
+//
+// StableIndexHandle{Node} handle = nodes.create_handle(id);
+// nodes.erase(id);
+//
+// assert(!handle.is_valid());
+//  ```
+//
+//  Handles require the container itself to remain at the same address. Stable IDs survive unrelated erases, but raw pointers and dense data indexes may be
+//  invalidated by push or erase.
+//
 
 
 enum PortType : uint {
@@ -19,7 +41,7 @@ enum AgentType {
 struct Port {
   uint nodeId;
   uint wireId;
-  PortType port;
+  PortType type;
   Maybe{AuxiliaryPortProperties} properties;
 }
 
@@ -67,33 +89,41 @@ struct Net {
   List{Node} nodes;
 }
 
+fn bool is_active (Net* net, uint wire_id){
+  Port* port_a =  &net.ports[net.wires[wire_id].a];
+  Port* port_b =  &net.ports[net.wires[wire_id].b];
+  Wire* wire = &net.wires[wire_id];
+  return port_a.type == PRINCIPAL && port_b.type == PRINCIPAL   ;
+
+}
 
 
 
-fn void interact (Net net, uint node_id)  {
-  Node node = net.nodes[node_id];
+fn void interact (Net* net, uint wire_id)  {
+  // Node* node = &net.nodes[node_id];
+  Port* port_a =  &net.ports[net.wires[wire_id].a];
+  Port* port_b =  &net.ports[net.wires[wire_id].b];
+  if (!is_active(net, wire_id)){return;} ;
+  Node* node_a = &net.nodes[port_a.nodeId];
+  Node* node_b = &net.nodes[port_b.nodeId];
 
-  switch (node.type)  {
+  switch (node_a.type)  {
   case  ERRASER:
     io::printn("Erraser");
-    uint wire_id = node.agent.erraser.wireId ;
-    Wire wire = net.wires[wire_id];
-    Port port_a = net.ports[wire.a];
-    Port the_port  =  (port_a.nodeId != node_id) ? port_a : net.ports[wire.b];
-    Node end_node = net.nodes[the_port.nodeId];
-    switch (end_node.type) {
-
-    case  REPLICATOR:
-      io::printn("Replicator");
-      foreach (endpoint:end_node.agent.replicator.auxilaries)
+    switch (node_b.type) {
+    case FAN:
+      foreach (endpoint:node_b.agent.replicator.auxilaries)
       {
       }
-  case FAN:
-    io::printn("Fan");
+  case  REPLICATOR:
+    foreach (endpoint:node_b.agent.replicator.auxilaries)
+    {
 
-  case ERRASER:
-    io::printn("ERRASER");
-  }
+    }
+
+case ERRASER:
+  io::printn("ERRASER");
+}
 
 //find the node in the other end of the wire
 
