@@ -30,6 +30,8 @@ struct StableIndexVector
 	List{sz} indexes;
 }
 
+alias Siv = StableIndexVector;
+
 fn StableIndexVector* StableIndexVector.init(&self, Allocator allocator = mem, sz initial_capacity = 0)
 {
 	self.values.init(allocator, initial_capacity);

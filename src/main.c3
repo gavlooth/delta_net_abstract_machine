@@ -23,7 +23,6 @@ import delta_net_abstract_machine::stable_index_vector;
 //  invalidated by push or erase.
 //
 
-
 enum PortType : uint {
   PRINCIPAL,
   LEFT,
@@ -39,37 +38,37 @@ enum AgentType {
 }
 
 struct Port {
-  uint nodeId;
-  uint wireId;
+  StableId nodeId;
+  StableId wireId;
   PortType type;
   Maybe{AuxiliaryPortProperties} properties;
 }
 
 struct AuxiliaryPortProperties {
-  uint position;
-  uint deltaLevel;
+  StableId position;
+  StableId deltaLevel;
 }
 
 
 struct Wire {
-  uint a;
-  uint b;
+  StableId   a;
+  StableId   b;
   bool alive;
 }
 
 struct Fan {
-  uint principal;
-  uint left;
-  uint right;
+  StableId   principal;
+  StableId   left;
+  StableId   right;
 }
 
 struct Erraser {
-  uint wireId;
+  StableId   wireId;
 }
 
 struct Replicator {
-  uint [] auxilaries;
-  uint principal;
+  StableId   [] auxilaries;
+  StableId   principal;
 }
 
 union Agent {
@@ -84,28 +83,29 @@ struct Node {
 }
 
 struct Net {
-  List{Port} ports;
-  List{Wire} wires;
-  List{Node} nodes;
+  Siv{Port} ports;
+  Siv{Wire} wires;
+  Siv{Node} nodes;
 }
 
-fn bool is_active (Net* net, uint wire_id){
-  Port* port_a =  &net.ports[net.wires[wire_id].a];
-  Port* port_b =  &net.ports[net.wires[wire_id].b];
-  Wire* wire = &net.wires[wire_id];
+fn bool is_active (Net* net, StableId wire_id){
+  Port* port_a =  net.ports.get_ref(net.wires.get_ref(wire_id).a);
+  Port* port_b =  net.ports.get_ref(net.wires.get_ref(wire_id).b);
   return port_a.type == PRINCIPAL && port_b.type == PRINCIPAL   ;
 
 }
 
 
 
-fn void interact (Net* net, uint wire_id)  {
+fn void interact (Net* net, StableId wire_id)  {
   // Node* node = &net.nodes[node_id];
-  Port* port_a =  &net.ports[net.wires[wire_id].a];
-  Port* port_b =  &net.ports[net.wires[wire_id].b];
-  if (!is_active(net, wire_id)){return;} ;
-  Node* node_a = &net.nodes[port_a.nodeId];
-  Node* node_b = &net.nodes[port_b.nodeId];
+  Port* port_a =  net.ports.get_ref(net.wires.get_ref(wire_id).a);
+  Port* port_b =  net.ports.get_ref(net.wires.get_ref(wire_id).b);
+
+  if  (port_a.type != PRINCIPAL || port_b.type != PRINCIPAL) {return;}
+
+  Node* node_a =  &net.nodes.get_ref(port_a.nodeId);
+  Node* node_b =  &net.nodes.get_ref(port_b.nodeId);
 
   switch (node_a.type)  {
   case  ERRASER:
@@ -140,6 +140,11 @@ case FAN:
 
 fn int main(String[] args)
 {
+  StableIndexVector{Node} nodes;
+  nodes.init();
+  defer nodes.free    () ;
   io::printn("Hello, World!");
   return 0;
+
+
 }

@@ -9,7 +9,7 @@ fn bool is_even(int* value)
 
 fn void stable_ids_survive_unordered_erase() @test
 {
-	StableIndexVector{int} vector;
+	Siv{int} vector;
 	vector.init();
 	defer vector.free();
 
