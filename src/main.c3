@@ -4,23 +4,23 @@ import delta_net_abstract_machine::stable_index_vector;
 
 enum PortType : uint
 {
-  PRINCIPAL,
-  LEFT,
-  RIGHT,
-  AUXILIARY
+ PRINCIPAL,
+ LEFT,
+ RIGHT,
+ AUXILIARY
 }
 
 enum AgentType
 {
-  REPLICATOR,
-  FAN,
-  ERASER
+ REPLICATOR,
+ FAN,
+ ERASER
 }
 
 struct AuxiliaryPortProperties
 {
-  StableId position;
-  StableId delta_level;
+ StableId position;
+ StableId delta_level;
 }
 
 // The slot describes the role of a port on its owning agent. Keeping this
@@ -28,125 +28,127 @@ struct AuxiliaryPortProperties
 // for role-specific metadata.
 struct PortSlot
 {
-  PortType type;
-  Maybe{AuxiliaryPortProperties} properties;
+ PortType type;
+ Maybe{AuxiliaryPortProperties} properties;
 }
 
 struct Port
 {
-  StableId node_id;
-  StableId wire_id;
-  PortSlot slot;
+ StableId node_id;
+ StableId wire_id;
+ PortSlot slot;
 }
 
 struct Wire
 {
-  StableId a;
-  StableId b;
-  bool alive;
+ StableId a;
+ StableId b;
+ bool alive;
 }
 
 struct Fan
 {
-  StableId principal;
-  StableId left;
-  StableId right;
+ StableId principal;
+ StableId left;
+ StableId right;
 }
 
 struct Eraser
 {
-  StableId principal;
+ StableId principal;
 }
 
 struct Replicator
 {
-  StableId[] auxiliaries;
-  StableId principal;
+ StableId[] auxiliaries;
+ StableId principal;
 }
 
 union Agent
 {
-  Fan fan;
-  Eraser eraser;
-  Replicator replicator;
+ Fan fan;
+ Eraser eraser;
+ Replicator replicator;
 }
 
 struct Node
 {
-  Agent agent;
-  AgentType type;
+ Agent agent;
+ AgentType type;
 }
 
 struct Net
 {
-  Siv{Port} ports;
-  Siv{Wire} wires;
-  Siv{Node} nodes;
+ Siv{Port} ports;
+ Siv{Wire} wires;
+ Siv{Node} nodes;
 }
 
 fn Net* Net.init(&self)
 {
-  self.ports.init();
-  self.wires.init();
-  self.nodes.init();
-  return self;
+ self.ports.init();
+ self.wires.init();
+ self.nodes.init();
+ return self;
 }
 
 fn void Net.free(&self)
 {
-  self.ports.free();
-  self.wires.free();
-  self.nodes.free();
+ self.ports.free();
+ self.wires.free();
+ self.nodes.free();
 }
 
 fn bool is_active(Net* net, StableId wire_id)
 {
-  if (!net.wires.contains(wire_id)) return false;
+ if (!net.wires.contains(wire_id)) return false;
 
-  Wire* wire = net.wires.get_ref(wire_id);
-  if (!wire.alive) return false;
-  if (!net.ports.contains(wire.a) || !net.ports.contains(wire.b)) return false;
+ Wire* wire = net.wires.get_ref(wire_id);
+ if (!wire.alive) return false;
+ if (!net.ports.contains(wire.a) || !net.ports.contains(wire.b)) return false;
 
-  Port* port_a = net.ports.get_ref(wire.a);
-  Port* port_b = net.ports.get_ref(wire.b);
-  return port_a.slot.type == PRINCIPAL && port_b.slot.type == PRINCIPAL;
+ Port* port_a = net.ports.get_ref(wire.a);
+ Port* port_b = net.ports.get_ref(wire.b);
+ return port_a.slot.type == PRINCIPAL && port_b.slot.type == PRINCIPAL;
 }
+
+
 
 fn void erase_redex(Net* net, StableId node_a_id, StableId node_b_id,
 StableId wire_id, StableId port_a_id, StableId port_b_id)
 {
-  // Erase the endpoints after reading all topology needed by the rewrite.
-  // Stable IDs make the order independent of dense-storage movement.
-  net.nodes.erase(node_a_id);
-  net.nodes.erase(node_b_id);
-  net.wires.erase(wire_id);
-  net.ports.erase(port_a_id);
-  net.ports.erase(port_b_id);
+ // Erase the endpoints after reading all topology needed by the rewrite.
+ // Stable IDs make the order independent of dense-storage movement.
+ net.nodes.erase(node_a_id);
+ net.nodes.erase(node_b_id);
+ net.wires.erase(wire_id);
+ net.ports.erase(port_a_id);
+ net.ports.erase(port_b_id);
 }
 
 fn void eraser_eraser_reduction(Net* net, StableId node_a_id, StableId node_b_id,
 StableId wire_id, StableId port_a_id, StableId port_b_id)
 {
-  erase_redex(net, node_a_id, node_b_id, wire_id, port_a_id, port_b_id);
+ erase_redex(net, node_a_id, node_b_id, wire_id, port_a_id, port_b_id);
 }
 
 fn void fan_eraser_reduction(Net* net, StableId fan_id, StableId eraser_id,
 StableId wire_id, StableId fan_port_id, StableId eraser_port_id,
 StableId fan_left_id, StableId fan_right_id)
 {
-  // Copy IDs before inserting nodes: push may reallocate the node storage.
-  Port* left_port = net.ports.get_ref(fan_left_id);
-  Port* right_port = net.ports.get_ref(fan_right_id);
-  StableId left_wire_id = left_port.wire_id;
-  StableId right_wire_id = right_port.wire_id;
+ // Copy IDs before inserting nodes: push may reallocate the node storage.
+ Port* left_port = net.ports.get_ref(fan_left_id);
+ Port* right_port = net.ports.get_ref(fan_right_id);
+ StableId left_wire_id = left_port.wire_id;
+ StableId right_wire_id = right_port.wire_id;
 
-  Node left_eraser = {
-    .agent = { .eraser = { .principal = left_wire_id } },
-    .type = ERASER
-  };
-Node right_eraser = {
-  .agent = { .eraser = { .principal = right_wire_id } },
+ Node left_eraser = {
+  .agent = { .eraser = { .principal = left_wire_id } },
   .type = ERASER
+ };
+Node right_eraser = {
+ .agent = { .eraser = { .principal = right_wire_id } },
+ .type = ERASER
 };
 
 StableId left_eraser_id = net.nodes.push(left_eraser);
@@ -162,65 +164,113 @@ right_port.slot.type = PRINCIPAL;
 erase_redex(net, fan_id, eraser_id, wire_id, fan_port_id, eraser_port_id);
 }
 
+
 // Fan/fan and replicator interactions are intentionally separate rewrite
 // rules. Their topology is not inferred from PortSlot, so they can be added
 // without reintroducing agent-specific fields into Port.
 fn void fan_fan_reduction(Net* net, StableId node_a_id, StableId node_b_id,
-StableId wire_id, StableId port_a_id, StableId port_b_id)
+StableId port_a_id, StableId port_b_id)
 {
-  (void)net;
-  (void)node_a_id;
-  (void)node_b_id;
-  (void)wire_id;
-  (void)port_a_id;
-  (void)port_b_id;
+ Node* fan_1= net.nodes.get_ref(node_a_id)  ;
+
+ Node* fan_2 = net.nodes.get_ref(node_b_id) ;
+
+ Port* fan1_left = net.ports.get_ref(fan_1.left);
+
+ Port* fan1_right = net.ports.get_ref(fan_1.right);
+
+ Port* fan2_left = net.ports.get_ref(fan_2.left);
+
+ Port* fan2_right = net.ports.get_ref(fan_2.right);
+
+ Wire* wire_1_left  = net.wires.get_ref( fan1_left.wire_id );
+
+ Wire* wire_1_right  = net.wires.get_ref( fan1_right.wire_id );
+
+ Wire* wire_2_left  = net.wires.get_ref( fan2_left.wire_id );
+
+ Wire* wire_2_right  = net.wires.get_ref( fan2_right.wire_id );
+
+ StableId  wire_2_unconnected_port_left = net.ports.get_ref(wire_2_left.a == fan_2.left ? wire_2_left.b : wire_2_left.a ) ;
+
+ StableId  wire_2_unconnected_port_right = net.ports.get_ref(wire_2_right.a == fan_2.right ? wire_2_right.b : wire_2_right.a) ;
+ if (wire_1_left.a == fan_1.left)
+ { wire_1_left.a =  wire_2_unconnected_port_left ;}
+ else if(wire_1_left.b ==  wire_2_unconnected_port_left   )
+
+ if (wire_1_right.a == fan_1.right)
+ { wire_1_right.a ==  wire_2_unconnected_port_right ;}
+ else  if (wire_1_right.b =  wire_2_unconnected_port_right)
+
+
+ net.nodes.erase(node_a_id);
+ net.nodes.erase(node_b_id);
+
+ // Delete all ports owned by the two fans:
+ // - their principal ports
+ // - their left and right auxiliary ports
+ net.ports.erase(port_a_id);
+ net.ports.erase(port_b_id);
+ net.ports.erase(fan_1.left);
+ net.ports.erase(fan_1.right);
+ net.ports.erase(fan_2.left);
+ net.ports.erase(fan_2.right);
+
+ // Delete the old principal-principal wire and the two fan_2
+ // auxiliary wires. The fan_1 auxiliary wires are reused.
+ net.wires.erase(wire_id);
+ net.wires.erase(fan2_left.wire_id);
+ net.wires.erase(fan2_right.wire_id);
+
+
+
 }
 
 fn void interact(Net* net, StableId wire_id)
 {
-  if (!is_active(net, wire_id)) return;
+ if (!is_active(net, wire_id)) return;
 
-  Wire* wire = net.wires.get_ref(wire_id);
-  StableId port_a_id = wire.a;
-  StableId port_b_id = wire.b;
-  Port* port_a = net.ports.get_ref(port_a_id);
-  Port* port_b = net.ports.get_ref(port_b_id);
-  StableId node_a_id = port_a.node_id;
-  StableId node_b_id = port_b.node_id;
-  Node* node_a = net.nodes.get_ref(node_a_id);
-  Node* node_b = net.nodes.get_ref(node_b_id);
-  AgentType type_a = node_a.type;
-  AgentType type_b = node_b.type;
+ Wire* wire = net.wires.get_ref(wire_id);
+ StableId port_a_id = wire.a;
+ StableId port_b_id = wire.b;
+ Port* port_a = net.ports.get_ref(port_a_id);
+ Port* port_b = net.ports.get_ref(port_b_id);
+ StableId node_a_id = port_a.node_id;
+ StableId node_b_id = port_b.node_id;
+ Node* node_a = net.nodes.get_ref(node_a_id);
+ Node* node_b = net.nodes.get_ref(node_b_id);
+ AgentType type_a = node_a.type;
+ AgentType type_b = node_b.type;
 
-  switch (type_a)
-  {
-  case ERASER:
-    switch (type_b)
-    {
-    case ERASER:
-      eraser_eraser_reduction(net, node_a_id, node_b_id, wire_id,
-      port_a_id, port_b_id);
-    case FAN:
-      fan_eraser_reduction(net, node_b_id, node_a_id, wire_id,
-      port_b_id, port_a_id, node_b.agent.fan.left, node_b.agent.fan.right);
-    }
-case FAN:
+ switch (type_a)
+ {
+ case ERASER:
   switch (type_b)
   {
   case ERASER:
-    fan_eraser_reduction(net, node_a_id, node_b_id, wire_id,
-    port_a_id, port_b_id, node_a.agent.fan.left, node_a.agent.fan.right);
+   eraser_eraser_reduction(net, node_a_id, node_b_id, wire_id,
+   port_a_id, port_b_id);
   case FAN:
-    fan_fan_reduction(net, node_a_id, node_b_id, wire_id, port_a_id, port_b_id);
+   fan_eraser_reduction(net, node_b_id, node_a_id, wire_id,
+   port_b_id, port_a_id, node_b.agent.fan.left, node_b.agent.fan.right);
   }
+case FAN:
+ switch (type_b)
+ {
+ case ERASER:
+  fan_eraser_reduction(net, node_a_id, node_b_id, wire_id,
+  port_a_id, port_b_id, node_a.agent.fan.left, node_a.agent.fan.right);
+ case FAN:
+  fan_fan_reduction(net, node_a_id, node_b_id, wire_id, port_a_id, port_b_id);
+ }
 }
 }
 
 fn int main(String[] args)
 {
-  (void)args;
-  Net net;
-  net.init();
-  defer net.free();
-  return 0;
+ (void)args;
+ Net net;
+ net.init();
+ defer net.free();
+ return 0;
 }
