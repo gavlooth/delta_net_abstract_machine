@@ -18,7 +18,7 @@ enum AgentType
   ERASER
 }
 
-struct AuxiliaryPortProperties
+struct AuxiliaryPortMetadata
 {
   StableId position;
   StableId delta_level;
@@ -30,7 +30,7 @@ struct AuxiliaryPortProperties
 struct PortSlot
 {
   PortType type;
-  Maybe{AuxiliaryPortProperties} properties;
+  Maybe{AuxiliaryPortMetadata} properties;
 }
 
 struct Port
