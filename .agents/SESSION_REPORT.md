@@ -13,3 +13,14 @@
 - Unresolved issue: compiler diagnostics for this project now reflect files on disk, so save before relying on them; Tree-sitter/LSP navigation remains live for unsaved buffers.
 
 Signature: openai-codex/gpt-5.6-sol
+
+
+## 2026-08-10 — Native Zellij migration
+
+- Objective: replace the failing native Windows tmux path with Zellij while preserving the active tmux workflow.
+- Changes: installed `Zellij.Zellij` 0.44.3 through WinGet; created `C:\Users\heefoo\AppData\Roaming\Zellij\config\config.kdl`; set `default_shell` to the user's PowerShell 7 executable so the PowerShell profile loads `PSFzf`.
+- Binding contract: `Ctrl-b` remains Zellij's tmux-mode prefix. Custom bindings are `Ctrl-b |` (right split), `Ctrl-b -` (down split), `Ctrl-b [`/`]` (previous/next tab), `Ctrl-b t` (enter Tab mode), and `Ctrl-b h/j/k/l` (pane navigation). Scrollback is 10,000 lines. Global unbinds for `Ctrl-t` and `Ctrl-r` give FZF's file/history shortcuts priority in terminal panes.
+- Root cause: native Zellij had fallen back to `cmd.exe`, which cannot load the configured `PSFzf` chords. Do not attribute missing `Ctrl-t`/`Ctrl-r` pickers to keybinding interception when the child shell is cmd.
+- Verification: `zellij setup --check` reported the configuration well defined. A native Windows Zellij pane started PowerShell 7, reported `PSFzf=True`, `CtrlT=Fzf Provider Select`, and `CtrlR=Fzf Reverse History Select`; real `Ctrl-t` opened the file picker and `Ctrl-r` opened the 192-entry history picker. Smoke session was killed afterward.
+
+Signature: openai-codex/gpt-5.6-terra
