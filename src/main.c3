@@ -234,36 +234,89 @@ net.wires.erase(fan2_right_wire_id);
 
 
 
-fn void replicator_fan_reduction(Net* net, StableId replicator_node_id, StableId fan_node_id,
-StableId port_a_id, StableId port_b_id)
+fn void replicator_fan_reduction(Net* net, StableId replicator_node_id, StableId fan_node_id)
+// StableId port_a_id, StableId port_b_id)
 {
- // Erasing an entry can move the last dense entry, so pointers into any
- // StableIndexVector are invalid after an erase. Snapshot all IDs first.
- Node* replicator = net.nodes.get_ref(replicator_node_id);
- Node* fan = net.nodes.get_ref(fan_node_id);
- StableId replicator_primary = replicator.agent.replicator.principal;
- List{StableId} auxiliary_ids ;
- List{StableId} auxiliary_wire_ids ;
- auxiliary_ids.init(mem);
- auxiliary_wire_ids.init(mem);
- foreach (i:replicator.agent.replicator.auxiliaries) {
-  auxiliary_ids.push(i)   ;
-  auxiliary_wire_ids.push(net.ports.get_ref(i).wire_id) ;
- }
 
-
+Node* fan = net.nodes.get_ref(fan_node_id);
+StableId fan_principal_id= fan.agent.fan.principal;
 StableId fan_left_id = fan.agent.fan.left;
 StableId fan_right_id = fan.agent.fan.right;
 
+//will use the auxiliaries to connect new replicators
 StableId fan_left_wire_id = net.ports.get_ref(fan_left_id).wire_id;
 StableId fan_right_wire_id = net.ports.get_ref(fan_right_id).wire_id;
 
-StableId principal_wire_id = net.ports.get_ref(port_a_id).wire_id;
+//connection wire, must be deleted at the end
+StableId principal_wire_id = net.ports.get_ref(fan_principal_id).wire_id;
 
-//StableId fan2_left_other_id = fan2_left_wire.a == fan2_left_id
-//? fan2_left_wire.b : fan2_left_wire.a;
-//StableId fan2_right_other_id = fan2_right_wire.a == fan2_right_id
-//? fan2_right_wire.b : fan2_right_wire.a;
+Node* replicator = net.nodes.get_ref(replicator_node_id);
+
+ 
+ StableId replicator_principal_id = replicator.agent.replicator.principal;
+ List{StableId} auxiliary_ids ;
+ List{StableId} auxiliary_wire_ids ;
+
+ List{Port} auxiliary_ports;
+auxiliary_ids.init(mem);
+ auxiliary_ports.init(mem);
+ auxiliary_wire_ids.init(mem);
+ defer auxiliary_ids.free();
+ defer auxiliary_wire_ids.free();
+
+ foreach (i:replicator.agent.replicator.auxiliaries) {
+  auxiliary_ids.push(i)   ;
+  auxiliary_wire_ids.push(net.ports.get_ref(i).wire_id) ;
+  //we need to save whole ports for the deltas
+  auxiliary_ports.push(net.ports.get_ref(i)) ;
+ }
+
+
+Port[] left_auxiliary_ports = mem.init(auxiliary_ports_slice.len);
+Port[] right_auxiliary_ports = mem.init(auxiliary_ports_slice.len);
+
+Node left_new_replicator = {
+  .agent = { .replicator =
+  { .principal = fan_left_wire_id,
+    .auxiliaries =  left_auxiliary_ports} },
+  .type = REPLICATOR
+ };
+
+
+Node right_new_replicator = {
+  .agent = {.replicator = {
+    .principal = fan_right_wire_id,
+    .auxiliaries =  right_auxiliary_ports}},
+  .type = REPLICATOR
+ };
+
+StableId left_replicator_id = net.nodes.create(left_new_replicator);
+StableId right_replicator_id = net.nodes.create(right_new_replicator);
+
+
+
+foreach(idx,val:auxiliary_ids) {
+  //connect to the new replicator
+
+ left_auxiliary_ports[idx].node_id = left_replicator_id;
+ right_auxiliary_ports[idx].node_id = right_replicator_id;
+
+  StableId  left_new_auxiliary_port_id = net.ports.create(left_auxiliary_ports[idx]);
+  StableId  right_new_auxiliary_port_id = net.ports.create(right_auxiliary_ports[idx]);
+
+  Wire* auxiliary_wire = net.wires.get_ref(auxiliary_wire_ids[idx]);
+  if (auxiliary_wire.a == val)
+  {
+   auxiliary_wire.a = replicator_principal_id;
+  }
+  else
+  {
+   auxiliary_wire.b = replicator_principal_id;
+ }
+}
+
+
+
 
 // Reuse fan 1's auxiliary wires to connect the external neighbours.
 Wire* fan_left_wire = net.wires.get_ref(fan_left_wire_id);
