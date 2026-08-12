@@ -3,6 +3,21 @@ import std::core::main_stub;
 import std::collections::maybe;
 import delta_net_abstract_machine::stable_index_vector;
 
+
+enum ReplicatorStatus
+{
+    UNPAIRED,
+    UNKNOWN,
+}
+
+
+enum Polarity
+{
+       PARENT,
+       CHILD,
+}
+
+
 enum PortType : uint
 {
  PRINCIPAL,
@@ -60,6 +75,7 @@ struct Replicator
  StableId[] auxiliaries;
  StableId principal;
  ulong delta_level;
+ ReplicatorStatus status;
 }
 
 union Agent
@@ -221,8 +237,14 @@ fn void replicator_fan_reduction(Net* net, StableId replicator_id, StableId fan_
  sz count = replicator.agent.replicator.auxiliaries.len;
  StableId[] left_auxiliaries = mem::alloc_array(StableId, count);
  StableId[] right_auxiliaries = mem::alloc_array(StableId, count);
+ Port [] auxiliaries = mem::alloc_array(Port, count);
 
- // The fan's branches become the principal ports of the two copies.
+foreach (i,v: replicator.agent.replicator.auxiliaries)
+{
+ auxiliaries[i] = *net.ports.get_ref(v);
+}
+
+// The fan's branches become the principal ports of the two copies.
  Port* left_principal = net.ports.get_ref(fan_left);
  Port* right_principal = net.ports.get_ref(fan_right);
  left_principal.slot.type = PRINCIPAL;
@@ -250,16 +272,18 @@ fn void replicator_fan_reduction(Net* net, StableId replicator_id, StableId fan_
 
  foreach (idx, old_auxiliary_id : replicator.agent.replicator.auxiliaries)
  {
+
+ AuxiliaryPortMetadata properties =   auxiliaries[idx].slot.properties  ;
   StableId old_wire_id = net.ports.get_ref(old_auxiliary_id).wire_id;
   StableId external_id = other_endpoint(net, old_wire_id, old_auxiliary_id);
   left_auxiliaries[idx] = net.ports.push({ .node_id = left_copy_id,
-   .slot = { .type = AUXILIARY }});
+   .slot = { .type = AUXILIARY , .properties = properties  }});
   right_auxiliaries[idx] = net.ports.push({ .node_id = right_copy_id,
-   .slot = { .type = AUXILIARY }});
+   .slot = { .type = AUXILIARY , .properties = properties  }});
 
   // Reuse the old auxiliary edge as the principal edge of a new fan.
   Port* old_auxiliary = net.ports.get_ref(old_auxiliary_id);
-  old_auxiliary.slot.type = PRINCIPAL;
+  old_auxiliary.slot = { .type = PRINCIPAL} ;
   StableId new_left = net.ports.push({ .slot = { .type = LEFT }});
   StableId new_right = net.ports.push({ .slot = { .type = RIGHT }});
   StableId new_fan_id = net.nodes.push({ .agent = { .fan = {
