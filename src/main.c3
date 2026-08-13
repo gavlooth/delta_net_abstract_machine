@@ -237,12 +237,8 @@ fn void replicator_fan_reduction(Net* net, StableId replicator_id, StableId fan_
  sz count = replicator.agent.replicator.auxiliaries.len;
  StableId[] left_auxiliaries = mem::alloc_array(StableId, count);
  StableId[] right_auxiliaries = mem::alloc_array(StableId, count);
- Port [] auxiliaries = mem::alloc_array(Port, count);
-
-foreach (i,v: replicator.agent.replicator.auxiliaries)
-{
- auxiliaries[i] = *net.ports.get_ref(v);
-}
+ defer  mem::free_array(left_auxiliaries);
+ defer  mem::free_array(right_auxiliaries);
 
 // The fan's branches become the principal ports of the two copies.
  Port* left_principal = net.ports.get_ref(fan_left);
@@ -273,13 +269,16 @@ foreach (i,v: replicator.agent.replicator.auxiliaries)
  foreach (idx, old_auxiliary_id : replicator.agent.replicator.auxiliaries)
  {
 
- AuxiliaryPortMetadata properties =   auxiliaries[idx].slot.properties  ;
-  StableId old_wire_id = net.ports.get_ref(old_auxiliary_id).wire_id;
+
+// AuxiliaryPortMetadata properties =   auxiliaries[idx].slot.properties  ;
+   PortSlot auxiliary_slot =   *net.ports.get_ref(old_auxiliary_id).slot;
+   auxiliary_slot.type = AUXILIARY;
+   StableId old_wire_id = net.ports.get_ref(old_auxiliary_id).wire_id;
   StableId external_id = other_endpoint(net, old_wire_id, old_auxiliary_id);
   left_auxiliaries[idx] = net.ports.push({ .node_id = left_copy_id,
-   .slot = { .type = AUXILIARY , .properties = properties  }});
+   .slot = auxiliary_slot});
   right_auxiliaries[idx] = net.ports.push({ .node_id = right_copy_id,
-   .slot = { .type = AUXILIARY , .properties = properties  }});
+   .slot = auxiliary_slot});
 
   // Reuse the old auxiliary edge as the principal edge of a new fan.
   Port* old_auxiliary = net.ports.get_ref(old_auxiliary_id);
