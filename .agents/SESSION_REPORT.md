@@ -24,3 +24,23 @@ Signature: openai-codex/gpt-5.6-sol
 - Verification: `zellij setup --check` reported the configuration well defined. A native Windows Zellij pane started PowerShell 7, reported `PSFzf=True`, `CtrlT=Fzf Provider Select`, and `CtrlR=Fzf Reverse History Select`; real `Ctrl-t` opened the file picker and `Ctrl-r` opened the 192-entry history picker. Smoke session was killed afterward.
 
 Signature: openai-codex/gpt-5.6-terra
+
+## 2026-08-14 — Interaction-net reduction tests
+
+- Objective: test each implemented interaction-net node pair and both asymmetric endpoint orderings.
+- Changes: completed `test/node_interaction_test.c3` with topology assertions for eraser, fan, and replicator reductions; added equal-replicator annihilation and unequal-replicator Cartesian-commutation cases, including reversed endpoints and delta-sensitive replica levels.
+- Source repairs required by those tests: dispatched both eraser–replicator orders; repaired fan–fan and fan–replicator reciprocal `wire_id` updates; integrated `destroy_node` ownership cleanup into fan–replicator removal; preserved spawned replicator auxiliary arrays; and release surviving replicator arrays in `Net.free`.
+- Verification: `c3c test` passed all 20 tests. The suite covers all six core interaction families, mirrored eraser/fan, eraser/replicator, fan/fan, and fan/replicator orders, equal and unequal replicator cases, plus inactive-wire safety.
+- Checkpoint: every constructed output edge asserts both wire endpoints and each port's reciprocal `wire_id`, preventing dangling port-to-wire references.
+
+Signature: openai-codex/gpt-5.6-terra
+
+## 2026-08-14 — Net validation module
+
+- Objective: provide a standalone structural validator for live interaction nets.
+- Changes: added `src/net_validation.c3` with `validate_net(Net*)`. It verifies live and reciprocal wire endpoints, one wire per port, agent-specific port layout, at-most-one node owner per port, and unique non-empty replicator auxiliary slices. Unclaimed ports are treated as boundaries because the current graph model has no boundary type or polarity field.
+- Tests: added valid fully wired fan/boundary coverage and malformed dangling-wire and invalid-node-slot cases in `test/node_interaction_test.c3`.
+- Verification: `c3c test` passed all 23 tests.
+- Limitation: parent/child wire polarity cannot be validated until polarity is represented on ports or wires.
+
+Signature: openai-codex/gpt-5.6-terra
