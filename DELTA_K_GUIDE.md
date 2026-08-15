@@ -1,158 +1,210 @@
-# Guide: implementing full $\Delta K$-Nets in this C3 project
+# Guide: finishing ΔK-nets in this C3 project
 
-Terminology first: $\lambda K$ is the unrestricted lambda calculus—bound variables may occur zero, one, or many times. $\Delta K$-Nets implement it using:
+This is the short path through the work. For the full explanation of *why*
+each piece exists—polarity, sharing levels, the two reduction phases, and the
+rest—see `DELTA_K_IMPLEMENTATION_GUIDE.md`.
 
-- **Fan**: application, abstraction, and $\beta$-reduction.
-- **Eraser**: unused variables.
-- **Replicator**: shared variables and optimal duplication.
+---
 
-Your project currently has a compiling partial interaction kernel in `src/main.c3`; it is not yet a lambda-calculus evaluator. `c3c build` succeeds and the six tests only cover `StableIndexVector`.
+## What you are building
 
-## 1. Target end-to-end pipeline
+**λK** is ordinary lambda calculus: a bound variable may be used never, once,
+or many times. A **ΔK-net** evaluates that calculus as a graph of agents and
+wires instead of as a recursive tree walk.
+
+Three agents cover the whole job:
+
+| Agent | Job |
+|---|---|
+| **Fan** | Application, abstraction, and β-reduction when two fans meet head-on |
+| **Eraser** | “This is unused” — delete work that cannot affect the answer |
+| **Replicator** | “This is shared” — duplicate only when forced, with level bookkeeping |
+
+Your tree already has a partial interaction kernel in `src/main.c3`. It is not
+yet a lambda evaluator. Local pair rules are tested; parser, translation,
+scheduler, canonicalization, and readback are not.
+
+---
+
+## End-to-end pipeline
 
 ```mermaid
 flowchart LR
     S[Lambda source] --> P[Parser]
     P --> A[De Bruijn AST]
-    A --> T[phi_K translation]
-    T --> N[Canonical Delta-K net]
+    A --> T[Translation]
+    T --> N[Canonical ΔK-net]
     N --> R[Phase 1 reduction]
-    R --> C[Phase 2 canonicalization]
-    C --> B[Inverse translation]
+    R --> C[Phase 2 + cleanup]
+    C --> B[Readback]
     B --> O[Normal lambda term]
 ```
 
-The final executable should support:
+The executable should eventually do:
 
 ```text
 parse → resolve names → translate → normalize → read back → print
 ```
 
-Do not add concurrency initially. A correct sequential leftmost-outermost reducer is the prerequisite for any parallel optimization.
+Stay sequential at first. A correct leftmost-outermost reducer is the
+prerequisite for every later parallel experiment.
 
 ---
 
-## 2. Split the current file into semantic modules
-
-Recommended layout:
+## Suggested modules
 
 ```text
 src/
-  lambda_ast.c3       # AST, parser, printer, De Bruijn conversion
-  lambda_reference.c3 # simple normal-order reducer used as an oracle
-  net.c3              # nodes, ports, wires, graph mutation API
-  translate.c3        # phi_K: lambda term -> canonical Delta-K net
-  interact.c3         # core active-pair rules
-  canonicalize.c3     # merge, decay, reachability erasure, phase 2
-  reduce.c3           # leftmost-outermost scheduler
-  readback.c3         # canonical Delta-K net -> lambda term
-  main.c3             # CLI only
+  lambda_ast.c3        # AST, parser, printer, De Bruijn conversion
+  lambda_reference.c3  # simple normal-order oracle
+  net.c3               # nodes, ports, wires, mutation API
+  translate.c3         # lambda term → canonical net
+  interact.c3          # core active-pair rules
+  canonicalize.c3      # merge, decay, reachability cleanup
+  reduce.c3            # leftmost-outermost scheduler
+  readback.c3          # net → lambda term
+  main.c3              # CLI only
 ```
 
-Keep `stable_index_vector.c3`, but stop manipulating its contents directly inside rewrite rules.
+Keep `stable_index_vector.c3` as storage. Do not poke it from every rewrite.
 
 ---
 
-## 3. Finish the graph model before writing more rules
+## Finish the graph model first
 
-The existing model lacks information required by translation, scheduling, canonicalization, and readback.
+Isolated rewrites are not enough. A complete evaluator must answer:
 
-### Required data
+1. Which way does computation flow through this port?
+2. Is this fan being read as an abstraction or as an application?
+3. Is this replicator a fan-in or a fan-out, and may it merge?
+4. What part of the graph is still reachable from the result?
+
+Those are not cosmetic annotations. They decide translation, scheduling,
+cleanup, and readback.
+
+### Polarity
+
+The same `Fan` type means two different pieces of syntax:
+
+```text
+abstraction:  two parent ports, one child port
+application:  one parent port, two child ports
+```
+
+The difference is the direction from which you meet the fan when walking from
+the root. Give every port a polarity:
+
+```text
+PARENT — the surrounding term points into this port
+CHILD  — this fragment points toward a subterm
+```
+
+Invariant:
+
+```text
+every wire joins exactly one parent to exactly one child
+```
+
+Without that:
+
+- readback cannot tell `λx.M` from `M N`
+- leftmost-outermost order has no graph definition
+- replicator orientation is guesswork
+- garbage collection cannot walk “from the answer outward”
+
+Store polarity on `Port`. Reject parent–parent and child–child wires in
+`validate_net`.
+
+### Core data
 
 ```c3
-enum PortKind
-{
-    PRINCIPAL,
-    AUXILIARY,
-}
-
-enum Polarity
-{
-    PARENT,
-    CHILD,
-}
-
-enum ReplicatorStatus
-{
-    UNPAIRED,
-    UNKNOWN,
-}
+enum PortKind    { PRINCIPAL, AUXILIARY }
+enum Polarity    { PARENT, CHILD }
+enum ReplicatorStatus { UNPAIRED, UNKNOWN }
 
 struct ReplicatorAux
 {
     StableId port;
-    long delta;       // signed
+    long delta;        // signed
 }
 
 struct Replicator
 {
     StableId principal;
     ReplicatorAux[] auxiliaries;
-    ulong level;      // non-negative
+    ulong level;       // non-negative
     ReplicatorStatus status;
 }
 ```
 
-Also add non-agent boundary nodes:
+Auxiliary order is meaning, not packing. Delta `i` belongs to auxiliary `i`.
+
+### Interfaces at the edge of the net
 
 ```c3
-enum BoundaryType
+enum InterfaceKind { ROOT, FREE_VARIABLE }
+
+struct Interface
 {
-    ROOT,
-    FREE_VARIABLE,
+    InterfaceKind kind;
+    String name;       // free-variable name; empty for root
+    StableId port;
 }
 ```
 
-A free-variable boundary must retain its source name. The root has one port.
+- The **root** is where the answer lives. Translation attaches the term there;
+  readback and reachability start there.
+- A **free-variable interface** keeps an open name observable. Anonymous dangling
+  ports are fine for one local rewrite test and useless for a real evaluator.
 
-### Central graph API
-
-All rewrites should use a small mutation API:
+### Mutation API
 
 ```text
 new_fan()
 new_eraser()
 new_replicator(level, deltas, status)
-new_boundary(type, name)
+new_interface(kind, name)
 connect(port_a, port_b)
 other(port)
 splice(old_port_a, old_port_b)
 destroy_agent(node)
 ```
 
-`destroy_agent` must free a replicator’s auxiliary allocation. Currently:
+Constructors and destructors should enforce:
 
-- `replicator_fan_reduction` does not free the original replicator’s auxiliary slice.
-- `Net.free` does not free auxiliary slices owned by surviving replicators.
-- The fan–replicator rule creates new auxiliary ports without copying their delta metadata.
-- `interact` has no replicator–eraser case.
+- replicator auxiliary count equals metadata count
+- copied auxiliaries keep position and signed delta
+- new ports receive polarity before wiring
+- deleted ports disconnect before erasure
+- auxiliary slices are copied or transferred, never accidentally shared
 
-Centralized constructors and destructors prevent these errors.
+### Validator checklist
 
-### Debug validator
+Run after every rewrite in debug tests:
 
-Run this after every rewrite in debug tests:
+- every port belongs to exactly one live node or interface
+- every port has exactly one live wire; every wire has two live ends
+- `port.wire_id` agrees with the wire endpoints
+- every agent has one principal; fans have two ordered auxiliaries
+- erasers have no auxiliaries; replicator deltas match auxiliaries
+- every wire is parent–child; every active pair is principal–principal
+- replicator levels stay non-negative
+- no auxiliary slice has two owners
+- every port has polarity
+- canonical replicators are fan-ins; fan-outs are visible from polarity
+- interfaces have correct polarity and identity (one root; named frees)
 
-- Every port belongs to exactly one live node or boundary.
-- Every port has exactly one live wire.
-- Every wire has two live endpoints.
-- `port.wire_id` and the wire endpoints agree.
-- Every agent has exactly one principal port.
-- Fan has two ordered auxiliaries.
-- Eraser has zero auxiliaries.
-- Replicator delta count equals auxiliary count.
-- Every wire joins one parent and one child.
-- Every active pair is a principal–principal wire.
-- Replicator levels remain non-negative.
-- No allocated auxiliary slice is owned by two nodes.
-
-Do not continue to translation until hand-constructed graphs survive this validator.
+Do not start translation until hand-built graphs survive this.
 
 ---
 
-## 4. Implement lambda syntax and a reference reducer
+## Lambda syntax and a reference reducer
 
-Use a named AST only for parsing. Resolve it to De Bruijn indices immediately:
+The net is hard to debug: a wrong wire can look plausible for several steps.
+First build a small ordinary evaluator that answers *what should this term
+become?* with no graphs involved.
+
+### Parse, then index
 
 ```text
 Term :=
@@ -162,8 +214,6 @@ Term :=
   | App(function, argument)
 ```
 
-Suggested grammar:
-
 ```text
 term        := abstraction | application
 abstraction := ("λ" | "\") IDENT "." term
@@ -171,15 +221,39 @@ application := atom atom*
 atom        := IDENT | "(" term ")" | abstraction
 ```
 
-Application is left-associative; abstraction extends as far right as possible.
+Application is left-associative; abstraction extends right. `f x y` is
+`(f x) y`; `λx.x y` is `λx.(x y)`.
 
-Implement a boring capture-free normal-order reducer over De Bruijn terms. It is not the production evaluator: it is your semantic oracle for differential tests.
+De Bruijn indices count binders between an occurrence and its binder. In
+`λx.λy.x`, `x` is `BoundVar(1)` and `y` is `BoundVar(0)`. Free names stay symbols.
+
+### Normal-order oracle
+
+Reduce leftmost-outermost. Substitute only when the function is an abstraction.
+That way `(λx.y) Ω` becomes `y` without entering `Ω`.
+
+Need:
+
+- `shift(d, cutoff, term)`
+- `subst(j, replacement, term)`
+- `normalize(term, limit)`
+
+`shift` prevents capture when terms move under binders. Use a step limit for
+`Ω`. Keep this reducer free of graph types so it stays an honest oracle.
+
+Later, for each fixture:
+
+1. parse to De Bruijn
+2. normalize with the oracle
+3. translate the same term to a net
+4. reduce the net and read it back
+5. compare modulo alpha-equivalence
 
 ---
 
-## 5. Implement $\phi_K$: lambda term to canonical net
+## Translation: term → canonical net
 
-Use a destination-driven builder. It avoids temporary “variable nodes” for bound variables:
+Destination-driven builder:
 
 ```text
 emit(term, parent_port, level, environment)
@@ -188,299 +262,222 @@ emit(term, parent_port, level, environment)
 ### Variable
 
 ```text
-Bound variable:
-    append (parent_port, level) to its binder’s occurrence list
-
-Free variable:
-    create a named free-variable boundary
-    connect parent_port to it
+bound:  append (parent_port, level) to the binder’s occurrence list
+free:   connect parent_port to the named free-variable interface
 ```
 
-### Abstraction $[\lambda x.M]_l$
+### Abstraction `[λx.M]` at level `l`
 
-Create a fan with logical ports:
+Fan ports:
 
-- principal: abstraction result/parent
-- auxiliary 0: body
-- auxiliary 1: variable
-
-Then:
+- principal: result / parent
+- auxiliary 0: body / child
+- auxiliary 1: variable / parent
 
 ```text
 connect destination to fan.principal
-register binder x at abstraction level l
-emit M into fan.auxiliary[0] at level l
-finish binder:
-    0 occurrences:
-        connect fan.auxiliary[1] to an eraser
-
-    1 occurrence with delta 0:
-        connect fan.auxiliary[1] directly to that occurrence
-
-    otherwise:
-        create unpaired replicator:
-            level = l + 1
-            delta[i] = occurrence_level[i] - (l + 1)
-        connect fan.auxiliary[1] to replicator.principal
-        connect each replicator auxiliary to its occurrence
+emit M into body at level l
+finish variable port:
+    0 uses              → eraser
+    1 use, delta 0      → direct wire
+    otherwise           → unpaired replicator
+                            level = l + 1
+                            delta[i] = occurrence_level[i] - (l + 1)
 ```
 
-Deltas must remain signed. For example:
+Deltas stay signed. Identity `λx.x` is the classic level/`-1` example.
+
+### Application `[M N]` at level `l`
+
+Fan ports:
+
+- principal: function / child
+- auxiliary 0: result / parent
+- auxiliary 1: argument / child
+
+```text
+connect destination to result auxiliary
+emit M into principal at level l
+emit N into argument auxiliary at level l + 1
+```
+
+Outermost term: level `0`, wired to the root.
+
+### First fixtures
 
 ```text
 λx.x
-```
-
-has abstraction level `0`, replicator level `1`, and occurrence delta `-1`.
-
-### Application $[M\,N]_l$
-
-Create a fan with:
-
-- principal: function
-- auxiliary 0: result/parent
-- auxiliary 1: argument
-
-```text
-connect destination to fan.auxiliary[0]
-emit M into fan.principal at level l
-emit N into fan.auxiliary[1] at level l + 1
-```
-
-Compile the outer term at level `0`, connected to the root boundary.
-
-### First translation fixtures
-
-Verify exact topology for:
-
-```text
-λx.x          # one use
-λx.y          # eraser
-λx.x x        # sharing, deltas [-1, 0]
-(λx.x) y      # immediate fan/fan active pair
-λx.λy.x       # nested levels
-λx.λy.y x     # mixed argument levels
+λx.y
+λx.x x
+(λx.x) y
+λx.λy.x
+λx.λy.y x
 ```
 
 ---
 
-## 6. Complete the core interaction matrix
+## Core interaction matrix
 
 | Active pair | Rule |
 |---|---|
 | Eraser–Eraser | Delete both |
-| Eraser–Fan | Delete both; place one eraser on each fan auxiliary |
-| Eraser–Replicator | Delete both; place one eraser on each replicator auxiliary |
-| Fan–Fan | Annihilate; connect corresponding auxiliary contexts |
-| Fan–Replicator | Two replicator copies and one fan per replicator auxiliary |
-| Equal Replicator–Replicator | Annihilate; connect corresponding auxiliaries |
+| Eraser–Fan | Delete both; eraser on each fan auxiliary |
+| Eraser–Replicator | Delete both; eraser on each replicator auxiliary |
+| Fan–Fan | Annihilate; connect matching auxiliary contexts |
+| Fan–Replicator | Two replicator copies; one fan per replicator auxiliary |
+| Equal Replicator–Replicator | Annihilate; connect matching auxiliaries |
 | Unequal Replicator–Replicator | Cartesian commutation |
 
-For translated $\lambda$-terms, equal replicator levels imply complete equality. During development, nevertheless validate:
+During development, still validate level, arity, and ordered deltas on
+“equal” pairs. That catches corruption even when the fast path only compares
+levels.
 
-```text
-level
-arity
-ordered delta vector
-```
+For unequal `A_l(d…)` and `B_k(e…)` with `l < k`:
 
-This catches a corrupted translation or rewrite rather than silently misreducing it.
-
-For unequal replicators $A_l(d_0,\ldots,d_n)$ and $B_k(e_0,\ldots,e_m)$ with $l<k$:
-
-- Produce one higher-level replica for every $A$ auxiliary:
-  \[
-  B_{k+d_i}(e_0,\ldots,e_m)
-  \]
-- Produce one exact copy of $A_l(d_0,\ldots,d_n)$ for every $B$ auxiliary.
-- Connect the two families as an $(n+1)\times(m+1)$ Cartesian grid.
-- Preserve auxiliary order.
-
-Use checked signed arithmetic before converting a resulting level back to `ulong`.
+- one higher-level `B` copy per `A` auxiliary, at level `k + d_i`
+- one exact `A` copy per `B` auxiliary
+- wire as a Cartesian grid; preserve order
+- checked signed arithmetic before storing levels as `ulong`
 
 ---
 
-## 7. Implement canonicalization
+## Canonicalization
 
-Core interactions alone do not produce a canonical $\Delta K$ normal form.
+Interactions fire on principal–principal wires. Canonicalization cleans sharing
+structure that is not necessarily an active pair.
 
-### Unpaired replicator merging
+### Unpaired merge
 
-If unpaired replicator $A$ auxiliary $i$, with delta $d$, connects to the principal of unpaired $B$:
+If unpaired `A`’s auxiliary `i` with delta `d` meets unpaired `B`’s principal,
+and `0 ≤ level(B) - level(A) ≤ d`, merge:
 
-- Remove the connecting ports and wire.
-- Replace auxiliary $i$ of $A$ with all auxiliaries of $B$.
-- Preserve the other $A$ auxiliaries.
+```text
+new deltas =
+  A’s deltas before i,
+  then each of B’s deltas plus d,
+  then A’s deltas after i
+```
 
-The paper states when merging is safe but does not explicitly give the delta-vector rewrite. The compositional rule is:
+Consider merge before commuting that same unpaired replicator.
 
-\[
-[d_0,\ldots,d_{i-1},
- d+e_0,\ldots,d+e_m,
- d_{i+1},\ldots,d_n]
-\]
-
-**[INFERENCE]** This follows by composing the level offsets.
-
-An unknown consecutive $B$ may be proven unpaired when:
-
-\[
-0 \le l_B-l_A \le d
-\]
-
-### Unpaired replicator decay
+### Decay
 
 For an unpaired replicator:
 
-1. Remove every auxiliary connected to an eraser.
-2. If one auxiliary remains with delta `0`, replace the replicator with a wire.
-3. If no auxiliary remains, replace its principal context with an eraser **[INFERENCE]**; document this decision because the paper does not spell out the zero-arity rewrite.
+1. drop auxiliaries wired to erasers
+2. one remaining auxiliary with delta `0` → replace by a wire
+3. zero auxiliaries → replace principal context by an eraser (document the choice)
 
-Apply decay before fan replication, replicator replication, and phase-two auxiliary fan replication.
+Decay before any rewrite that would copy the replicator.
 
-### Reachability erasure
+### Reachability cleanup
 
-Traverse parent-to-child paths starting at the root:
+From the root, parent-to-child:
 
-1. Mark reachable nodes and wires.
-2. Delete everything unmarked.
-3. Replace connections from retained structure into deleted structure with erasers.
-4. Run unpaired decay.
-
-This canonicalization can replace eager eraser interactions, although keeping the local rules is useful for testing the complete core system.
+1. mark reachable structure
+2. delete the rest
+3. insert erasers where retained structure still touched deleted structure
+4. run decay again
 
 ---
 
-## 8. Use the required two-phase reducer
+## Two-phase reducer
+
+### Why order matters
+
+Scanning `net.wires` in storage order is not lambda order.
+
+- `(λx.y) Ω` must erase `Ω`, not diverge inside it
+- an unpaired merge must beat a commutation that would copy the same structure
 
 ### Phase 1
 
-Sequential leftmost-outermost loop:
-
 ```text
 repeat:
-    find the leftmost-outermost merge or active pair
-    decay involved unpaired replicators
-    prefer a legal merge before commuting that replicator
-    apply exactly one rewrite
-until no phase-1 rewrite exists
+    traverse root → children by polarity
+    pick leftmost-outermost legal merge or active pair
+    decay before copying a replicator
+    prefer legal merge before commute
+    apply one rewrite
+until stuck
 ```
 
-Recompute traversal order from the root initially. Do not depend on stable IDs or insertion order: neither represents lambda-term order.
+Recompute traversal after every step.
 
 ### Phase 2
 
-The paper defines phase two by treating every fan’s first auxiliary port as its principal port. Parameterize fan interaction rather than cloning the entire reducer:
+Treat each fan’s first auxiliary as the active fan port. Continue until fan-out
+replicators are gone and sharing has settled on variable ports. Then final
+reachability cleanup and decay.
 
-```text
-active_fan_port =
-    phase 1: principal
-    phase 2: auxiliary 0
-```
-
-In phase two, auxiliary fan replication replaces ordinary fan replication. Continue until:
-
-- no fan-out replicators remain;
-- sharing structures have accumulated at abstraction variable ports;
-- no phase-two rewrite remains.
-
-Then run final reachability erasure and decay.
-
-Only after the sequential evaluator is correct should you experiment with parallel annihilations. $\Delta K$ optimality depends on leftmost-outermost treatment of erasure and unpaired-replicator commutations.
+Parallelize independent rewrites only after the sequential path is correct.
 
 ---
 
-## 9. Read the canonical net back to a term
+## Readback
 
-Traverse from the root using polarity:
+From the root, by polarity:
 
-- Entering a fan through its principal parent port means **abstraction**:
-  - read body through auxiliary 0;
-  - allocate a fresh binder identity;
-  - associate the variable structure on auxiliary 1 with that binder.
-- Entering a fan through auxiliary 0 as parent means **application**:
-  - read function through principal;
-  - read argument through auxiliary 1.
-- A named boundary becomes a free variable.
-- A wire or canonical replicator branch leading to a binder’s variable port becomes that bound variable.
+- fan entered by principal parent → abstraction
+- fan entered by result-auxiliary parent → application
+- named free-variable interface → free name
+- path into a binder’s variable structure → bound variable
 
-Return a De Bruijn term first. Assign printable names only afterward. Compare results modulo alpha-equivalence.
+Read De Bruijn first; pretty-print names afterward. Compare modulo
+alpha-equivalence.
 
 ---
 
-## 10. Verification ladder
+## Verification ladder
 
-Do not test the entire evaluator first.
-
-### Graph tests
-
-One isolated test for every interaction rule and its mirror ordering. Assert the resulting topology and validator success.
-
-### Translation tests
-
-Golden graphs for the six small terms above. Assert levels, signed deltas, port order, polarity, and unpaired status.
-
-### Semantic differential tests
-
-For each normalizing term:
+1. **Graph tests** — every interaction, both endpoint orders, validator green
+2. **Translation tests** — golden graphs for the six small terms
+3. **Semantic tests**
 
 ```text
-delta_result =
-    readback(normalize(translate(term)))
-
-reference_result =
+assert alpha_equivalent(
+    readback(normalize(translate(term))),
     normal_order_reduce(term)
-
-assert alpha_equivalent(delta_result, reference_result)
+)
 ```
 
-Required cases:
+Minimum suite:
 
 ```text
-(λx.x) y                         -> y
-(λx.y) Ω                         -> y
-(λx.x x) (λy.y)                 -> λy.y
-(λx.λy.x) a b                   -> a
-(λx.λy.y) a b                   -> b
-(λf.λx.f (f x)) g z             -> g (g z)
+(λx.x) y              → y
+(λx.y) Ω              → y
+(λx.x x) (λy.y)      → λy.y
+(λx.λy.x) a b        → a
+(λx.λy.y) a b        → b
+(λf.λx.f (f x)) g z  → g (g z)
 ```
 
-Add Church booleans, numerals, nested sharing, free variables, shadowing, and the paper’s Lamping examples.
-
-For $\Omega=(\lambda x.x\,x)(\lambda x.x\,x)$, use a step limit. Assert that each step preserves graph invariants; once canonicalization is complete, track live-node growth as a performance regression check.
-
-### Definition of done
-
-The implementation is full only when this succeeds:
+### Done means
 
 ```text
-source
-  → parse
-  → De Bruijn
-  → canonical Delta-K net
-  → phase 1
-  → phase 2
-  → erasure/decay
-  → readback
-  → alpha-equivalent normal form
+source → parse → De Bruijn → net → phase 1 → phase 2
+      → cleanup → readback → alpha-equivalent normal form
 ```
 
-## Recommended immediate order
+### Immediate order
 
-1. Replace direct graph mutations with constructors, `connect`, `splice`, and destructors.
-2. Add polarity, boundaries, replicator status, and the graph validator.
-3. Repair and test all six core interaction families.
-4. Add parser and reference reducer.
-5. Implement translation.
-6. Implement leftmost-outermost phase one.
-7. Add merge, decay, and reachability erasure.
-8. Add phase two.
-9. Add readback and differential tests.
-10. Optimize allocation and parallelism last.
+1. constructors / `connect` / `splice` / destructors  
+2. polarity, interfaces, validator  
+3. core interaction families  
+4. parser + reference reducer  
+5. translation  
+6. phase-one scheduler  
+7. merge, decay, reachability  
+8. phase two  
+9. readback + differential tests  
+10. allocation and parallelism last  
 
-## Primary references
+---
 
-- [$\Delta$-Nets paper, arXiv:2505.20314](https://arxiv.org/abs/2505.20314)
-- [Official interactive evaluator](https://deltanets.org/)
-- [Official project repository](https://github.com/danaugrs/deltanets)
-- [Independent Go implementation—use as secondary evidence, not the specification](https://github.com/denful/GoDNet)
+## References
+
+- [Δ-Nets paper](https://arxiv.org/abs/2505.20314)
+- [Official evaluator](https://deltanets.org/)
+- [Official repo](https://github.com/danaugrs/deltanets)
+- [Go port — secondary evidence only](https://github.com/denful/GoDNet)
+- Full write-up: `DELTA_K_IMPLEMENTATION_GUIDE.md`

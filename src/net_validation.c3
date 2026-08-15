@@ -1,7 +1,7 @@
 module delta_net_abstract_machine;
 
-// Boundaries are represented by ports that no live node references. This model
-// does not yet record their polarity, so parent/child polarity is not checked.
+// Boundaries are represented by ports that no live node references. Wire
+// validation still enforces parent/child polarity for those boundary ports.
 fn bool node_references_port(Node* node, StableId port_id)
 {
 	switch (node.type)
@@ -121,8 +121,10 @@ fn bool wires_are_valid(Net* net)
 		Wire* wire = net.wires.get_ref(wire_id);
 		if (wire.a == wire.b || !net.ports.contains(wire.a)
 			|| !net.ports.contains(wire.b)) return false;
-		if (net.ports.get_ref(wire.a).wire_id != wire_id
-			|| net.ports.get_ref(wire.b).wire_id != wire_id) return false;
+		Port* a = net.ports.get_ref(wire.a);
+		Port* b = net.ports.get_ref(wire.b);
+		if (a.wire_id != wire_id || b.wire_id != wire_id
+			|| a.polarity == b.polarity) return false;
 	}
 	return true;
 }
