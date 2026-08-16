@@ -1,0 +1,17 @@
+flowchart TB
+  subgraph Before[Before fan annihilation]
+    direction LR
+    B[Abstraction body external: PARENT] --- AB[Abstraction body port: CHILD]
+    AV[Abstraction variable port: PARENT] --- V[Variable external: CHILD]
+    AF[Abstraction fan principal: PARENT]
+    APP[Application fan principal: CHILD]
+    R[Application result port: PARENT] --- C[Result-context external: CHILD]
+    AG[Application argument port: CHILD] --- N[Argument external: PARENT]
+    AF --- APP
+  end
+
+  subgraph After[After annihilation]
+    direction LR
+    B2[Abstraction body external: PARENT] --- C2[Result-context external: CHILD]
+    V2[Variable external: CHILD] --- N2[Argument external: PARENT]
+  end

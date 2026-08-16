@@ -42,57 +42,40 @@ erase_redex(net, fan_id, eraser_id, wire_id, fan_port_id, eraser_port_id);
 }
 
 fn void fan_fan_reduction(Net* net, StableId first_id, StableId second_id,
-StableId first_principal_id)
+	StableId first_principal_id)
 {
- Node* first = net.nodes.get_ref(first_id);
- Node* second = net.nodes.get_ref(second_id);
- StableId first_left = first.agent.fan.left;
- StableId first_right = first.agent.fan.right;
- StableId second_left = second.agent.fan.left;
- StableId second_right = second.agent.fan.right;
- StableId first_left_wire_id = net.ports.get_ref(first_left).wire_id;
- StableId first_right_wire_id = net.ports.get_ref(first_right).wire_id;
- StableId second_left_wire_id = net.ports.get_ref(second_left).wire_id;
- StableId second_right_wire_id = net.ports.get_ref(second_right).wire_id;
- StableId principal_wire_id = net.ports.get_ref(first_principal_id).wire_id;
- StableId left_external = other_endpoint(net, second_left_wire_id, second_left);
- StableId right_external = other_endpoint(net, second_right_wire_id, second_right);
+	Node* first = net.nodes.get_ref(first_id);
+	Node* second = net.nodes.get_ref(second_id);
+	StableId second_principal_id = second.agent.fan.principal;
+	StableId principal_wire_id = net.ports.get_ref(first_principal_id).wire_id;
 
- Wire* left_wire = net.wires.get_ref(first_left_wire_id);
- if (left_wire.a == first_left)
- {
-  left_wire.a = left_external;
- }
-else
-{
- left_wire.b = left_external;
-}
-net.ports.get_ref(left_external).wire_id = first_left_wire_id;
-Wire* right_wire = net.wires.get_ref(first_right_wire_id);
-if (right_wire.a == first_right)
-{
- right_wire.a = right_external;
-}
-else
-{
- right_wire.b = right_external;
-}
-net.ports.get_ref(right_external).wire_id = first_right_wire_id;
+	// A parent-principal fan is an abstraction; a child-principal fan is an
+	// application. Splice body to result and variable to argument, regardless
+	// of the active wire's endpoint order.
+	Node* abstraction = net.ports.get_ref(first_principal_id).polarity == PARENT
+		? first : second;
+	Node* application = abstraction == first ? second : first;
+	StableId abstraction_body = abstraction.agent.fan.right;
+	StableId abstraction_variable = abstraction.agent.fan.left;
+	StableId application_result = application.agent.fan.left;
+	StableId application_argument = application.agent.fan.right;
+	StableId first_left = first.agent.fan.left;
+	StableId first_right = first.agent.fan.right;
+	StableId second_left = second.agent.fan.left;
+	StableId second_right = second.agent.fan.right;
 
-StableId second_principal_id = second.agent.fan.principal;
-net.nodes.erase(first_id);
-net.nodes.erase(second_id);
-net.ports.erase(first_principal_id);
-// The remaining IDs are still valid handles, but erases may move dense
-// entries. Erase by the saved IDs, never by a dense index.
-net.ports.erase(first_left);
-net.ports.erase(first_right);
-net.ports.erase(second_left);
-net.ports.erase(second_right);
-net.ports.erase(second_principal_id);
-net.wires.erase(principal_wire_id);
-net.wires.erase(second_left_wire_id);
-net.wires.erase(second_right_wire_id);
+	(void)splice(net, abstraction_body, application_result);
+	(void)splice(net, abstraction_variable, application_argument);
+
+	net.nodes.erase(first_id);
+	net.nodes.erase(second_id);
+	net.ports.erase(first_principal_id);
+	net.ports.erase(second_principal_id);
+	net.ports.erase(first_left);
+	net.ports.erase(first_right);
+	net.ports.erase(second_left);
+	net.ports.erase(second_right);
+	net.wires.erase(principal_wire_id);
 }
 
 fn void replicator_fan_reduction(Net* net, StableId replicator_id, StableId fan_id)
@@ -111,7 +94,9 @@ fn void replicator_fan_reduction(Net* net, StableId replicator_id, StableId fan_
  StableId[] left_auxiliaries = {};
  StableId[] right_auxiliaries = {};
 
- // The fan's branches become the principal ports of the two copies.
+ // Reuse the fan branches as the principals of two replicator copies.
+ // These ports are not cloned; only their slot and owner change.
+ // Save polarity before changing ownership so the orientation is explicit.
  Port* left_principal = net.ports.get_ref(fan_left);
  Port* right_principal = net.ports.get_ref(fan_right);
  left_principal.slot.type = PRINCIPAL;
@@ -140,20 +125,28 @@ StableId left_copy_id = net.nodes.push(left_copy);
 StableId right_copy_id = net.nodes.push(right_copy);
 net.ports.get_ref(fan_left).node_id = left_copy_id;
 net.ports.get_ref(fan_right).node_id = right_copy_id;
-left_auxiliaries = clone_ports(net, old_auxiliaries, left_copy_id);
-right_auxiliaries = clone_ports(net, old_auxiliaries, right_copy_id);
-net.nodes.get_ref(left_copy_id).agent.replicator.auxiliaries = left_auxiliaries;
-net.nodes.get_ref(right_copy_id).agent.replicator.auxiliaries = right_auxiliaries;
+ // Clone every old auxiliary for each output replicator. A copied
+ // replicator must orient its auxiliaries opposite its reused principal:
+ // one output is a fan-out and the other a fan-in.
+ left_auxiliaries = clone_ports(net, old_auxiliaries, left_copy_id);
+ right_auxiliaries = clone_ports(net, old_auxiliaries, right_copy_id);
+ foreach (auxiliary : left_auxiliaries)
+  net.ports.get_ref(auxiliary).polarity = opposite_polarity(left_principal_polarity);
+ foreach (auxiliary : right_auxiliaries)
+  net.ports.get_ref(auxiliary).polarity = opposite_polarity(right_principal_polarity);
+ net.nodes.get_ref(left_copy_id).agent.replicator.auxiliaries = left_auxiliaries;
+ net.nodes.get_ref(right_copy_id).agent.replicator.auxiliaries = right_auxiliaries;
 
 foreach (idx, old_auxiliary_id : old_auxiliaries)
 {
- // Reuse the old auxiliary edge as the principal edge of a new fan.
-
+ // Reuse the old auxiliary as the principal of a newly created fan.
+ // The two branch ports below are genuinely new ports.
  Port* old_auxiliary = net.ports.get_ref(old_auxiliary_id);
  old_auxiliary.slot = { .type = PRINCIPAL };
  StableId new_left = net.ports.push({
   .wire_id = INVALID_STABLE_ID,
   .slot = { .type = LEFT },
+  // A wire must connect opposite endpoint polarities.
   .polarity = opposite_polarity(
    net.ports.get_ref(left_auxiliaries[idx]).polarity)
  });

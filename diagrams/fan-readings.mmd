@@ -1,0 +1,12 @@
+flowchart TB
+  R[PARENT: abstraction result] --- P[PARENT: principal port]
+  P --- F[Fan]
+  F --- V[PARENT: variable x]
+  F --- B[CHILD: body M]
+  F ---|abstraction reading| L[λx.M]
+
+  AR[PARENT: application result] --- AP[PARENT: principal port]
+  AP --- F2[Fan]
+  F2 --- FN[CHILD: function M]
+  F2 --- A[CHILD: argument N]
+  F2 ---|application reading| APP[M N]

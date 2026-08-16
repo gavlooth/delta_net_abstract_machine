@@ -174,6 +174,8 @@ Constructors and destructors should enforce:
 
 - replicator auxiliary count equals metadata count
 - copied auxiliaries keep position and signed delta
+- a copied auxiliary is assigned the polarity opposite its output replicator
+  principal; fan–replicator commutation creates one fan-in and one fan-out
 - new ports receive polarity before wiring
 - deleted ports disconnect before erasure
 - auxiliary slices are copied or transferred, never accidentally shared
@@ -323,8 +325,8 @@ Outermost term: level `0`, wired to the root.
 | Eraser–Eraser | Delete both |
 | Eraser–Fan | Delete both; eraser on each fan auxiliary |
 | Eraser–Replicator | Delete both; eraser on each replicator auxiliary |
-| Fan–Fan | Annihilate; connect matching auxiliary contexts |
-| Fan–Replicator | Two replicator copies; one fan per replicator auxiliary |
+| Fan–Fan | Annihilate; splice abstraction body to application result and abstraction variable to application argument |
+| Fan–Replicator | Produce one fan-in and one fan-out replicator; one new fan per old replicator auxiliary |
 | Equal Replicator–Replicator | Annihilate; connect matching auxiliaries |
 | Unequal Replicator–Replicator | Cartesian commutation |
 

@@ -136,7 +136,7 @@ fn StableId new_replicator(Net* net, ulong level, long[] ordered_deltas,
  return node_id;
 }
 
-fn StableId new_interface(Net* net, InterfaceType type, String name)
+fn StableId new_interface(Net* net, InterfacePortType type, String name)
 {
  assert(type == ROOT || name.len > 0,
   "A free-variable interface must have a name");

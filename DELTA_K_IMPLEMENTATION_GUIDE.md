@@ -193,53 +193,92 @@ There is no permanent label on the node saying “I am a lambda” or “I am an
 application.” The meaning comes from **how you arrive at the fan** when you
 walk from the result of the whole term, and from the directions of its ports.
 
-One helpful picture for an abstraction:
+Here is the abstraction and application reading rendered as a single Mermaid
+diagram. The node shape is shared; the surrounding polarity determines how
+the interpreter reads it:
+
+![The abstraction and application readings of a fan](diagrams/rendered/fan-readings.png)
+
+Do not get too attached to where a port appears on the page. “Top,” “left,”
+and “right” are drawing choices. `PARENT` and `CHILD` are semantic facts.
+The same three-port shape can therefore have two readings even when a quick
+sketch makes the nodes look identical.
+
+If the implementation only stores tags like `PRINCIPAL`, `LEFT`, `RIGHT`, and
+`AUXILIARY`, those readings collapse into one ambiguous triangle of ports.
+The slot tells you where a port sits on an agent. Its polarity tells you which
+way that occurrence participates in the term.
+
+#### Fan annihilation matches auxiliary order, not drawing geometry
+
+The paper orders a fan’s auxiliaries clockwise. That order survives rotation of
+the fan; a page-relative “left” label does not. The implementation’s fields
+therefore map the two lambda readings as follows:
 
 ```text
-        parent port: the abstraction as a value
-                     |
-                    fan
-                  /     \
-     parent: the          child: the body M
-     variable x
+                         first auxiliary       second auxiliary
+abstraction              RIGHT: body           LEFT: variable
+application              LEFT: result          RIGHT: argument
 ```
 
-And for an application:
+Fan annihilation has one rule: connect first auxiliary to first auxiliary and
+second auxiliary to second auxiliary:
+
+![Fan annihilation connects matching auxiliary indices](diagrams/rendered/beta-annihilation.png)
 
 ```text
-                 parent port: the application as a value
-                              |
-                             fan
-                           /     \
-            child: function       child: argument
+abstraction RIGHT (body)     ── application LEFT  (result)
+abstraction LEFT  (variable) ── application RIGHT (argument)
 ```
 
-Same three-port shape. Different encounter pattern. If the implementation
-only stores tags like `PRINCIPAL`, `LEFT`, `RIGHT`, and `AUXILIARY`, those two
-readings collapse into one ambiguous triangle of ports.
+Whether these lines cross in a particular drawing is irrelevant: a wire
+crossing is not a node or an interaction. The only semantic constraints are
+auxiliary order and the resulting `PARENT ─ CHILD` endpoints. Do not infer the
+rule from the page geometry.
 
 ### 3.2 Parent and child
 
 Every port needs a semantic direction. The paper’s names are simple once you
-hear them as “who points at whom”:
+hear them as “which side of the rooted term this port belongs to”:
 
 ```text
-PARENT  — the surrounding term points into this port
-CHILD   — this fragment points outward toward a subterm
+PARENT  — the surrounding term / context side
+CHILD   — the subterm / continuation side
 ```
 
+These names do **not** describe an arrow running from one node to another.
+They classify the two endpoints of a wire. A wire is an undirected connection
+whose endpoints have opposite polarity:
+
+```text
+surrounding context   PARENT ───────── CHILD   subterm
+```
+
+The fan is not an intermediate station where a child flows into the fan and
+then flows onward to a parent. Both ports are attached to the same agent; the
+labels say how each port is oriented relative to the root traversal.
+
+A rooted traversal makes the relationship concrete:
+
+![Root-to-child polarity traversal](diagrams/rendered/polarity.png)
+ 
 A proper Δ-net wire always joins opposite directions:
 
 ```text
-parent ───────── child
+valid                         invalid
+
+ P ───────────── C             P ───────────── P
+                               C ───────────── C
 ```
 
-These are illegal:
 
-```text
-parent ───────── parent
-child  ───────── child
-```
+
+
+
+The letters describe the two ends of the wire; they are not arrows saying
+that reduction runs from left to right. Reduction is a separate operation on
+interacting agents. Polarity gives the rooted graph an orientation before,
+during, and after those interactions.
 
 That invariant is why a lonely `Polarity` enum sitting unused in a header is
 not enough. Polarity must live on every `Port`, be assigned when the port is
@@ -269,20 +308,50 @@ order. Scanning `net.wires` from index zero gives allocation history.
 
 A **canonical replicator** is a fan-in:
 
+![Fan-in and fan-out replicator orientations](diagrams/rendered/replicators.png)
+
+Read fan-in as several logical uses converging on one shared object. It does
+not mean that several reductions flow into the replicator. The labels classify
+the endpoint roles:
+
 ```text
-principal: child
-auxiliaries: parents
+             principal    auxiliaries    shape
+fan-in       CHILD        PARENT         many → one
+fan-out      PARENT       CHILD          one → many
 ```
 
-Reduction can also produce a fan-out replicator:
+The concrete fan–replicator rewrite makes the copying visible:
 
 ```text
-principal: parent
-auxiliaries: children
+fan.left  ──reused as──>  left_copy.principal   (fan-out)
+fan.right ──reused as──>  right_copy.principal  (fan-in)
+
+old_auxiliary[i] ──cloned──> left_auxiliary[i]
+                    └─────> right_auxiliary[i]
+
+old_auxiliary[i] ──reused as──> new_fan.principal
+new_left  ───────────────────── left_auxiliary[i]
+new_right ───────────────────── right_auxiliary[i]
 ```
+
+The fan branches and old auxiliary ports are reused. The two auxiliary
+families are copied, and `new_left` and `new_right` are newly allocated.
+Each copied family is oriented against its own reused principal:
+
+```text
+left_auxiliary[i].polarity  = opposite(left_copy.principal.polarity)
+right_auxiliary[i].polarity = opposite(right_copy.principal.polarity)
+```
+
+One copy is therefore a fan-out and the other a fan-in. Copying preserves
+identity-independent metadata such as auxiliary position and level delta; it
+does not blindly preserve polarity when the output replicator's orientation
+changes. Newly allocated ports receive the opposite polarity of the port at
+the other end of their new wire.
 
 Whether two sharing agents may pair, and whether an unpaired merge is safe,
-depends on knowing which orientation you are looking at.
+depends on which orientation is present. Pairing and merging are reduction
+questions. Fan-in and fan-out are structural answers supplied by polarity.
 
 #### Reachability cleanup
 
@@ -382,28 +451,30 @@ They are not enough for a translator, a scheduler, or readback.
 ### 4.4 A concrete representation
 
 ```c3
-enum InterfaceKind
+enum InterfacePortType
 {
     ROOT,
     FREE_VARIABLE,
 }
 
-struct Interface
+struct InterfacePort
 {
-    InterfaceKind kind;
+    InterfacePortType type;
     String name;      // meaningful for free variables; empty for the root
     StableId port;
 }
 ```
 
-Call them interfaces, roots, free-variable ports—whatever keeps the code
-readable. The important part is the job they do:
+Call them **interface ports**, roots, or free-variable ports—whatever keeps
+the code readable. `InterfacePort` is the concrete implementation term:
+unlike a programming-language interface, it describes an exposed port of the
+net. The important part is the job it does:
 
-- the interface owns its port
+- the interface port owns its port
 - the port has exactly one live wire
-- the interface never becomes an active pair by itself
+- the interface port never becomes an active pair by itself
 - the graph has exactly one root
-- every free name the term still exposes has a stable named interface
+- every free name the term still exposes has a stable named interface port
 
 During translation, the term’s result is wired to the root and each free
 occurrence is wired to the interface for that name. During reduction, the

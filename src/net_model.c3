@@ -21,15 +21,17 @@ fn Polarity opposite_polarity(Polarity polarity) @private
 
 
 
-enum InterfaceType
+// An InterfacePort is an exposed net boundary, not an active agent.
+// ROOT is the result boundary; FREE_VARIABLE preserves a free name.
+enum InterfacePortType
 {
     ROOT,
     FREE_VARIABLE,
 }
 
-struct Interface
+struct InterfacePort
 {
-    InterfaceType type;
+    InterfacePortType type;
     Maybe{String} name;
     StableId port;
 }
@@ -120,5 +122,5 @@ struct Net
  Siv{Port} ports;
  Siv{Wire} wires;
  Siv{Node} nodes;
- Siv{Interface} interfaces;
+    Siv{InterfacePort} interfaces;
 }

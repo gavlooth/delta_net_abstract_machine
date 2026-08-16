@@ -1,0 +1,9 @@
+flowchart LR
+  U1[Use 1] --- R[Fan-in replicator]
+  U2[Use 2] --- R
+  U3[Use 3] --- R
+  R --- S[Shared child structure]
+  P[One parent context] --- O[Fan-out replicator]
+  O --- B1[Branch 1]
+  O --- B2[Branch 2]
+  O --- B3[Branch 3]

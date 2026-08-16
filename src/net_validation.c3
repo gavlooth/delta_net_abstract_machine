@@ -43,16 +43,23 @@ fn bool node_is_valid(Net* net, StableId node_id, Node* node)
 		if (node.agent.fan.principal == node.agent.fan.left
 			|| node.agent.fan.principal == node.agent.fan.right
 			|| node.agent.fan.left == node.agent.fan.right) return false;
-		return node_port_is_valid(net, node_id, node.agent.fan.principal, PRINCIPAL)
-			&& node_port_is_valid(net, node_id, node.agent.fan.left, LEFT)
-			&& node_port_is_valid(net, node_id, node.agent.fan.right, RIGHT);
+		// LEFT is the parent auxiliary; RIGHT is the child auxiliary. The
+		// principal distinguishes abstraction (parent) from application (child).
+		if (!node_port_is_valid(net, node_id, node.agent.fan.principal, PRINCIPAL)
+			|| !node_port_is_valid(net, node_id, node.agent.fan.left, LEFT)
+			|| !node_port_is_valid(net, node_id, node.agent.fan.right, RIGHT)) return false;
+		return net.ports.get_ref(node.agent.fan.left).polarity == PARENT
+			&& net.ports.get_ref(node.agent.fan.right).polarity == CHILD;
 	case REPLICATOR:
 		StableId principal = node.agent.replicator.principal;
 		if (!node_port_is_valid(net, node_id, principal, PRINCIPAL)) return false;
+		Polarity auxiliary_polarity =
+			opposite_polarity(net.ports.get_ref(principal).polarity);
 		foreach (idx, auxiliary : node.agent.replicator.auxiliaries)
 		{
 			if (auxiliary == principal
-				|| !node_port_is_valid(net, node_id, auxiliary, AUXILIARY)) return false;
+				|| !node_port_is_valid(net, node_id, auxiliary, AUXILIARY)
+				|| net.ports.get_ref(auxiliary).polarity != auxiliary_polarity) return false;
 			foreach (other_idx, other : node.agent.replicator.auxiliaries)
 			{
 				if (idx != other_idx && auxiliary == other) return false;
