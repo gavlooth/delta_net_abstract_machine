@@ -188,14 +188,14 @@ the graph machine, not part of the graph implementation.
 
 ## 6. Encode abstractions
 
-An abstraction has one result and two semantic branches:
+An abstraction has one result and two ordered auxiliaries:
 
 ```mermaid
 flowchart TB
   R[PARENT: abstraction result] --- P[PARENT: principal port]
   P --- F[Fan]
-  F --- V[PARENT: variable x]
-  F --- B[CHILD: body M]
+  F --- B[LEFT / auxiliary 1: CHILD body M]
+  F --- V[RIGHT / auxiliary 2: PARENT variable x]
 ```
 
 Encoding steps:
@@ -213,28 +213,29 @@ traversal determine the abstraction reading.
 
 ## 7. Encode applications
 
-An application has one result and two child branches:
+An application has one result and two child-facing subterms:
 
 ```mermaid
 flowchart TB
-  R[PARENT: application result] --- P[PARENT: principal port]
-  P --- F[Fan]
-  F --- FN[CHILD: function M]
-  F --- A[CHILD: argument N]
+  C[CHILD: surrounding context] --- R[LEFT / auxiliary 1: PARENT result]
+  R --- F[Fan]
+  F --- FN[CHILD: principal / function M]
+  F --- A[RIGHT / auxiliary 2: CHILD argument N]
 ```
 
 Encoding steps:
 
 ```text
-1. Allocate a fan.
-2. Connect its result/principal path to the destination port.
-3. Encode the function under one child port.
-4. Encode the argument under the other child port.
+1. Allocate a fan with a CHILD principal.
+2. Connect the LEFT/result auxiliary to the destination context.
+3. Encode the function under the principal child port.
+4. Encode the argument under the RIGHT child auxiliary.
 ```
 
-The application fan has two `CHILD` branches. The arrows in the diagram are
-wire layout only; polarity labels classify endpoints and do not describe runtime
-flow.
+The application fan has one `PARENT` result auxiliary and two `CHILD` ports.
+Auxiliaries have agent-local counterclockwise identities: `LEFT` is auxiliary
+1 and `RIGHT` is auxiliary 2. As with a handshake, fan annihilation connects
+`LEFT ↔ LEFT` and `RIGHT ↔ RIGHT`; page geometry does not alter that rule.
 
 ## 8. Encode variables
 

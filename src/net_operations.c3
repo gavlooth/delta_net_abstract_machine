@@ -52,15 +52,15 @@ fn StableId[] clone_ports(Net* net, StableId[] source_port_ids,
 
 fn StableId new_fan(Net* net, Polarity principal_polarity = PARENT)
 {
- // The two auxiliaries are not globally PARENT/CHILD. Their polarity is
- // derived from this fan's orientation while their identity stays fixed:
+ // Auxiliary identity follows the agent-local counterclockwise order:
+ // LEFT is auxiliary 1 and RIGHT is auxiliary 2. Like a handshake, matching
+ // two facing fans connects LEFT to LEFT and RIGHT to RIGHT; page positions
+ // may appear crossed but never change the port identities.
  //
  //   principal PARENT (abstraction): left/aux1 CHILD,  right/aux2 PARENT
  //   principal CHILD  (application): left/aux1 PARENT, right/aux2 CHILD
  //
- // Keeping `left = aux1` and `right = aux2` in both rows is essential. Do
- // not swap the fields for an application merely because a rendered diagram
- // faces the abstraction in the opposite direction.
+ // Do not swap fields when rendering or matching a rotated fan.
  StableId principal = net.ports.push({
   .wire_id = INVALID_STABLE_ID,
   .slot = { .type = PRINCIPAL },

@@ -209,32 +209,30 @@ If the implementation only stores tags like `PRINCIPAL`, `LEFT`, `RIGHT`, and
 The slot tells you where a port sits on an agent. Its polarity tells you which
 way that occurrence participates in the term.
 
-#### Fan annihilation matches auxiliary order, not drawing geometry
+#### Fan annihilation matches stable auxiliary identities
 
-The paper orders a fan’s auxiliaries clockwise. That order survives rotation of
-the fan; a page-relative “left” label does not. The implementation’s fields
-therefore map the two lambda readings as follows:
-
-```text
-                         first auxiliary       second auxiliary
-abstraction              RIGHT: body           LEFT: variable
-application              LEFT: result          RIGHT: argument
-```
-
-Fan annihilation has one rule: connect first auxiliary to first auxiliary and
-second auxiliary to second auxiliary:
-
-![Fan annihilation connects matching auxiliary indices](diagrams/rendered/beta-annihilation.png)
+The implementation names the two ordered auxiliaries `LEFT` and `RIGHT`.
+They are stable, agent-local identities in counterclockwise order: `LEFT` is
+auxiliary 1 and `RIGHT` is auxiliary 2, not page-side coordinates. Like a
+handshake, two facing fans connect the same local side—`LEFT ↔ LEFT` and
+`RIGHT ↔ RIGHT`—even if those wires look crossed in a drawing. The polarity
+depends on whether the fan is read as an abstraction or application:
 
 ```text
-abstraction RIGHT (body)     ── application LEFT  (result)
-abstraction LEFT  (variable) ── application RIGHT (argument)
+                         auxiliary 1 / LEFT       auxiliary 2 / RIGHT
+abstraction              CHILD: body              PARENT: variable
+application              PARENT: result           CHILD: argument
 ```
 
-Whether these lines cross in a particular drawing is irrelevant: a wire
-crossing is not a node or an interaction. The only semantic constraints are
-auxiliary order and the resulting `PARENT ─ CHILD` endpoints. Do not infer the
-rule from the page geometry.
+Thus fan annihilation is ordinary corresponding-auxiliary pairing:
+
+```text
+abstraction LEFT   (body)      ── application LEFT  (result)
+abstraction RIGHT  (variable)  ── application RIGHT (argument)
+```
+
+The resulting wires are `PARENT ─ CHILD`; a drawn wire crossing is neither a
+node nor an interaction.
 
 ### 3.2 Parent and child
 
