@@ -84,6 +84,20 @@ struct Wire
  StableId b;
 }
 
+// A fan has two *named auxiliary identities*, not two global positions.
+//
+// `left` is auxiliary 1 (also called `first`) and `right` is auxiliary 2
+// (also called `second`). These names stay attached to the agent when a
+// diagram mirrors it. Consequently a fan--fan annihilation always pairs
+// left with left and right with right. In a facing diagram those same-index
+// wires can look crossed; that is a drawing consequence, never a reason to
+// exchange the stored fields.
+//
+// Semantic names are only local views of these identities:
+//   parent-principal fan: left = abstraction body, right = bound variable
+//   child-principal fan:  left = application result, right = argument
+// Do not encode the semantic roles as different fields: the generic graph
+// rewrite operates on the stable auxiliary identities below.
 struct Fan
 {
  StableId principal;

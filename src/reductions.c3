@@ -49,23 +49,31 @@ fn void fan_fan_reduction(Net* net, StableId first_id, StableId second_id,
 	StableId second_principal_id = second.agent.fan.principal;
 	StableId principal_wire_id = net.ports.get_ref(first_principal_id).wire_id;
 
-	// A parent-principal fan is an abstraction; a child-principal fan is an
-	// application. Splice body to result and variable to argument, regardless
-	// of the active wire's endpoint order.
-	Node* abstraction = net.ports.get_ref(first_principal_id).polarity == PARENT
-		? first : second;
-	Node* application = abstraction == first ? second : first;
-	StableId abstraction_body = abstraction.agent.fan.right;
-	StableId abstraction_variable = abstraction.agent.fan.left;
-	StableId application_result = application.agent.fan.left;
-	StableId application_argument = application.agent.fan.right;
-	StableId first_left = first.agent.fan.left;
-	StableId first_right = first.agent.fan.right;
-	StableId second_left = second.agent.fan.left;
-	StableId second_right = second.agent.fan.right;
+	// Canonicalize operand order because splice preserves its first wire ID.
+	// This keeps the physical result independent of active-wire endpoint order;
+	// it does not change either fan's auxiliary identities. The parent-principal
+	// choice is only a deterministic wire-ownership choice, not an instruction
+	// to pair different auxiliary indices.
+	Node* parent_principal_fan =
+		net.ports.get_ref(first_principal_id).polarity == PARENT ? first : second;
+	Node* child_principal_fan = parent_principal_fan == first ? second : first;
+	StableId first_left = parent_principal_fan.agent.fan.left;
+	StableId first_right = parent_principal_fan.agent.fan.right;
+	StableId second_left = child_principal_fan.agent.fan.left;
+	StableId second_right = child_principal_fan.agent.fan.right;
 
-	(void)splice(net, abstraction_body, application_result);
-	(void)splice(net, abstraction_variable, application_argument);
+	// FAN--FAN ANNIHILATION: pair corresponding auxiliary identities.
+	//
+	//   left/first/aux1   <--> left/first/aux1
+	//   right/second/aux2 <--> right/second/aux2
+	//
+	// The agents may be drawn facing one another, so same-index wires may look
+	// crossed on paper. That visual crossing is correct and must NOT be
+	// implemented as left<-->right or right<-->left. Translation/readback may
+	// assign local semantic names (body/result, variable/argument), but this
+	// graph-level rule deliberately knows only the stable auxiliary identity.
+	(void)splice(net, first_left, second_left);
+	(void)splice(net, first_right, second_right);
 
 	net.nodes.erase(first_id);
 	net.nodes.erase(second_id);

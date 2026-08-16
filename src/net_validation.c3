@@ -43,13 +43,21 @@ fn bool node_is_valid(Net* net, StableId node_id, Node* node)
 		if (node.agent.fan.principal == node.agent.fan.left
 			|| node.agent.fan.principal == node.agent.fan.right
 			|| node.agent.fan.left == node.agent.fan.right) return false;
-		// LEFT is the parent auxiliary; RIGHT is the child auxiliary. The
-		// principal distinguishes abstraction (parent) from application (child).
+		// LEFT and RIGHT are stable auxiliary identities, not global geometry:
+		// LEFT is auxiliary 1 and RIGHT is auxiliary 2. Mirroring a fan changes
+		// their polarities relative to the principal, but never swaps the slots.
+		// In particular, do not replace this relation with "left is PARENT and
+		// right is CHILD": that accepts a wrongly-oriented abstraction and
+		// forces the incorrect crossed fan--fan rewrite.
 		if (!node_port_is_valid(net, node_id, node.agent.fan.principal, PRINCIPAL)
 			|| !node_port_is_valid(net, node_id, node.agent.fan.left, LEFT)
 			|| !node_port_is_valid(net, node_id, node.agent.fan.right, RIGHT)) return false;
-		return net.ports.get_ref(node.agent.fan.left).polarity == PARENT
-			&& net.ports.get_ref(node.agent.fan.right).polarity == CHILD;
+		Polarity principal_polarity =
+			net.ports.get_ref(node.agent.fan.principal).polarity;
+		return net.ports.get_ref(node.agent.fan.left).polarity
+				== opposite_polarity(principal_polarity)
+			&& net.ports.get_ref(node.agent.fan.right).polarity
+				== principal_polarity;
 	case REPLICATOR:
 		StableId principal = node.agent.replicator.principal;
 		if (!node_port_is_valid(net, node_id, principal, PRINCIPAL)) return false;

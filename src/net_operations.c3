@@ -50,22 +50,33 @@ fn StableId[] clone_ports(Net* net, StableId[] source_port_ids,
 }
 
 
-fn StableId new_fan(Net* net)
+fn StableId new_fan(Net* net, Polarity principal_polarity = PARENT)
 {
+ // The two auxiliaries are not globally PARENT/CHILD. Their polarity is
+ // derived from this fan's orientation while their identity stays fixed:
+ //
+ //   principal PARENT (abstraction): left/aux1 CHILD,  right/aux2 PARENT
+ //   principal CHILD  (application): left/aux1 PARENT, right/aux2 CHILD
+ //
+ // Keeping `left = aux1` and `right = aux2` in both rows is essential. Do
+ // not swap the fields for an application merely because a rendered diagram
+ // faces the abstraction in the opposite direction.
  StableId principal = net.ports.push({
   .wire_id = INVALID_STABLE_ID,
   .slot = { .type = PRINCIPAL },
-  .polarity = PARENT
+  .polarity = principal_polarity
  });
  StableId left = net.ports.push({
   .wire_id = INVALID_STABLE_ID,
   .slot = { .type = LEFT },
-  .polarity = PARENT
+  // LEFT is auxiliary 1: abstraction body or application result.
+  .polarity = opposite_polarity(principal_polarity)
  });
  StableId right = net.ports.push({
   .wire_id = INVALID_STABLE_ID,
   .slot = { .type = RIGHT },
-  .polarity = CHILD
+  // RIGHT is auxiliary 2: abstraction variable or application argument.
+  .polarity = principal_polarity
  });
  StableId node_id = net.nodes.push({
   .agent = { .fan = {

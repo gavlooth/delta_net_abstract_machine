@@ -54,6 +54,27 @@ fn void assert_split_fan(Net* net, StableId former_auxiliary,
 		== net.ports.get_ref(fan.agent.fan.right).wire_id);
 }
 
+fn void assert_replicated_auxiliary_metadata(Net* net,
+	StableId former_auxiliary, PortSlot expected, StableId left_auxiliary,
+	StableId right_auxiliary)
+{
+	PortSlot left_slot = net.ports.get_ref(left_auxiliary).slot;
+	PortSlot right_slot = net.ports.get_ref(right_auxiliary).slot;
+	assert(left_slot.properties.has_value && right_slot.properties.has_value);
+	assert(left_slot.properties.value.position == expected.properties.value.position);
+	assert(right_slot.properties.value.position == expected.properties.value.position);
+	assert(left_slot.properties.value.delta_level
+		== expected.properties.value.delta_level);
+	assert(right_slot.properties.value.delta_level
+		== expected.properties.value.delta_level);
+
+	// The original auxiliary is now a fan principal, so its metadata must have
+	// followed the replicated auxiliary role rather than remaining on this port.
+	PortSlot former_auxiliary_slot = net.ports.get_ref(former_auxiliary).slot;
+	assert(former_auxiliary_slot.type == PRINCIPAL);
+	assert(!former_auxiliary_slot.properties.has_value);
+}
+
 fn void assert_replicator_fan_result(Net* net, StableId replicator, StableId fan,
 	StableId fan_left, StableId fan_right, StableId first_auxiliary,
 	StableId second_auxiliary)
@@ -117,11 +138,11 @@ fn StableId add_fan(Net* net, Polarity principal_polarity = PARENT)
 	});
 	StableId left = net.ports.push({
 		.slot = { .type = LEFT },
-		.polarity = PARENT
+		.polarity = opposite(principal_polarity)
 	});
 	StableId right = net.ports.push({
 		.slot = { .type = RIGHT },
-		.polarity = CHILD
+		.polarity = principal_polarity
 	});
 	StableId node = net.nodes.push({
 		.agent = { .fan = { .principal = principal, .left = left, .right = right } },
@@ -134,7 +155,7 @@ fn StableId add_fan(Net* net, Polarity principal_polarity = PARENT)
 }
 
 fn StableId add_replicator(Net* net, ulong level, sz arity,
-	Polarity principal_polarity = CHILD)
+	Polarity principal_polarity = CHILD, ReplicatorStatus status = UNPAIRED)
 {
 	StableId principal = net.ports.push({
 		.slot = { .type = PRINCIPAL },
@@ -146,7 +167,7 @@ fn StableId add_replicator(Net* net, ulong level, sz arity,
 			.principal = principal,
 			.auxiliaries = auxiliaries,
 			.delta_level = level,
-			.status = UNPAIRED
+			.status = status
 		} },
 		.type = REPLICATOR
 	});
@@ -209,8 +230,8 @@ fn void fan_eraser_interaction_replaces_branches_with_erasers() @test
 	StableId left = net.nodes.get_ref(fan).agent.fan.left;
 	StableId right = net.nodes.get_ref(fan).agent.fan.right;
 	connect(&net, fan_principal, eraser_principal);
-	connect(&net, left, add_external_port(&net, CHILD));
-	connect(&net, right, add_external_port(&net, PARENT));
+	connect(&net, left, add_external_port(&net, PARENT));
+	connect(&net, right, add_external_port(&net, CHILD));
 	StableId wire = net.ports.get_ref(fan_principal).wire_id;
 
 	delta_net_abstract_machine::interact(&net, wire);
@@ -238,8 +259,8 @@ fn void eraser_fan_interaction_replaces_branches_with_erasers() @test
 	StableId left = net.nodes.get_ref(fan).agent.fan.left;
 	StableId right = net.nodes.get_ref(fan).agent.fan.right;
 	connect(&net, eraser_principal, fan_principal);
-	connect(&net, left, add_external_port(&net, CHILD));
-	connect(&net, right, add_external_port(&net, PARENT));
+	connect(&net, left, add_external_port(&net, PARENT));
+	connect(&net, right, add_external_port(&net, CHILD));
 
 	delta_net_abstract_machine::interact(&net, net.ports.get_ref(eraser_principal).wire_id);
 
@@ -253,22 +274,24 @@ fn void eraser_fan_interaction_replaces_branches_with_erasers() @test
 	assert(delta_net_abstract_machine::validate_net(&net));
 }
 
-fn void fan_fan_interaction_splices_the_branch_wires() @test
+fn void fan_fan_interaction_splices_matching_auxiliary_wires() @test
 {
 	Net net;
 	net.init();
 	defer net.free();
 
-	StableId first = add_fan(&net);
-	StableId second = add_fan(&net, CHILD);
+	// The fans are facing only in a drawing. These fields remain aux1/aux2 on
+	// both agents, so this fixture must reduce left<-->left and right<-->right.
+	StableId first = delta_net_abstract_machine::new_fan(&net, PARENT);
+	StableId second = delta_net_abstract_machine::new_fan(&net, CHILD);
 	StableId first_principal = principal(&net, first);
 	StableId second_principal = principal(&net, second);
 	StableId first_left = net.nodes.get_ref(first).agent.fan.left;
 	StableId first_right = net.nodes.get_ref(first).agent.fan.right;
 	StableId second_left = net.nodes.get_ref(second).agent.fan.left;
 	StableId second_right = net.nodes.get_ref(second).agent.fan.right;
-	StableId first_left_external = add_external_port(&net, CHILD);
-	StableId first_right_external = add_external_port(&net, PARENT);
+	StableId first_left_external = add_external_port(&net, PARENT);
+	StableId first_right_external = add_external_port(&net, CHILD);
 	StableId second_left_external = add_external_port(&net, CHILD);
 	StableId second_right_external = add_external_port(&net, PARENT);
 	connect(&net, first_principal, second_principal);
@@ -277,37 +300,38 @@ fn void fan_fan_interaction_splices_the_branch_wires() @test
 	connect(&net, second_left, second_left_external);
 	connect(&net, second_right, second_right_external);
 	StableId principal_wire = net.ports.get_ref(first_principal).wire_id;
-	StableId variable_wire = net.ports.get_ref(first_left).wire_id;
-	StableId body_wire = net.ports.get_ref(first_right).wire_id;
+	StableId body_wire = net.ports.get_ref(first_left).wire_id;
+	StableId variable_wire = net.ports.get_ref(first_right).wire_id;
+	assert(delta_net_abstract_machine::validate_net(&net));
 
 	delta_net_abstract_machine::interact(&net, principal_wire);
 
 	assert(net.nodes.len() == 0);
 	assert(!net.wires.contains(principal_wire));
 	assert(net.wires.len() == 2);
-	assert(wire_connects(&net, body_wire, first_right_external, second_left_external));
-	assert(wire_connects(&net, variable_wire, first_left_external, second_right_external));
+	assert(wire_connects(&net, body_wire, first_left_external, second_left_external));
+	assert(wire_connects(&net, variable_wire, first_right_external, second_right_external));
 	assert(net.ports.get_ref(second_left_external).wire_id == body_wire);
 	assert(net.ports.get_ref(second_right_external).wire_id == variable_wire);
 	assert(delta_net_abstract_machine::validate_net(&net));
 }
 
-fn void fan_fan_interaction_splices_branch_wires_when_endpoint_order_is_reversed() @test
+fn void fan_fan_interaction_splices_matching_auxiliaries_when_endpoint_order_is_reversed() @test
 {
 	Net net;
 	net.init();
 	defer net.free();
 
-	StableId first = add_fan(&net);
-	StableId second = add_fan(&net, CHILD);
+	StableId first = delta_net_abstract_machine::new_fan(&net, PARENT);
+	StableId second = delta_net_abstract_machine::new_fan(&net, CHILD);
 	StableId first_principal = principal(&net, first);
 	StableId second_principal = principal(&net, second);
 	StableId first_left = net.nodes.get_ref(first).agent.fan.left;
 	StableId first_right = net.nodes.get_ref(first).agent.fan.right;
 	StableId second_left = net.nodes.get_ref(second).agent.fan.left;
 	StableId second_right = net.nodes.get_ref(second).agent.fan.right;
-	StableId first_left_external = add_external_port(&net, CHILD);
-	StableId first_right_external = add_external_port(&net, PARENT);
+	StableId first_left_external = add_external_port(&net, PARENT);
+	StableId first_right_external = add_external_port(&net, CHILD);
 	StableId second_left_external = add_external_port(&net, CHILD);
 	StableId second_right_external = add_external_port(&net, PARENT);
 	connect(&net, second_principal, first_principal);
@@ -316,18 +340,19 @@ fn void fan_fan_interaction_splices_branch_wires_when_endpoint_order_is_reversed
 	connect(&net, second_left, second_left_external);
 	connect(&net, second_right, second_right_external);
 	StableId principal_wire = net.ports.get_ref(first_principal).wire_id;
-	StableId variable_wire = net.ports.get_ref(first_left).wire_id;
-	StableId body_wire = net.ports.get_ref(first_right).wire_id;
+	StableId body_wire = net.ports.get_ref(first_left).wire_id;
+	StableId variable_wire = net.ports.get_ref(first_right).wire_id;
+	assert(delta_net_abstract_machine::validate_net(&net));
 
 	delta_net_abstract_machine::interact(&net, principal_wire);
 
 	assert(net.nodes.is_empty());
 	assert(!net.wires.contains(principal_wire));
 	assert(net.wires.len() == 2);
-	assert(wire_connects(&net, body_wire, first_right_external, second_left_external));
-	assert(wire_connects(&net, variable_wire, first_left_external, second_right_external));
-	assert(net.ports.get_ref(first_right_external).wire_id == body_wire);
-	assert(net.ports.get_ref(first_left_external).wire_id == variable_wire);
+	assert(wire_connects(&net, body_wire, first_left_external, second_left_external));
+	assert(wire_connects(&net, variable_wire, first_right_external, second_right_external));
+	assert(net.ports.get_ref(first_left_external).wire_id == body_wire);
+	assert(net.ports.get_ref(first_right_external).wire_id == variable_wire);
 	assert(delta_net_abstract_machine::validate_net(&net));
 }
 
@@ -400,8 +425,8 @@ fn void replicator_fan_interaction_copies_replicator_across_fan() @test
 	StableId second_auxiliary = net.nodes.get_ref(replicator).agent.replicator.auxiliaries[1];
 	connect(&net, first_auxiliary, add_external_port(&net, CHILD));
 	connect(&net, second_auxiliary, add_external_port(&net, CHILD));
-	connect(&net, fan_left, add_external_port(&net, CHILD));
-	connect(&net, fan_right, add_external_port(&net, PARENT));
+	connect(&net, fan_left, add_external_port(&net, PARENT));
+	connect(&net, fan_right, add_external_port(&net, CHILD));
 	connect(&net, replicator_principal, fan_principal);
 
 	delta_net_abstract_machine::interact(&net, net.ports.get_ref(replicator_principal).wire_id);
@@ -425,14 +450,59 @@ fn void fan_replicator_interaction_copies_replicator_across_fan() @test
 	StableId second_auxiliary = net.nodes.get_ref(replicator).agent.replicator.auxiliaries[1];
 	connect(&net, first_auxiliary, add_external_port(&net, CHILD));
 	connect(&net, second_auxiliary, add_external_port(&net, CHILD));
-	connect(&net, fan_left, add_external_port(&net, CHILD));
-	connect(&net, fan_right, add_external_port(&net, PARENT));
+	connect(&net, fan_left, add_external_port(&net, PARENT));
+	connect(&net, fan_right, add_external_port(&net, CHILD));
 	connect(&net, fan_principal, replicator_principal);
 
 	delta_net_abstract_machine::interact(&net, net.ports.get_ref(fan_principal).wire_id);
 
 	assert_replicator_fan_result(&net, replicator, fan, fan_left, fan_right,
 		first_auxiliary, second_auxiliary);
+}
+
+fn void replicator_fan_interaction_preserves_status_and_auxiliary_metadata() @test
+{
+	Net net;
+	net.init();
+	defer net.free();
+
+	StableId replicator = add_replicator(&net, 3, 2, CHILD, UNKNOWN);
+	StableId fan = add_fan(&net);
+	StableId replicator_principal = principal(&net, replicator);
+	StableId fan_principal = principal(&net, fan);
+	StableId fan_left = net.nodes.get_ref(fan).agent.fan.left;
+	StableId fan_right = net.nodes.get_ref(fan).agent.fan.right;
+	StableId first_source_auxiliary = net.nodes.get_ref(replicator)
+		.agent.replicator.auxiliaries[0];
+	StableId second_source_auxiliary = net.nodes.get_ref(replicator)
+		.agent.replicator.auxiliaries[1];
+	set_auxiliary_delta(&net, first_source_auxiliary, -1);
+	set_auxiliary_delta(&net, second_source_auxiliary, 2);
+	PortSlot first_source_slot = net.ports.get_ref(first_source_auxiliary).slot;
+	PortSlot second_source_slot = net.ports.get_ref(second_source_auxiliary).slot;
+
+	connect(&net, first_source_auxiliary, add_external_port(&net, CHILD));
+	connect(&net, second_source_auxiliary, add_external_port(&net, CHILD));
+	connect(&net, fan_left, add_external_port(&net, PARENT));
+	connect(&net, fan_right, add_external_port(&net, CHILD));
+	connect(&net, replicator_principal, fan_principal);
+	assert(delta_net_abstract_machine::validate_net(&net));
+
+	delta_net_abstract_machine::interact(
+		&net, net.ports.get_ref(replicator_principal).wire_id);
+
+	Node* left_copy = net.nodes.get_ref(net.ports.get_ref(fan_left).node_id);
+	Node* right_copy = net.nodes.get_ref(net.ports.get_ref(fan_right).node_id);
+	assert(left_copy.type == REPLICATOR && right_copy.type == REPLICATOR);
+	assert(left_copy.agent.replicator.status == UNKNOWN);
+	assert(right_copy.agent.replicator.status == UNKNOWN);
+	assert_replicated_auxiliary_metadata(&net, first_source_auxiliary,
+		first_source_slot, left_copy.agent.replicator.auxiliaries[0],
+		right_copy.agent.replicator.auxiliaries[0]);
+	assert_replicated_auxiliary_metadata(&net, second_source_auxiliary,
+		second_source_slot, left_copy.agent.replicator.auxiliaries[1],
+		right_copy.agent.replicator.auxiliaries[1]);
+	assert(delta_net_abstract_machine::validate_net(&net));
 }
 
 fn void inactive_wire_does_not_reduce_nodes() @test
@@ -605,8 +675,8 @@ fn void net_validator_accepts_a_fully_wired_fan_and_boundaries() @test
 	StableId fan = add_fan(&net);
 	Node* node = net.nodes.get_ref(fan);
 	connect(&net, node.agent.fan.principal, add_external_port(&net, CHILD));
-	connect(&net, node.agent.fan.left, add_external_port(&net, CHILD));
-	connect(&net, node.agent.fan.right, add_external_port(&net, PARENT));
+	connect(&net, node.agent.fan.left, add_external_port(&net, PARENT));
+	connect(&net, node.agent.fan.right, add_external_port(&net, CHILD));
 
 	assert(delta_net_abstract_machine::validate_net(&net));
 }
@@ -622,8 +692,8 @@ fn void net_validator_rejects_a_dangling_wire_endpoint() @test
 	StableId external_principal = add_external_port(&net);
 	connect(&net, node.agent.fan.principal, external_principal);
 	net.ports.get_ref(external_principal).polarity = CHILD;
-	connect(&net, node.agent.fan.left, add_external_port(&net, CHILD));
-	connect(&net, node.agent.fan.right, add_external_port(&net, PARENT));
+	connect(&net, node.agent.fan.left, add_external_port(&net, PARENT));
+	connect(&net, node.agent.fan.right, add_external_port(&net, CHILD));
 	net.ports.erase(external_principal);
 
 	assert(!delta_net_abstract_machine::validate_net(&net));
@@ -638,8 +708,8 @@ fn void net_validator_rejects_an_invalid_node_port_slot() @test
 	StableId fan = add_fan(&net);
 	Node* node = net.nodes.get_ref(fan);
 	connect(&net, node.agent.fan.principal, add_external_port(&net, CHILD));
-	connect(&net, node.agent.fan.left, add_external_port(&net, CHILD));
-	connect(&net, node.agent.fan.right, add_external_port(&net, PARENT));
+	connect(&net, node.agent.fan.left, add_external_port(&net, PARENT));
+	connect(&net, node.agent.fan.right, add_external_port(&net, CHILD));
 	node.agent.fan.left = node.agent.fan.principal;
 
 	assert(!delta_net_abstract_machine::validate_net(&net));
@@ -692,6 +762,9 @@ fn void graph_constructors_populate_owned_ports_and_metadata() @test
 	assert(net.ports.get_ref(fan.agent.fan.principal).node_id == fan_id);
 	assert(net.ports.get_ref(fan.agent.fan.left).slot.type == LEFT);
 	assert(net.ports.get_ref(fan.agent.fan.right).slot.type == RIGHT);
+	assert(net.ports.get_ref(fan.agent.fan.principal).polarity == PARENT);
+	assert(net.ports.get_ref(fan.agent.fan.left).polarity == CHILD);
+	assert(net.ports.get_ref(fan.agent.fan.right).polarity == PARENT);
 
 	Node* eraser = net.nodes.get_ref(eraser_id);
 	assert(eraser.type == ERASER);
