@@ -44,3 +44,28 @@ Signature: openai-codex/gpt-5.6-terra
 - Limitation: parent/child wire polarity cannot be validated until polarity is represented on ports or wires.
 
 Signature: openai-codex/gpt-5.6-terra
+
+## 2026-08-17 — λK / ΔK next-step checkpoint
+
+- Objective: answer what remains to turn the interaction kernel into a λK evaluator.
+- Workspace: `C:/Users/heefoo/code/delta_net_abstract_machine`.
+- Code changes: none.
+- Current kernel (verified by reading sources, not by re-running tests): polarity on every `Port`; `InterfacePort` ROOT/FREE_VARIABLE; constructors `new_fan`/`new_eraser`/`new_replicator`/`new_interface`; `connect`/`disconnect`/`splice`/`clone_port`/`destroy_node`; all six core interaction families in `src/reductions.c3`; polarity-aware `validate_net`.
+- Invalidated assumption: `DELTA_K_GUIDE.md`, `DELTA_K_IMPLEMENTATION_GUIDE.md` §1, and the 2026-08-14 session entries still describe polarity, interfaces, and constructors as missing. Those pieces exist. The 2026-08-14 validator note that polarity is unrepresented is stale.
+- Still missing: De Bruijn AST/parser/printer; normal-order oracle; encode/`φK` translation; leftmost-outermost scheduler; unpaired merge/decay/reachability; phase two; readback; CLI; semantic tests. No `lambda_*.c3`, `translate.c3`, `canonicalize.c3`, `reduce.c3`, or `readback.c3`.
+- Residual kernel hygiene before translation: most interaction fixtures still use local `add_*` helpers and anonymous ports; validator does not check unique root, named frees, interface ownership, or active-pair polarity; rewrites still mutate arrays directly; `VALIDATE_REPLICATOR_EQUALITY` is off.
+- Recommended next checkpoint: De Bruijn AST + reference reducer, then hand-built readback, then encode the six small terms. Do not start a production scheduler until the oracle exists.
+- Next action: implement `src/lambda_ast.c3` and `src/lambda_reference.c3`.
+
+Signature: xai-oauth/grok-4.6
+
+## 2026-08-28 — Vendored C3 mpc parser library
+
+- Objective: download and register `gavlooth/mpc` for the λK parser.
+- Changes: vendored upstream `master` revision `55334f5695fd7001a8f067a9a65144ea0f2810e9` at `lib/mpc.c3l`; added its source-only `manifest.json` targeting `src/**`; removed the nested clone metadata; registered `"mpc"` in root `project.json` dependencies.
+- Contract: mpc is C3 source, imported as `mpc`; no C FFI, headers, `c-sources`, or native libraries are used.
+- Commands run: `c3c build delta_net_abstract_machine`; `c3c test mpc` inside `lib/mpc.c3l`; `c3c test` at the project root.
+- Results: root build linked; vendored mpc passed 34/34 upstream tests; project passed 30/30 tests.
+- Next action: add `src/lambda_ast.c3` that imports `mpc`, compiles the λ grammar once, and lowers mpc AST nodes to the project-owned named-term representation.
+
+Signature: openai-codex/gpt-5.6-terra

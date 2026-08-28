@@ -6,7 +6,7 @@
   // Directories where C3 library files may be found.
   "dependency-search-paths": [ "lib" ],
   // Libraries to use for all targets.
-  "dependencies": [ ],
+  "dependencies": [ "mpc" ],
   // Version using semantic versioning.
   "version": "0.1.0",
   // Sources compiled for all targets.

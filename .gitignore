@@ -1,2 +1,5 @@
 build/
 out/
+
+# Large generated HTML exports
+*.html

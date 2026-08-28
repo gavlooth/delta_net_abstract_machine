@@ -25,15 +25,15 @@ fn Polarity opposite_polarity(Polarity polarity) @private
 // ROOT is the result boundary; FREE_VARIABLE preserves a free name.
 enum InterfacePortType
 {
-    ROOT,
-    FREE_VARIABLE,
+ ROOT,
+ FREE_VARIABLE,
 }
 
 struct InterfacePort
 {
-    InterfacePortType type;
-    Maybe{String} name;
-    StableId port;
+ InterfacePortType type;
+ Maybe{String} name;
+ StableId port;
 }
 
 
@@ -136,5 +136,5 @@ struct Net
  Siv{Port} ports;
  Siv{Wire} wires;
  Siv{Node} nodes;
-    Siv{InterfacePort} interfaces;
+ Siv{InterfacePort} interfaces;
 }

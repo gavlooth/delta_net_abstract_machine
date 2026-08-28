@@ -1,0 +1,5 @@
+*~
+*.exe
+*.dSYM
+build/
+.ccls-cache/

@@ -1,0 +1,10 @@
+{
+  "provides": "mpc",
+  "sources": ["src/**"],
+  "targets": {
+    "windows-x64": {},
+    "linux-x64": {},
+    "macos-x64": {},
+    "macos-aarch64": {}
+  }
+}
