@@ -1,6 +1,6 @@
 # Micro Parser Combinators for C3
 
-`mpc` is an allocator-aware parser toolkit for C3 0.8.2 (`langrev` 1). It provides parser combinators, recursive named rules, regular-expression compilation, a declarative grammar compiler, owned AST and diagnostic results, and practical lexer and language-authoring utilities.
+`mpc` is an allocator-aware parser toolkit for C3 0.8.3 (`langrev` 1). It provides parser combinators, recursive named rules, regular-expression compilation, a declarative grammar compiler, owned AST and diagnostic results, and practical lexer and language-authoring utilities.
 
 ## Features
 

@@ -1,0 +1,241 @@
+
+Your current `LAMBDA_AST_STRING` is not valid `mpc` grammar. Build this in two clean stages:
+
+```text
+source → mpc AST → De Bruijn Term → ΔK net
+```
+
+Do not let `translate.c3` depend on `mpc::AstNode`.
+
+## 1. Grammar
+
+Replace the current grammar with:
+
+```c3
+const String LAMBDA_GRAMMAR = `
+    term: <abstraction> | <application>;
+    abstraction: ("λ" | "\\") <ident> "." <term>;
+    application: <atom> <atom>*;
+    atom: <ident> | "(" <term> ")" | <abstraction>;
+    ident ["identifier"]: /[A-Za-z_][A-Za-z0-9_]*/;
+`;
+```
+
+This gives the intended associativity:
+
+```text
+f x y       → (f x) y
+\x.x y      → \x.(x y)
+(\x.x) y    → (\x.x) y
+```
+
+Wrap `LanguageCompileResult` in an owning parser object: compile once, deinitialize once. Remove the current module `init()` printing. A `ParseResult` owns its AST and text, so complete semantic lowering—and copy free-variable names—before calling `ParseResult.deinit()`.
+
+## 2. Project-owned AST
+
+Immediately lower to:
+
+```text
+Term :=
+    BoundVar(index)
+  | FreeVar(name)
+  | Abstraction(body)
+  | Application(function, argument)
+```
+
+Keep a stack of binder names while lowering.
+
+```text
+lower identifier(name):
+    search binder stack from newest to oldest
+    found at distance d → BoundVar(d)
+    not found           → FreeVar(copy(name))
+
+lower abstraction:
+    read direct ident and body-term children
+    push ident
+    body = lower(body-term)
+    pop ident
+    return Abstraction(body)
+
+lower application:
+    collect its immediate atom children
+    result = lower(first atom)
+    for each remaining atom:
+        result = Application(result, lower(atom))
+    return result
+```
+
+For example:
+
+```text
+\x.x          → Abs(BoundVar(0))
+\x.\y.x       → Abs(Abs(BoundVar(1)))
+\x.\x.x       → Abs(Abs(BoundVar(0)))
+\x.x y        → Abs(App(BoundVar(0), FreeVar("y")))
+```
+
+`mpc` inserts `sequence`, `many`, `string`, and `char` wrapper nodes. Use a helper that traverses these transparent wrappers and collects the first matching named-rule frontier. Do not use unrestricted `find_all_ast(application, "atom")`: it would also collect atoms inside nested applications.
+
+## 3. Fix the polarity prerequisite
+
+Current `new_interface` creates:
+
+```text
+ROOT          = PARENT
+FREE_VARIABLE = CHILD
+```
+
+That cannot be connected to the existing canonical fan orientation:
+
+- abstraction result: `PARENT`
+- application result: `PARENT`
+- emitted context port: `CHILD`
+- free-variable result: must be `PARENT`
+
+`connect` therefore rejects root-to-term and occurrence-to-free-variable wiring.
+
+Preserve the existing fan orientation and change the interface endpoints to:
+
+```text
+ROOT          = CHILD
+FREE_VARIABLE = PARENT
+```
+
+Add wiring tests for this before implementing translation. `validate_net` currently does not inspect interfaces, so it will not catch the contradiction.
+
+## 4. Destination-driven net lowering
+
+Put this in a separate root-module `translate.c3`:
+
+```text
+emit(term, context_child_port, level, binder_stack)
+```
+
+Each binder state stores ordered occurrences:
+
+```text
+Occurrence {
+    port: CHILD context port
+    level: occurrence level
+}
+```
+
+### Bound variable
+
+```text
+binder = binder_stack[len - 1 - index]
+binder.occurrences.append({ context_child_port, level })
+```
+
+Allocate no variable node yet.
+
+### Free variable
+
+Create or reuse the named `FREE_VARIABLE` interface and connect:
+
+```text
+context CHILD ── interface PARENT
+```
+
+### Abstraction
+
+```text
+fan = new_fan(net, PARENT)
+
+context CHILD ── fan.principal PARENT
+fan.left CHILD  = body destination
+fan.right PARENT = binder port
+```
+
+Then:
+
+```text
+push empty binder state
+emit(body, fan.left, level, stack)
+pop binder state
+finish binder at fan.right
+```
+
+Finish the binder using:
+
+```text
+base_level = level + 1
+delta[i] = occurrence[i].level - base_level
+```
+
+Cases:
+
+```text
+0 occurrences:
+    connect binder PARENT to eraser principal CHILD
+
+1 occurrence and delta == 0:
+    connect binder PARENT directly to occurrence CHILD
+
+otherwise:
+    replicator = new_replicator(
+        net,
+        base_level,
+        ordered_deltas,
+        UNPAIRED,
+        CHILD
+    )
+    connect binder PARENT to replicator principal CHILD
+    connect each replicator auxiliary PARENT to occurrence CHILD
+```
+
+Under this level convention, `\x.x` has delta `-1`, so it uses a one-exit replicator rather than the direct-wire case.
+
+### Application
+
+```text
+fan = new_fan(net, CHILD)
+
+fan.left PARENT      = application result
+fan.principal CHILD  = function destination
+fan.right CHILD      = argument destination
+```
+
+Then:
+
+```text
+connect context CHILD to fan.left PARENT
+emit(function, fan.principal, level, stack)
+emit(argument, fan.right, level + 1, stack)
+```
+
+### Entry point
+
+```text
+root = new_interface(net, ROOT, "")  // port must be CHILD
+emit(term, root.port, 0, empty_stack)
+```
+
+## 5. Implement in this order
+
+1. Grammar compilation and diagnostics.
+2. Parser AST → De Bruijn `Term`.
+3. Tests for associativity, parentheses, free variables, and shadowing.
+4. Correct interface polarities and test actual connections.
+5. Implement `emit`.
+6. Verify exact net topology for:
+
+```text
+\x.x
+\x.y
+\x.x x
+(\x.x) y
+\x.\y.x
+\x.\y.y x
+```
+
+For every translated fixture, assert `validate_net(&net)`, node types, port polarities, replicator level/status, ordered deltas, and reciprocal wire IDs.
+
+## Me
+
+> Context:
+> - <rules>/home/heefoo/.claude/CLAUDE.md</rules>
+> -  <buf>lambda_ast.c3</buf>
+
+

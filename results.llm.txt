@@ -1,0 +1,552 @@
+## Me
+
+> Context:
+> - <rules>/home/heefoo/.claude/CLAUDE.md</rules>
+> -  <buf>lambda_ast.c3</buf>
+
+
+#{buffer}
+give me haw to access the mpc ast nodes and guide me to connect them to delta nets.
+
+## CodeCompanion (OMP)
+
+### Reasoning
+
+**Inspecting file and repo patterns**
+
+
+
+### Response
+
+
+Read: lambda_ast.c3:1-260
+Read: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/src
+
+### Reasoning
+
+**Locating project root manifests**
+
+
+
+### Response
+
+
+Read: net_model.c3:1-220
+Read: net_operations.c3:1-260
+
+### Reasoning
+
+**Investigating MPC AST Node API**
+
+
+
+### Response
+
+
+Read: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine
+
+### Reasoning
+
+**Planning to read MPC archive**
+
+
+
+### Response
+
+
+Read: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/lib/mpc.c3l
+
+### Reasoning
+
+**Reviewing type and API examples**
+
+
+
+### Response
+
+
+Read: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/lib/mpc.c3l/src/types.c3:1-220
+Read: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/lib/mpc.c3l/src/language.c3:1-180
+
+### Reasoning
+
+**Parsing result lines**
+
+
+
+### Response
+
+
+Search: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/lib/mpc.c3l/src/language.c3
+Search: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/lib/mpc.c3l/src
+Read: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/lib/mpc.c3l/src/parser.c3:188-248
+Read: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/lib/mpc.c3l/src/language.c3:428-490
+
+### Reasoning
+
+**Reviewing grammar semantics and AST structure**
+
+
+
+### Response
+
+
+Search: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/lib/mpc.c3l/examples;../lib/mpc.c3l/test;../lib/mpc.c3l/README.md
+
+### Reasoning
+
+**Planning AST extraction by running main**
+
+
+
+### Response
+
+
+Read: main.c3:1-120
+Read: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/project.json:1-180
+
+### Reasoning
+
+**Planning grammar inspection strategy**
+
+
+
+### Response
+
+
+Read: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/lib/mpc.c3l/README.md:25-165
+
+### Reasoning
+
+**Planning temporary AST inspection file**
+
+**Exploring c3c commands for temp compilation**
+
+
+
+### Response
+
+
+---
+**Approval Required**
+
+Execute: c3c run
+
+Please select an option:
+- `g2` - Accept
+- `g1` - Always accept
+- `g3` - Reject
+- `g4` - Cancel
+
+  You selected: Always accept
+
+---
+
+
+Execute: $ c3c run
+
+### Reasoning
+
+**Searching source docs for lambda translation**
+
+
+
+### Response
+
+
+Search: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/DELTA_K_IMPLEMENTATION_GUIDE.md;../DELTA_K_GUIDE.md;../NEXT_STEPS_GUIDE.md;../meridian_spec.md;../meridian_syntax.md;../src;../test
+
+### Reasoning
+
+**Reviewing relevant guide sections**
+
+
+
+### Response
+
+
+Read: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/NEXT_STEPS_GUIDE.md:160-330
+
+### Reasoning
+
+**Inspecting recent parser log entries**
+
+
+
+### Response
+
+
+Read: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/.agents/SESSION_REPORT.md:120-260
+
+### Reasoning
+
+**Reviewing file size and line count**
+
+
+
+### Response
+
+
+Read: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/.agents/SESSION_REPORT.md:1-100
+
+### Reasoning
+
+**Planning MPC node API update**
+
+**Analyzing parser AST structure**
+
+
+
+### Response
+
+
+Search: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/lib/mpc.c3l/src/parser.c3
+
+### Reasoning
+
+**Planning precise AST traversal strategy**
+
+
+
+### Response
+
+
+Read: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/lib/mpc.c3l/src/parser.c3:330-450,560-596
+
+### Reasoning
+
+**Planning robust named node traversal**
+
+**Exploring safe C3 compiler instrumentation**
+
+
+
+### Response
+
+
+Execute: $ c3c --help
+
+### Reasoning
+
+**Inspecting grammar parser AST structure**
+
+**Analyzing AST traversal for application nodes**
+
+**Refining atom payload identification logic**
+
+**Outlining De Bruijn representation details**
+
+**Verifying and correcting interface port mappings**
+
+**Planning replicator use for variable occurrences**
+
+**Planning replicator principal-child pairing**
+
+
+
+### Response
+
+
+Search: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/DELTA_K_IMPLEMENTATION_GUIDE.md;../DELTA_K_GUIDE.md;../NEXT_STEPS_GUIDE.md
+Read: /home/heefoo/Documents/code/c3-experiments/delta_net_abstract_machine/DELTA_K_GUIDE.md:213-310
+
+### Reasoning
+
+**Analyzing interface naming mismatch and identity delta**
+
+**Confirming AST parsing and lowering strategy**
+
+**Reviewing AST node access and ownership concerns**
+
+**Designing AST traversal helpers**
+
+**Clarifying AST binding and interface polarity**
+
+**Validating De Bruijn indexing tests**
+
+**Designing parser compilation strategy**
+
+**Clarifying AST handling and module visibility**
+
+**Deciding translate module placement**
+
+**Finalizing binder with fan.right connection**
+
+**Refining AST frontier traversal method**
+
+**Verifying parser outputs with c3c run**
+
+
+
+### Response
+
+## Problem
+
+`parsed.root` is an `mpc::AstNode*`, but it is:
+
+- Owned by `ParseResult`.
+- Invalid after `parsed.deinit()`.
+- Full of parser nodes such as `sequence`, `many`, and `string`.
+
+Do not connect MPC nodes directly to `Net`. Lower them into a project-owned lambda term first.
+
+## Accessing MPC nodes
+
+```c3
+AstNode* root = parsed.root;
+
+io::printfn("tag=%s text=%s", root.tag, root.text);
+
+foreach (child : root.children)
+{
+    io::printfn("child tag=%s text=%s", child.tag, child.text);
+}
+
+AstNode* first = root.child(0);       // null when out of range
+AstNode* ident = root.find("ident"); // recursive first match
+```
+
+Available fields and methods:
+
+```c3
+node.tag
+node.text
+node.span
+node.children
+
+node.child_count()
+node.is_leaf()
+node.child(index)
+node.find("tag")
+```
+
+Important ownership rule:
+
+```c3
+defer parsed.deinit();
+```
+
+After that executes, `root`, its children, their tags, and their text are invalid. Copy names needed by your own AST.
+
+Avoid using `find("abstraction")` to classify arbitrary terms: it searches recursively and could find an abstraction nested inside an application.
+
+## Lower MPC AST into a semantic AST
+
+Use this representation:
+
+```text
+Term :=
+    BoundVar(index)
+  | FreeVar(name)
+  | Abstraction(body)
+  | Application(function, argument)
+```
+
+Maintain a binder-name stack while lowering identifiers:
+
+```text
+λx.x       → Abstraction(BoundVar(0))
+λx.λy.x    → Abstraction(Abstraction(BoundVar(1)))
+λx.λx.x    → Abstraction(Abstraction(BoundVar(0)))
+```
+
+Map the grammar as follows:
+
+- `term`: unwrap the nearest `abstraction` or `application`.
+- `abstraction`: get its binder `ident`, push it, lower its body `term`, then pop it.
+- `application`: collect only its top-level `atom` nodes and fold left.
+- `atom`: unwrap `ident`, parenthesized `term`, or `abstraction`.
+- `ident`: search the binder stack from innermost to outermost; otherwise create `FreeVar`.
+
+For applications:
+
+```text
+f x y
+```
+
+must become:
+
+```text
+Application(
+    Application(f, x),
+    y
+)
+```
+
+Do not use `find_all_ast(application, "atom")`: it also returns atoms nested inside parentheses and abstraction bodies. Instead, collect an `atom` and stop descending through that node:
+
+```c3
+fn void collect_atom_frontier(AstNode* node, List{AstNode*}* atoms)
+{
+    foreach (child : node.children)
+    {
+        if (child.tag == "atom")
+        {
+            atoms.push(child);
+            continue;
+        }
+        collect_atom_frontier(child, atoms);
+    }
+}
+```
+
+## Connect the semantic AST to the net
+
+Put this in a separate `translate.c3`, preferably in module:
+
+```c3
+module delta_net_abstract_machine;
+```
+
+Use a destination-driven encoder:
+
+```text
+emit(term, destination_child_port, level, binder_environment)
+```
+
+Every term destination is a `CHILD` port.
+
+### Required polarity correction
+
+`net_operations.c3:new_interface()` currently creates:
+
+```c3
+ROOT          → PARENT
+FREE_VARIABLE → CHILD
+```
+
+That cannot connect to the existing fan encoding because `connect()` requires opposite polarities.
+
+The consistent interface polarities are:
+
+```c3
+ROOT          → CHILD
+FREE_VARIABLE → PARENT
+```
+
+Fix and test this before implementing translation.
+
+### Abstraction
+
+For `Abstraction(body)` at level `l`:
+
+```c3
+StableId node_id = new_fan(net, PARENT);
+Fan fan = net.nodes.get(node_id).agent.fan;
+
+connect(net, destination, fan.principal);
+emit(body, fan.left, l, environment);
+```
+
+Port meanings:
+
+```text
+fan.principal : PARENT — abstraction result
+fan.left      : CHILD  — body
+fan.right     : PARENT — binder
+```
+
+Push a binder frame before emitting the body. Bound-variable occurrences should record:
+
+```text
+(destination_port, occurrence_level)
+```
+
+After emitting the body, finalize `fan.right`:
+
+```text
+0 occurrences:
+    connect binder to eraser principal
+
+1 occurrence with delta 0:
+    connect binder directly to occurrence
+
+otherwise:
+    create CHILD-principal UNPAIRED replicator
+    replicator level = l + 1
+    delta[i] = occurrence_level[i] - (l + 1)
+    connect binder to replicator principal
+    connect each replicator auxiliary to its occurrence
+```
+
+Identity `λx.x` intentionally has delta `-1`:
+
+```text
+occurrence level = 0
+replicator level = 1
+delta = 0 - 1 = -1
+```
+
+### Application
+
+For `Application(function, argument)` at level `l`:
+
+```c3
+StableId node_id = new_fan(net, CHILD);
+Fan fan = net.nodes.get(node_id).agent.fan;
+
+connect(net, destination, fan.left);
+emit(function, fan.principal, l, environment);
+emit(argument, fan.right, l + 1, environment);
+```
+
+Port meanings:
+
+```text
+fan.left      : PARENT — application result
+fan.principal : CHILD  — function
+fan.right     : CHILD  — argument
+```
+
+### Variables
+
+Bound variable:
+
+```text
+Find binder by De Bruijn index.
+Append (destination, level) to that binder’s occurrence list.
+Do not connect it immediately.
+```
+
+Free variable:
+
+```text
+Create or reuse InterfacePort(FREE_VARIABLE, name).
+Connect its PARENT port to the variable destination CHILD port.
+```
+
+The outermost call is:
+
+```text
+root interface: CHILD
+emit(term, root.port, 0, empty_environment)
+```
+
+## Recommended implementation order
+
+1. Add a recursive AST-dump helper temporarily to understand MPC wrappers.
+2. Implement project-owned `Term`.
+3. Lower MPC nodes into `Term`, including De Bruijn conversion.
+4. Test `f x y`, parentheses, shadowing, and free variables.
+5. Correct interface polarities and add exact wiring tests.
+6. Implement `emit`.
+7. Test these net translations:
+
+```text
+λx.x
+λx.y
+λx.x x
+(λx.x) y
+λx.λy.x
+λx.λy.y x
+```
+
+The current parser smoke path is working: `c3c run` successfully parses `λx.λy.y` as a `term`.
+
+## Me
+
+> Context:
+> - <rules>/home/heefoo/.claude/CLAUDE.md</rules>
+> -  <buf>lambda_ast.c3</buf>
+
+

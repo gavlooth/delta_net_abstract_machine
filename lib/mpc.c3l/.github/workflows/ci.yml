@@ -8,10 +8,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install C3 0.8.2
+      - name: Install C3 0.8.3
         run: |
           curl -fsSL -o c3.tar.gz \
-            https://github.com/c3lang/c3c/releases/download/v0.8.2/c3-linux-musl.tar.gz
+            https://github.com/c3lang/c3c/releases/download/v0.8.3/c3-linux-musl.tar.gz
           tar -xzf c3.tar.gz
           echo "$PWD/c3" >> "$GITHUB_PATH"
       - run: c3c build mpc

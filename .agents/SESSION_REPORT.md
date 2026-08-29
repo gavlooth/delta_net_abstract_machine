@@ -69,3 +69,19 @@ Signature: xai-oauth/grok-4.6
 - Next action: add `src/lambda_ast.c3` that imports `mpc`, compiles the λ grammar once, and lowers mpc AST nodes to the project-owned named-term representation.
 
 Signature: openai-codex/gpt-5.6-terra
+
+## 2026-08-30T16:05:56+03:00 — Lambda parser and ΔK translation design checkpoint
+
+- Objective: guide the next implementation of the lambda grammar, parser-AST lowering, and De Bruijn-term translation into the existing ΔK net.
+- Workspace: `delta_net_abstract_machine`, centered on `src/lambda_ast.c3`.
+- Code/configuration changes: `src/lambda_ast.c3` now contains the valid `mpc` lambda grammar and a module-initialization smoke parse for `λx.λy.y`.
+- Implementation coverage: grammar compilation and one whole-input parse are complete; approximately 10% of the parser/translator pipeline is covered because semantic AST ownership, De Bruijn lowering, reusable parser API, and net translation remain absent.
+- Commands run: `date --iso-8601=seconds`; `c3c run`.
+- Grammar result: `c3c run` compiled, linked, parsed `λx.λy.y` as root tag `term`, printed `term: λx.λy.y`, and exited 0. Application remains `atom atom*` and must be folded left; abstraction owns the complete term to its right. Lower the noisy `mpc::AstNode` wrapper tree immediately into a project-owned De Bruijn term rather than exposing parser nodes to graph code.
+- Translation result: use `emit(term, context_child_port, level, binder_stack)`. Bound occurrences collect `(port, level)` on the indexed binder; abstractions finalize zero uses with an eraser, one zero-delta use with a direct wire, and all other cases with a CHILD-principal `UNPAIRED` replicator. Applications emit the function at `level` and argument at `level + 1`.
+- Invalidated assumption / failure mode: the current interface polarities cannot be wired by `connect` to the documented fan encoding. `new_interface` creates `ROOT` as `PARENT` and `FREE_VARIABLE` as `CHILD`, but every emitted term context is a `CHILD` port and every term result/free-variable boundary must be `PARENT`. With the current constructor, root-to-abstraction, root-to-application, and occurrence-to-free-variable connections assert on equal polarities. Existing validation does not inspect interfaces, so it does not expose this contradiction.
+- Current best recommendation: preserve the documented fan orientation and reverse interface endpoint polarities to `ROOT = CHILD`, `FREE_VARIABLE = PARENT`; add exact wiring tests before writing `translate.c3`. Keep parsing/De Bruijn conversion in `lambda_ast.c3` and net construction in a separate root-module `translate.c3`.
+- Unresolved issues: the smoke check asserts only the root tag/text, not associativity or binder resolution; `init()` currently owns and immediately destroys the parser, so no reusable parse API exists. Confirm the interface-polarity correction against the intended formal presentation; add interface ownership/uniqueness checks to `validate_net`; semantic AST ownership, translator, reducer, and readback remain unimplemented.
+- Next actions: move parser ownership out of the smoke-only module initializer; add parse/associativity/shadowing tests; implement direct De Bruijn lowering; correct and test interface polarities; then encode the six guide fixtures with exact topology and delta assertions.
+
+Signature: openai-codex/gpt-5.6-sol

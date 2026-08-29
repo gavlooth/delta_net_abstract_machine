@@ -1,6 +1,6 @@
 # delta_net_abstract_machine
 
-A minimal C3 executable project. It uses C3 0.8.2.
+A minimal C3 executable project. It uses C3 0.8.3.
 
 ## Run
 

@@ -7,5 +7,6 @@ fn int main(String[] args)
  Net net;
  net.init();
  defer net.free();
- return 0;
+ lambda_ast::init();
+return 0;
 }
