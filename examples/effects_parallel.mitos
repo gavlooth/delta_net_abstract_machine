@@ -1,0 +1,14 @@
+effect Reader:
+  read() of I64
+end
+
+main():
+  handle parallel:
+    left := Reader.read()
+    right := Reader.read()
+    left + right
+  end:
+    Reader.read(): resume(21)
+    return(value of I64): value
+  end
+end

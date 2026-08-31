@@ -1,0 +1,10 @@
+multi effect Choice:
+  choose(label of String) of I64
+end
+
+main():
+  handle Choice.choose("twenty\nor twenty-two"):
+    Choice.choose(label of String): resume(20) + resume(22)
+    return(value of I64): value
+  end
+end

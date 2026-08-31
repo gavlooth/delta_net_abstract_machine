@@ -1,0 +1,34 @@
+abstract NumberLike
+
+type Scalar is NumberLike
+
+type Box of T:
+  value of T
+end
+
+classify(value) of I64:
+  0
+end
+
+classify(value of NumberLike) of I64:
+  100
+end
+
+classify(value of Scalar) of I64:
+  1
+end
+
+classify(value of Box of T) of I64:
+  20
+end
+
+classify(value of Type of I64) of I64:
+  21
+end
+
+main():
+  specific := classify(Scalar())
+  parametric := classify(Box(42))
+  reflected := classify(typeOf(42))
+  specific + parametric + reflected
+end

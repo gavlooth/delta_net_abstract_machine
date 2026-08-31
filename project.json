@@ -13,11 +13,14 @@
   "sources": [ "src/**" ],
   // Test sources compiled for all targets.
   "test-sources": [ "test/**" ],
-  // C sources if the project also compiles C sources
-  // relative to the project file.
-  // "c-sources": [ "csource/**" ],
-  // Include directories for C sources relative to the project file.
-  // "c-include-dirs": [ "csource/include" ],
+  // Vendored MIR 1.0.0 native backend and its direct GNU C11 bridge.
+  "c-sources": [
+    "lib/mir/mir.c",
+    "lib/mir/mir-gen.c",
+    "csource/mitos_mir_bridge.c"
+  ],
+  "c-include-dirs": [ "lib/mir", "csource" ],
+  "cflags": "-std=gnu11 -D_GNU_SOURCE -include stdarg.h -include alloca.h",
   // Build location, relative to project file.
   "build-dir": "build",
   // Output location, relative to project file.
@@ -27,7 +30,7 @@
   // "target": "windows-x64",
   // Targets.
   "targets": {
-    "delta_net_abstract_machine": {
+    "mitos": {
       // Executable or library.
       "type": "executable",
       // Additional libraries, sources

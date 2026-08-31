@@ -1,0 +1,5 @@
+main():
+  left := 20
+  right := 22
+  left + right
+end

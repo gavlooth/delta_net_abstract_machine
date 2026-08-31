@@ -1,8 +1,11 @@
 module delta_net_abstract_machine;
-fn void erase_redex(Net* net, StableId node_a_id, StableId node_b_id,
-StableId wire_id, StableId port_a_id, StableId port_b_id)
+// Local interactions are coordinator-serialized in this wave. Any slot pointer
+// retained across an arena push is therefore protected by global quiescence;
+// the later parallel scheduler must replace that guarantee with slot claims.
+fn void erase_redex(Net* net, NetRef node_a_id, NetRef node_b_id,
+NetRef wire_id, NetRef port_a_id, NetRef port_b_id)
 {
- // Snapshot IDs before erasing: unordered erase can move dense entries.
+ // All cross-record references retain their generation through retirement.
  destroy_node_record(net, node_a_id);
  destroy_node_record(net, node_b_id);
  net.wires.erase(wire_id);
@@ -10,25 +13,25 @@ StableId wire_id, StableId port_a_id, StableId port_b_id)
  net.ports.erase(port_b_id);
 }
 
-fn void eraser_eraser_reduction(Net* net, StableId node_a_id, StableId node_b_id,
-StableId wire_id, StableId port_a_id, StableId port_b_id)
+fn void eraser_eraser_reduction(Net* net, NetRef node_a_id, NetRef node_b_id,
+NetRef wire_id, NetRef port_a_id, NetRef port_b_id)
 {
  erase_redex(net, node_a_id, node_b_id, wire_id, port_a_id, port_b_id);
 }
 
-fn void fan_eraser_reduction(Net* net, StableId fan_id, StableId eraser_id,
-StableId wire_id, StableId fan_port_id, StableId eraser_port_id)
+fn void fan_eraser_reduction(Net* net, NetRef fan_id, NetRef eraser_id,
+NetRef wire_id, NetRef fan_port_id, NetRef eraser_port_id)
 {
  Node* fan = net.nodes.get_ref(fan_id);
- StableId left_id = fan.agent.fan.left;
- StableId right_id = fan.agent.fan.right;
+ NetRef left_id = fan.agent.fan.left;
+ NetRef right_id = fan.agent.fan.right;
 
  // Each fan branch receives an eraser; the branch wires themselves survive.
- StableId left_eraser_id = net.nodes.push({
+ NetRef left_eraser_id = net.nodes.push({
   .agent = { .eraser = { .principal = left_id }},
   .type = ERASER
  });
-StableId right_eraser_id = net.nodes.push({
+NetRef right_eraser_id = net.nodes.push({
  .agent = { .eraser = { .principal = right_id }},
  .type = ERASER
 });
@@ -41,13 +44,13 @@ right.slot.type = PRINCIPAL;
 erase_redex(net, fan_id, eraser_id, wire_id, fan_port_id, eraser_port_id);
 }
 
-fn void fan_fan_reduction(Net* net, StableId first_id, StableId second_id,
-	StableId first_principal_id)
+fn void fan_fan_reduction(Net* net, NetRef first_id, NetRef second_id,
+	NetRef first_principal_id)
 {
 	Node* first = net.nodes.get_ref(first_id);
 	Node* second = net.nodes.get_ref(second_id);
-	StableId second_principal_id = second.agent.fan.principal;
-	StableId principal_wire_id = net.ports.get_ref(first_principal_id).wire_id;
+	NetRef second_principal_id = second.agent.fan.principal;
+	NetRef principal_wire_id = net.ports.get_ref(first_principal_id).wire_id;
 
 	// Canonicalize operand order because splice preserves its first wire ID.
 	// This keeps the physical result independent of active-wire endpoint order;
@@ -57,10 +60,10 @@ fn void fan_fan_reduction(Net* net, StableId first_id, StableId second_id,
 	Node* parent_principal_fan =
 		net.ports.get_ref(first_principal_id).polarity == PARENT ? first : second;
 	Node* child_principal_fan = parent_principal_fan == first ? second : first;
-	StableId first_left = parent_principal_fan.agent.fan.left;
-	StableId first_right = parent_principal_fan.agent.fan.right;
-	StableId second_left = child_principal_fan.agent.fan.left;
-	StableId second_right = child_principal_fan.agent.fan.right;
+	NetRef first_left = parent_principal_fan.agent.fan.left;
+	NetRef first_right = parent_principal_fan.agent.fan.right;
+	NetRef second_left = child_principal_fan.agent.fan.left;
+	NetRef second_right = child_principal_fan.agent.fan.right;
 
 	// FAN--FAN ANNIHILATION: pair corresponding auxiliary identities.
 	//
@@ -86,21 +89,25 @@ fn void fan_fan_reduction(Net* net, StableId first_id, StableId second_id,
 	net.wires.erase(principal_wire_id);
 }
 
-fn void replicator_fan_reduction(Net* net, StableId replicator_id, StableId fan_id)
+fn void replicator_fan_reduction(Net* net, NetRef replicator_id, NetRef fan_id)
 {
  Node* fan = net.nodes.get_ref(fan_id);
  Node* replicator = net.nodes.get_ref(replicator_id);
- StableId fan_principal = fan.agent.fan.principal;
- StableId fan_left = fan.agent.fan.left;
- StableId fan_right = fan.agent.fan.right;
- StableId old_principal_wire = net.ports.get_ref(fan_principal).wire_id;
- StableId old_replicator_principal = replicator.agent.replicator.principal;
+ NetRef fan_principal = fan.agent.fan.principal;
+ NetRef fan_left = fan.agent.fan.left;
+ NetRef fan_right = fan.agent.fan.right;
+ NetRef old_principal_wire = net.ports.get_ref(fan_principal).wire_id;
+ NetRef old_replicator_principal = replicator.agent.replicator.principal;
  ulong replicator_delta_level = replicator.agent.replicator.delta_level;
  ReplicatorStatus replicator_status = replicator.agent.replicator.status;
+ bool replicator_observable = replicator.agent.replicator.observable;
+ ulong replicator_origin = replicator.agent.replicator.origin;
+ ReplicatorStatus copy_status =
+  replicator_status == UNPAIRED ? UNKNOWN : replicator_status;
 
- StableId[] old_auxiliaries = replicator.agent.replicator.auxiliaries;
- StableId[] left_auxiliaries = {};
- StableId[] right_auxiliaries = {};
+ NetRef[] old_auxiliaries = replicator.agent.replicator.auxiliaries;
+ NetRef[] left_auxiliaries = {};
+ NetRef[] right_auxiliaries = {};
 
  // Reuse the fan branches as the principals of two replicator copies.
  // These ports are not cloned; only their slot and owner change.
@@ -116,7 +123,9 @@ fn void replicator_fan_reduction(Net* net, StableId replicator_id, StableId fan_
     .principal = fan_left,
     .auxiliaries = left_auxiliaries,
     .delta_level = replicator_delta_level,
-    .status = replicator_status
+    .status = copy_status,
+    .observable = replicator_observable && left_principal_polarity == PARENT,
+    .origin = replicator_observable && left_principal_polarity == PARENT ? replicator_origin : 0
    }},
  .type = REPLICATOR
 };
@@ -125,12 +134,14 @@ Node right_copy = {
    .principal = fan_right,
    .auxiliaries = right_auxiliaries,
    .delta_level = replicator_delta_level,
-   .status = replicator_status
+   .status = copy_status,
+   .observable = replicator_observable && right_principal_polarity == PARENT,
+   .origin = replicator_observable && right_principal_polarity == PARENT ? replicator_origin : 0
   }},
 .type = REPLICATOR
 };
-StableId left_copy_id = net.nodes.push(left_copy);
-StableId right_copy_id = net.nodes.push(right_copy);
+NetRef left_copy_id = net.nodes.push(left_copy);
+NetRef right_copy_id = net.nodes.push(right_copy);
 net.ports.get_ref(fan_left).node_id = left_copy_id;
 net.ports.get_ref(fan_right).node_id = right_copy_id;
  // Clone every old auxiliary for each output replicator. A copied
@@ -151,20 +162,22 @@ foreach (idx, old_auxiliary_id : old_auxiliaries)
  // The two branch ports below are genuinely new ports.
  Port* old_auxiliary = net.ports.get_ref(old_auxiliary_id);
  old_auxiliary.slot = { .type = PRINCIPAL };
- StableId new_left = net.ports.push({
-  .wire_id = INVALID_STABLE_ID,
+ NetRef new_left = net.ports.push({
+  .node_id = INVALID_NET_REF,
+  .wire_id = INVALID_NET_REF,
   .slot = { .type = LEFT },
   // A wire must connect opposite endpoint polarities.
   .polarity = opposite_polarity(
    net.ports.get_ref(left_auxiliaries[idx]).polarity)
  });
- StableId new_right = net.ports.push({
-  .wire_id = INVALID_STABLE_ID,
+ NetRef new_right = net.ports.push({
+  .node_id = INVALID_NET_REF,
+  .wire_id = INVALID_NET_REF,
   .slot = { .type = RIGHT },
   .polarity = opposite_polarity(
    net.ports.get_ref(right_auxiliaries[idx]).polarity)
  });
- StableId new_fan_id = net.nodes.push({ .agent = { .fan = {
+ NetRef new_fan_id = net.nodes.push({ .agent = { .fan = {
     .principal = old_auxiliary_id, .left = new_left, .right = new_right }}, .type = FAN });
  net.ports.get_ref(old_auxiliary_id).node_id = new_fan_id;
  net.ports.get_ref(new_left).node_id = new_fan_id;
@@ -182,27 +195,36 @@ net.wires.erase(old_principal_wire);
 
 
 
-fn void replicator_replicator_reduction(Net* net, StableId first_id,
-StableId second_id)
+fn void replicator_replicator_reduction(Net* net, NetRef first_id,
+NetRef second_id)
 {
  Node* first = net.nodes.get_ref(first_id);
  Node* second = net.nodes.get_ref(second_id);
- StableId first_principal = first.agent.replicator.principal;
- StableId second_principal = second.agent.replicator.principal;
- StableId principal_wire = net.ports.get_ref(first_principal).wire_id;
- StableId[] first_auxiliaries = first.agent.replicator.auxiliaries;
- StableId[] second_auxiliaries = second.agent.replicator.auxiliaries;
+ NetRef first_principal = first.agent.replicator.principal;
+ NetRef second_principal = second.agent.replicator.principal;
+ NetRef principal_wire = net.ports.get_ref(first_principal).wire_id;
+ NetRef[] first_auxiliaries = first.agent.replicator.auxiliaries;
+ NetRef[] second_auxiliaries = second.agent.replicator.auxiliaries;
  ulong first_level = first.agent.replicator.delta_level;
  ulong second_level = second.agent.replicator.delta_level;
+ bool first_observable = first.agent.replicator.observable;
+ bool second_observable = second.agent.replicator.observable;
+ ulong first_origin = first.agent.replicator.origin;
+ ulong second_origin = second.agent.replicator.origin;
 
- if (first_level == second_level)
+ // Observable coordinates are their stable source origins, not mutable
+ // reduction levels. Repeated origins annihilate index-for-index.
+ bool same_coordinate = first_observable && second_observable
+  ? first_origin == second_origin
+  : !first_observable && !second_observable && first_level == second_level;
+ if (same_coordinate)
  {
   assert(first_auxiliaries.len == second_auxiliaries.len,
   "Equal-level replicators must have the same arity");
 
   foreach (idx, first_auxiliary : first_auxiliaries)
   {
-   StableId second_auxiliary = second_auxiliaries[idx];
+   NetRef second_auxiliary = second_auxiliaries[idx];
    if (VALIDATE_REPLICATOR_EQUALITY)
    {
     PortSlot first_slot = net.ports.get_ref(first_auxiliary).slot;
@@ -214,9 +236,9 @@ StableId second_id)
     == second_slot.properties.value.delta_level,
     "Equal-level replicators must have matching ordered deltas");
    }
-  StableId first_wire = net.ports.get_ref(first_auxiliary).wire_id;
-  StableId second_wire = net.ports.get_ref(second_auxiliary).wire_id;
-  StableId second_external = other_endpoint(net, second_wire, second_auxiliary);
+  NetRef first_wire = net.ports.get_ref(first_auxiliary).wire_id;
+  NetRef second_wire = net.ports.get_ref(second_auxiliary).wire_id;
+  NetRef second_external = other_endpoint(net, second_wire, second_auxiliary);
 
   Wire* surviving_wire = net.wires.get_ref(first_wire);
   if (surviving_wire.a == first_auxiliary)
@@ -239,28 +261,34 @@ first_principal, second_principal);
 return;
 }
 
-StableId higher_id = first_level > second_level ? first_id : second_id;
-StableId lower_id = first_level > second_level ? second_id : first_id;
-StableId higher_principal = first_level > second_level
-? first_principal : second_principal;
-StableId lower_principal = first_level > second_level
-? second_principal : first_principal;
-StableId[] higher_auxiliaries = first_level > second_level
-? first_auxiliaries : second_auxiliaries;
-StableId[] lower_auxiliaries = first_level > second_level
-? second_auxiliaries : first_auxiliaries;
-ReplicatorStatus higher_status = first_level > second_level
-? first.agent.replicator.status : second.agent.replicator.status;
-ReplicatorStatus lower_status = first_level > second_level
-? second.agent.replicator.status : first.agent.replicator.status;
-ulong higher_level = first_level > second_level ? first_level : second_level;
-ulong lower_level = first_level > second_level ? second_level : first_level;
+// Earlier source origins remain outer coordinates, yielding lexicographic
+// Cartesian order; branch position is retained by each auxiliary slice.
+bool first_is_higher = first_observable && second_observable
+ ? first_origin < second_origin
+ : first_level > second_level
+  || (first_level == second_level && first_observable && !second_observable);
+NetRef higher_id = first_is_higher ? first_id : second_id;
+NetRef lower_id = first_is_higher ? second_id : first_id;
+NetRef higher_principal = first_is_higher ? first_principal : second_principal;
+NetRef lower_principal = first_is_higher ? second_principal : first_principal;
+NetRef[] higher_auxiliaries = first_is_higher ? first_auxiliaries : second_auxiliaries;
+NetRef[] lower_auxiliaries = first_is_higher ? second_auxiliaries : first_auxiliaries;
+ReplicatorStatus higher_status = first_is_higher
+ ? first.agent.replicator.status : second.agent.replicator.status;
+ReplicatorStatus lower_status = first_is_higher
+ ? second.agent.replicator.status : first.agent.replicator.status;
+ulong higher_level = first_is_higher ? first_level : second_level;
+ulong lower_level = first_is_higher ? second_level : first_level;
+bool higher_observable = first_is_higher ? first_observable : second_observable;
+bool lower_observable = first_is_higher ? second_observable : first_observable;
+ulong higher_origin = first_is_higher ? first_origin : second_origin;
+ulong lower_origin = first_is_higher ? second_origin : first_origin;
 sz higher_count = higher_auxiliaries.len;
 sz lower_count = lower_auxiliaries.len;
 
 Port[] higher_templates = mem::alloc_array(Port, higher_count);
 Port[] lower_templates = mem::alloc_array(Port, lower_count);
-StableId[][] higher_rows = mem::alloc_array(StableId[], lower_count);
+NetRef[][] higher_rows = mem::alloc_array(NetRef[], lower_count);
 defer mem::free(higher_templates);
 defer mem::free(lower_templates);
 defer mem::free(higher_rows);
@@ -273,18 +301,20 @@ lower_templates[idx] = net.ports.get(auxiliary);
 // Each lower auxiliary becomes the principal of a higher-level copy.
 foreach (lower_idx, principal : lower_auxiliaries)
 {
- StableId[] auxiliaries = mem::alloc_array(StableId, higher_count);
+ NetRef[] auxiliaries = mem::alloc_array(NetRef, higher_count);
  int128 replica_level = (int128)higher_level
  + (int128)lower_templates[lower_idx].slot.properties.value.delta_level;
  assert(replica_level >= 0
  && replica_level <= (int128)18_446_744_073_709_551_615,
  "Replicator level is out of range");
- StableId copy_id = net.nodes.push({
+ NetRef copy_id = net.nodes.push({
   .agent = { .replicator = {
     .principal = principal,
     .auxiliaries = auxiliaries,
     .delta_level = (ulong)replica_level,
-    .status = higher_status
+    .status = higher_status,
+    .observable = higher_observable,
+    .origin = higher_origin
    }},
  .type = REPLICATOR
 });
@@ -303,13 +333,15 @@ higher_rows[lower_idx] = auxiliaries;
 // Lower-level copies retain their level and complete the Cartesian wiring.
 foreach (higher_idx, principal : higher_auxiliaries)
 {
- StableId[] auxiliaries = mem::alloc_array(StableId, lower_count);
- StableId copy_id = net.nodes.push({
+ NetRef[] auxiliaries = mem::alloc_array(NetRef, lower_count);
+ NetRef copy_id = net.nodes.push({
   .agent = { .replicator = {
     .principal = principal,
     .auxiliaries = auxiliaries,
     .delta_level = lower_level,
-    .status = lower_status
+    .status = lower_status,
+    .observable = lower_observable,
+    .origin = lower_origin
    }},
  .type = REPLICATOR
 });
@@ -320,10 +352,10 @@ principal_port.slot = { .type = PRINCIPAL };
 
 foreach (lower_idx, template : lower_templates)
 {
- StableId lower_auxiliary = clone_port_value(net, template, copy_id);
+ NetRef lower_auxiliary = clone_port_value(net, template, copy_id);
 auxiliaries[lower_idx] = lower_auxiliary;
 
-StableId higher_auxiliary = higher_rows[lower_idx][higher_idx];
+NetRef higher_auxiliary = higher_rows[lower_idx][higher_idx];
 (void)connect(net, higher_auxiliary, lower_auxiliary);
 }
 }
@@ -332,29 +364,29 @@ erase_redex(net, higher_id, lower_id, principal_wire,
 higher_principal, lower_principal);
 }
 
-fn void replicator_eraser_reduction(Net* net, StableId replicator_id,
-StableId eraser_id)
+fn void replicator_eraser_reduction(Net* net, NetRef replicator_id,
+NetRef eraser_id)
 {
  Node* replicator = net.nodes.get_ref(replicator_id);
  Node* eraser = net.nodes.get_ref(eraser_id);
 
- StableId replicator_principal =
+ NetRef replicator_principal =
  replicator.agent.replicator.principal;
 
- StableId eraser_port =
+ NetRef eraser_port =
  eraser.agent.eraser.principal;
 
- StableId principal_wire_id =
+ NetRef principal_wire_id =
  net.ports.get_ref(replicator_principal).wire_id;
 
  // Snapshot the auxiliary IDs before mutating or erasing the
  // replicator node. The auxiliary wires remain in the net.
- StableId[] auxiliaries = replicator.agent.replicator.auxiliaries;
+ NetRef[] auxiliaries = replicator.agent.replicator.auxiliaries;
 
  foreach (auxiliary_id : auxiliaries)
  {
   // Every auxiliary port receives a new eraser.
-  StableId auxiliary_eraser_id = net.nodes.push({
+  NetRef auxiliary_eraser_id = net.nodes.push({
    .agent = {
     .eraser = {
      .principal = auxiliary_id
@@ -381,59 +413,373 @@ replicator_principal,
 eraser_port
 );
 }
-
-
-fn void interact(Net* net, StableId wire_id)
+fn bool commit_ordered_effect(Net* net, NetRef continuation_ref)
 {
- if (!is_active(net, wire_id)) return;
+	if (!net.effects.continuations.contains_ref(continuation_ref)) return false;
+	EffectContinuation* continuation = net.effects.continuations.get_ref(continuation_ref);
+	if (!continuation.ordered) return true;
+	foreach (&commit : net.effects.commits)
+		if (commit.continuation == continuation_ref && commit.committed) return true;
+	if (net.effects.committed >= net.effects.commits.len) return false;
+	OrderedEffectCommit* next = &net.effects.commits[net.effects.committed];
+	if (next.continuation != continuation_ref) return false;
+	next.committed = true;
+	net.effects.committed++;
+	return true;
+}
+
+fn bool resume_effect_continuation(Net* net, NetRef continuation_ref)
+{
+	if (!net.effects.continuations.contains_ref(continuation_ref)) return false;
+	EffectContinuation* continuation = net.effects.continuations.get_ref(continuation_ref);
+	if (continuation.effect_epoch != net.effects.execution_epoch
+		|| continuation.state == CONTINUATION_ERASED) return false;
+	if (!continuation.multi && continuation.resumes_used)
+	{
+		return false;
+	}
+	if (continuation.multi && continuation.resumes_used >= continuation.resume_count)
+	{
+		return false;
+	}
+	if (!commit_ordered_effect(net, continuation_ref)) return false;
+	continuation.resumes_used++;
+	continuation.state = continuation.multi
+		? CONTINUATION_REPLICATED : CONTINUATION_RESUMED;
+	return true;
+}
+
+fn bool erase_effect_continuation(Net* net, NetRef continuation_ref, NetRef eraser)
+{
+	if (!net.effects.continuations.contains_ref(continuation_ref)
+		|| !net.nodes.contains_ref(eraser)
+		|| net.nodes.get_ref(eraser).type != ERASER) return false;
+	EffectContinuation* continuation = net.effects.continuations.get_ref(continuation_ref);
+	continuation.eraser = eraser;
+	continuation.state = CONTINUATION_ERASED;
+	return true;
+}
+
+
+fn void practical_eraser_reduction(Net* net, NetRef practical_id, NetRef eraser_id)
+{
+ Node* practical = net.nodes.get_ref(practical_id);
+ Node* eraser = net.nodes.get_ref(eraser_id);
+ for (SlotId id = 0; id < net.effects.continuations.next_id; id++)
+ {
+  if (!net.effects.continuations.contains_id(id)) continue;
+  NetRef continuation_ref = net.effects.continuations.generation_ref(id);
+  EffectContinuation* continuation = net.effects.continuations.get_ref(continuation_ref);
+  if (continuation.handler == practical_id)
+  {
+   (void)erase_effect_continuation(net, continuation_ref, eraser_id);
+  }
+ }
+ NetRef practical_principal = practical.agent.practical.principal;
+ NetRef eraser_principal = eraser.agent.eraser.principal;
+ NetRef principal_wire = net.ports.get_ref(practical_principal).wire_id;
+ NetRef[] auxiliaries = practical.agent.practical.auxiliaries;
+ foreach (auxiliary : auxiliaries)
+ {
+  NetRef auxiliary_eraser = net.nodes.push({
+   .agent = { .eraser = { .principal = auxiliary } },
+   .type = ERASER
+  });
+  Port* port = net.ports.get_ref(auxiliary);
+  port.node_id = auxiliary_eraser;
+  port.slot = { .type = PRINCIPAL };
+ }
+ erase_redex(
+  net,
+  practical_id,
+  eraser_id,
+  principal_wire,
+  practical_principal,
+  eraser_principal
+ );
+}
+fn bool practical_value_agent(AgentType type) @private
+{
+ return type == I64_AGENT || type == STRING_AGENT || type == CONSTRUCTOR_AGENT
+  || type == TYPE_VALUE_AGENT || type == LAMBDA_AGENT || type == ARRAY_AGENT;
+}
+
+fn void practical_retire_continuations(
+ Net* net,
+ NetRef first_id,
+ NetRef second_id,
+ NetRef first_principal,
+ NetRef second_principal
+) @private
+{
+ for (SlotId id = 0; id < net.effects.continuations.next_id; id++)
+ {
+  if (!net.effects.continuations.contains_id(id)) continue;
+  NetRef reference = net.effects.continuations.generation_ref(id);
+  EffectContinuation* continuation =
+   net.effects.continuations.get_ref(reference);
+  if (continuation.handler == first_id || continuation.handler == second_id
+   || continuation.hole == first_principal
+   || continuation.hole == second_principal)
+  {
+   net.effects.continuations.erase(reference);
+  }
+ }
+ delta_build_effect_commit_queue(net);
+}
+
+fn void practical_pair_consume(
+ Net* net,
+ NetRef first_id,
+ NetRef second_id,
+ NetRef principal_wire,
+ NetRef first_principal,
+ NetRef second_principal
+) @private
+{
+ practical_retire_continuations(
+  net, first_id, second_id, first_principal, second_principal
+ );
+ Node* first = net.nodes.get_ref(first_id);
+ Node* second = net.nodes.get_ref(second_id);
+ NetRef[] first_auxiliaries = first.agent.practical.auxiliaries;
+ NetRef[] second_auxiliaries = second.agent.practical.auxiliaries;
+ usz common = first_auxiliaries.len < second_auxiliaries.len
+  ? first_auxiliaries.len : second_auxiliaries.len;
+ for (usz index = 0; index < common; index++)
+ {
+  (void)splice(net, first_auxiliaries[index], second_auxiliaries[index]);
+ }
+ for (usz index = common; index < first_auxiliaries.len; index++)
+ {
+  NetRef port_ref = first_auxiliaries[index];
+  NetRef eraser_ref = net.nodes.push({
+   .agent = { .eraser = { .principal = port_ref } },
+   .type = ERASER,
+  });
+  Port* port = net.ports.get_ref(port_ref);
+  port.node_id = eraser_ref;
+  port.slot = { .type = PRINCIPAL };
+ }
+ for (usz index = common; index < second_auxiliaries.len; index++)
+ {
+  NetRef port_ref = second_auxiliaries[index];
+  NetRef eraser_ref = net.nodes.push({
+   .agent = { .eraser = { .principal = port_ref } },
+   .type = ERASER,
+  });
+  Port* port = net.ports.get_ref(port_ref);
+  port.node_id = eraser_ref;
+  port.slot = { .type = PRINCIPAL };
+ }
+ for (usz index = 0; index < common; index++)
+ {
+  net.ports.erase(first_auxiliaries[index]);
+  net.ports.erase(second_auxiliaries[index]);
+ }
+ net.ports.erase(first_principal);
+ net.ports.erase(second_principal);
+ net.wires.erase(principal_wire);
+ destroy_node_record(net, first_id);
+ destroy_node_record(net, second_id);
+}
+
+fn NetRef practical_effect_continuation(
+ Net* net,
+ NetRef handler_ref,
+ PracticalAgent* effect
+) @private
+{
+ for (SlotId id = 0; id < net.effects.continuations.next_id; id++)
+ {
+  if (!net.effects.continuations.contains_id(id)) continue;
+  NetRef reference = net.effects.continuations.generation_ref(id);
+  EffectContinuation* continuation = net.effects.continuations.get_ref(reference);
+  if (continuation.handler == handler_ref
+   && continuation.effect_id == effect.effect_id
+   && continuation.operation_id == effect.operation_id
+   && continuation.effect_epoch == effect.effect_epoch
+   && continuation.hole == effect.principal) return reference;
+ }
+ return INVALID_NET_REF;
+}
+
+fn bool practical_pair_reduction(
+ Net* net,
+ NetRef first_id,
+ NetRef second_id,
+ NetRef principal_wire,
+ NetRef first_principal,
+ NetRef second_principal
+) @private
+{
+ Node* first_node = net.nodes.get_ref(first_id);
+ Node* second_node = net.nodes.get_ref(second_id);
+ AgentType first_type = first_node.type;
+ AgentType second_type = second_node.type;
+ PracticalAgent* first = &first_node.agent.practical;
+ PracticalAgent* second = &second_node.agent.practical;
+ bool consume = false;
+
+ if (first_type == second_type)
+ {
+  consume = first.semantic_id == second.semantic_id
+   && first.type_id == second.type_id
+   && first.descriptor == second.descriptor
+   && first.payload == second.payload
+   && first.text == second.text;
+ }
+ else if ((first_type == APPLY_AGENT && second_type == LAMBDA_AGENT)
+  || (second_type == APPLY_AGENT && first_type == LAMBDA_AGENT)
+  || (first_type == MATCH_AGENT && second_type == CONSTRUCTOR_AGENT)
+  || (second_type == MATCH_AGENT && first_type == CONSTRUCTOR_AGENT)
+  || (first_type == PARALLEL_JOIN_AGENT && second_type == PARALLEL_ROOT_AGENT)
+  || (second_type == PARALLEL_JOIN_AGENT && first_type == PARALLEL_ROOT_AGENT))
+ {
+  consume = true;
+ }
+ else if ((first_type == LET_AGENT && practical_value_agent(second_type))
+  || (second_type == LET_AGENT && practical_value_agent(first_type))
+  || (first_type == TYPE_ASSERTION_AGENT && practical_value_agent(second_type))
+  || (second_type == TYPE_ASSERTION_AGENT && practical_value_agent(first_type))
+  || (first_type == GENERIC_DISPATCH_AGENT && practical_value_agent(second_type))
+  || (second_type == GENERIC_DISPATCH_AGENT && practical_value_agent(first_type))
+  || (first_type == GENERIC_CALL_AGENT && practical_value_agent(second_type))
+  || (second_type == GENERIC_CALL_AGENT && practical_value_agent(first_type))
+  || (first_type == PRIMITIVE_OP_AGENT && practical_value_agent(second_type))
+  || (second_type == PRIMITIVE_OP_AGENT && practical_value_agent(first_type)))
+ {
+  consume = true;
+ }
+ else if ((first_type == HANDLER_AGENT && second_type == EFFECT_AGENT)
+  || (second_type == HANDLER_AGENT && first_type == EFFECT_AGENT))
+ {
+  NetRef handler_ref = first_type == HANDLER_AGENT ? first_id : second_id;
+  PracticalAgent* handler = first_type == HANDLER_AGENT ? first : second;
+  PracticalAgent* effect = first_type == EFFECT_AGENT ? first : second;
+  NetRef continuation = practical_effect_continuation(net, handler_ref, effect);
+  if (continuation == INVALID_NET_REF) return false;
+  handler.continuation = continuation;
+  effect.continuation = continuation;
+  consume = true;
+ }
+ else if ((first_type == RESUME_AGENT && second_type == HANDLER_AGENT)
+  || (second_type == RESUME_AGENT && first_type == HANDLER_AGENT))
+ {
+  PracticalAgent* resume = first_type == RESUME_AGENT ? first : second;
+  PracticalAgent* handler = first_type == HANDLER_AGENT ? first : second;
+  NetRef continuation = resume.continuation != INVALID_NET_REF
+   ? resume.continuation : handler.continuation;
+  if (!resume_effect_continuation(net, continuation)) return false;
+  consume = true;
+ }
+ else if ((first_type == ABORT_AGENT && second_type == HANDLER_AGENT)
+  || (second_type == ABORT_AGENT && first_type == HANDLER_AGENT))
+ {
+  PracticalAgent* handler = first_type == HANDLER_AGENT ? first : second;
+  PracticalAgent* abort = first_type == ABORT_AGENT ? first : second;
+  if (!net.effects.continuations.contains_ref(handler.continuation)) return false;
+  EffectContinuation* continuation =
+   net.effects.continuations.get_ref(handler.continuation);
+  continuation.state = CONTINUATION_ERASED;
+  continuation.eraser = abort.auxiliaries.len
+   ? net.ports.get_ref(abort.auxiliaries[abort.auxiliaries.len - 1]).node_id
+   : INVALID_NET_REF;
+  consume = true;
+ }
+
+ if (!consume) return false;
+ practical_pair_consume(
+  net, first_id, second_id, principal_wire, first_principal, second_principal
+ );
+ return true;
+}
+
+fn bool interact(Net* net, NetRef wire_id)
+{
+ // Queued work may carry a retired generation. Reject it before dereference;
+ // local rewrites remain coordinator-serialized until footprint claims land.
+ if (!is_active(net, wire_id)) return false;
  Wire* wire = net.wires.get_ref(wire_id);
- StableId port_a_id = wire.a;
- StableId port_b_id = wire.b;
+ NetRef port_a_id = wire.a;
+ NetRef port_b_id = wire.b;
  Port* port_a = net.ports.get_ref(port_a_id);
  Port* port_b = net.ports.get_ref(port_b_id);
- StableId node_a_id = port_a.node_id;
- StableId node_b_id = port_b.node_id;
+ NetRef node_a_id = port_a.node_id;
+ NetRef node_b_id = port_b.node_id;
  AgentType type_a = net.nodes.get_ref(node_a_id).type;
  AgentType type_b = net.nodes.get_ref(node_b_id).type;
 
- switch (type_a)
+ if (type_a == ERASER)
  {
- case ERASER:
-  switch (type_b)
+  if (type_b == ERASER)
   {
-  case ERASER:
-   eraser_eraser_reduction(net, node_a_id, node_b_id, wire_id,
-   port_a_id, port_b_id);
-  case FAN:
-   fan_eraser_reduction(net, node_b_id, node_a_id, wire_id,
-   port_b_id, port_a_id);
-  case REPLICATOR:
-   replicator_eraser_reduction(net, node_b_id, node_a_id);
-  default: ;
+   eraser_eraser_reduction(net, node_a_id, node_b_id, wire_id, port_a_id, port_b_id);
   }
-case FAN:
- switch (type_b)
+  else if (type_b == FAN)
+  {
+   fan_eraser_reduction(net, node_b_id, node_a_id, wire_id, port_b_id, port_a_id);
+  }
+  else if (type_b == REPLICATOR)
+  {
+   replicator_eraser_reduction(net, node_b_id, node_a_id);
+  }
+  else if (is_practical_agent_type(type_b))
+  {
+   practical_eraser_reduction(net, node_b_id, node_a_id);
+  }
+  else
+  {
+   return false;
+  }
+  return true;
+ }
+ if (type_b == ERASER)
  {
- case ERASER:
-  fan_eraser_reduction(net, node_a_id, node_b_id, wire_id,
-  port_a_id, port_b_id);
- case FAN:
+  if (type_a == FAN)
+  {
+   fan_eraser_reduction(net, node_a_id, node_b_id, wire_id, port_a_id, port_b_id);
+  }
+  else if (type_a == REPLICATOR)
+  {
+   replicator_eraser_reduction(net, node_a_id, node_b_id);
+  }
+  else if (is_practical_agent_type(type_a))
+  {
+   practical_eraser_reduction(net, node_a_id, node_b_id);
+  }
+  else
+  {
+   return false;
+  }
+  return true;
+ }
+ if (type_a == FAN && type_b == FAN)
+ {
   fan_fan_reduction(net, node_a_id, node_b_id, port_a_id);
- case REPLICATOR:
-  replicator_fan_reduction(net, node_b_id, node_a_id);
- default: ;
+  return true;
  }
-case REPLICATOR:
- switch (type_b)
+ if (type_a == REPLICATOR && type_b == FAN)
  {
- case FAN:
   replicator_fan_reduction(net, node_a_id, node_b_id);
- case REPLICATOR:
-  replicator_replicator_reduction(net, node_a_id, node_b_id);
- case ERASER:
-  replicator_eraser_reduction(net, node_a_id, node_b_id);
- default: ;
+  return true;
  }
-default: ;
-}
+ if (type_a == FAN && type_b == REPLICATOR)
+ {
+  replicator_fan_reduction(net, node_b_id, node_a_id);
+  return true;
+ }
+ if (type_a == REPLICATOR && type_b == REPLICATOR)
+ {
+  replicator_replicator_reduction(net, node_a_id, node_b_id);
+  return true;
+ }
+ if (is_practical_agent_type(type_a) && is_practical_agent_type(type_b))
+ {
+  return practical_pair_reduction(
+   net, node_a_id, node_b_id, wire_id, port_a_id, port_b_id
+  );
+ }
+ // An active pair is successful only when a concrete rewrite occurred.
+ return false;
 }

@@ -1,0 +1,19 @@
+enum Choice:
+  Left(value)
+  Right(value)
+end
+
+unwrap(choice):
+  match choice:
+    Left(value): value
+    Right(value): value
+  end
+end
+
+main():
+  parallel:
+    left := unwrap(Left(20))
+    right := unwrap(Right(22))
+    left + right
+  end
+end

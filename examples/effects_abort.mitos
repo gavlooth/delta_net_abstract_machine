@@ -1,0 +1,10 @@
+effect Abort:
+  abort(message of String) of I64
+end
+
+main():
+  handle Abort.abort("cancelled\n") + 1:
+    Abort.abort(message of String): 42
+    return(value of I64): value
+  end
+end

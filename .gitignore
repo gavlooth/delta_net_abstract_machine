@@ -1,5 +1,6 @@
 build/
 out/
+obj/
 
 # Large generated HTML exports
 *.html

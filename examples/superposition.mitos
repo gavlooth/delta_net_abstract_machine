@@ -1,0 +1,11 @@
+enum Observation:
+  Pair(correlated of I64, cartesian of I64)
+end
+
+main():
+  shared := superpose(1, 2)
+  independent := superpose(10, 20)
+  collapse(Pair(shared + shared, shared + independent))
+end
+
+// Expected: [Pair(2, 11), Pair(2, 21), Pair(4, 12), Pair(4, 22)]
