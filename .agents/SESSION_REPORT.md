@@ -389,3 +389,20 @@ Signature: openai-codex/gpt-5.6-sol
 - Next actions: write a core-lock PRD in dependency order: canonical symbols/coherence; EffectRow tails; continuation execution outcomes; layout/resource/buffer ABI; per-runtime host/executor registry; extensible Delta/AOT feature negotiation.
 
 Signature: openai-codex/gpt-5.6-sol
+
+## 2026-09-01T14:43:25+03:00 — Effects remain the control core; resumptions stay runtime-opaque
+
+- Objective attempted: decide whether Mitos needs first-class continuations as a separate core concept when algebraic effects already capture and resume delimited continuations.
+- Decision: no separate language-level continuation feature, type, syntax, practical agent, or undelimited `call/cc` belongs in the locked core. Algebraic effects remain the sole public control abstraction. A handler resumption is already a delimited continuation represented by a stable Delta graph root; multi-shot behavior already uses replicators.
+- Required runtime seam: asynchronous scheduling still needs an opaque, generation-checked resumption token attached to an escaped effect request. This is not a new semantic feature; it is the lifecycle/embedding representation of the continuation effects already create. The token records stable slot/generation, program/effect epochs, multiplicity, and captured/resumed/cancelled state.
+- Runtime outcome refinement: execution may return `Complete(value)`, `Suspended(effect request, opaque resumption token)`, or `Failed(diagnostic)`. Only the effect runtime/host ABI may resume or cancel the token. User libraries expose `Task`, `Fiber`, scheduler, or future abstractions through effects rather than manipulating raw continuations.
+- Safety contract: one-shot transition is atomic; stale tokens reject; cancellation attaches erasers and releases unreachable resources once; multi-shot replication is permitted only for a declared multi effect and remains Delta-replicator-backed. No native stack copying or dynamic handler stack is introduced.
+- Why the token is still necessary: effects can express suspension, but a request cannot be resumed after returning to an external event loop unless the captured graph root has a durable identity and lifecycle API. Without that token, host integrations must block, poll internally, or retain unsafe runtime pointers.
+- Architecture coverage: public control decision 100%; existing synchronous lexical effect/resume implementation 100%; opaque asynchronous suspension ABI 0%.
+- Commands/evidence: conceptual refinement against the current effect/handler/resume Delta design and core-lock checkpoint. No code changes, build, or tests.
+- Invalidated assumption / negative memory: “first-class continuation handle” was too broad and suggested a second public control model. The correct core seam is an opaque resumption handle subordinate to algebraic effects.
+- Current recommendation/checkpoint: remove “first-class continuations” from the core-lock feature list. Lock effect semantics plus the opaque suspend/resume/cancel host protocol; defer all user-facing concurrency abstractions to libraries.
+- Unresolved issues: exact host ABI ownership of a suspended token and whether cancellation may invoke only nonblocking release hooks.
+- Next actions: specify the opaque effect-resumption ABI together with per-runtime helper/executor registries.
+
+Signature: openai-codex/gpt-5.6-sol
