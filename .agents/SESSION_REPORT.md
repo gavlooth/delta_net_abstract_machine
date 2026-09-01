@@ -349,3 +349,21 @@ Signature: openai-codex/gpt-5.6-sol
 - Next actions: none required for this milestone.
 
 Signature: openai-codex/gpt-5.6-sol
+
+## 2026-09-01T14:29:35+03:00 — Mitos beta-readiness assessment
+
+- Objective attempted: assess the current language maturity and define the concrete gate from the completed experimental implementation to a defensible beta.
+- Workspace/target: `/home/heefoo/Documents/code/c3-experiments/siroko`, current Mitos language/runtime/toolchain.
+- Code/configuration changes: none; session-report checkpoint only.
+- Current state: feature-rich alpha / pre-beta. The semantic architecture is coherent and broad—owned typed DeltaProgram, nominal/parametric runtime types, multiple dispatch, Delta runtime, MIR JIT, persistent REPL, AOT v3, algebraic effects, deterministic parallelism, and first-class superposition all share one execution image. CLI smoke demonstrates cross-backend behavior, bounded decoding/evaluation, and stable helper/agent ABI metadata.
+- Beta-readiness coverage: approximately 55%. Basis: core semantics and all intended execution modes exist, but operational confidence is substantially lower than feature coverage. `test/` contains interaction-net and stable-index-vector tests only; there is no permanent language conformance, differential-backend, malformed-artifact, fuzz, sanitizer, leak, or concurrency-soak suite. Several native compiler warnings remain, and JIT diagnostics commonly lose the source position and report `1:1`.
+- Required beta blockers: (1) freeze the documented syntax/semantics and define compatibility policy for source, Delta schema, helper ABI, and AOT; (2) add one behavior-driven conformance corpus executed through `check`, `run`, `jit`, REPL, AOT creation, and `aot-run`; (3) add deterministic differential tests for values and errors across those modes; (4) fuzz parser, Delta/AOT decoders, type/method tables, and observable-net validation; (5) run ASan/UBSan plus leak and multithreaded stress/soak coverage over the C bridge, stable slots, effects, and superposition; (6) preserve source spans through MIR/AOT diagnostics; (7) establish CI/release packaging on supported architectures with reproducible versioned artifacts.
+- Language-product work recommended before a general-purpose beta: multi-file modules/imports, a minimal standard library, general Array operations beyond collapse output, practical file/IO APIs, and editor tooling. These are not blockers for an explicitly scoped “runtime beta,” but are blockers for presenting Mitos as a generally usable language beta.
+- Proposed beta exit criteria: zero known correctness/security/memory-safety P0 defects; all semantic fixtures pass identically through run/JIT/AOT/REPL; malformed inputs fail deterministically within resource bounds; sanitizer and threaded soak runs are clean; syntax/ABI/version promises are published; and a tagged release can be built from a clean checkout.
+- Commands/evidence reviewed: directory inspection of `test/`; current `README.md` CLI/backend contract; current `mitos_syntax.md` type and execution contract. No build or tests were run because this was a readiness assessment, not an implementation change.
+- Invalidated assumption / negative memory: a broad working feature set is not sufficient evidence for beta. The current smoke matrix proves representative paths, not compatibility, exhaustive backend parity, memory safety under adversarial inputs, or long-running reliability.
+- Current recommendation/checkpoint: call the current release an alpha. Target a runtime-focused beta first by prioritizing conformance, differential execution, fuzzing, sanitizers, source-accurate diagnostics, and CI; add modules/stdlib/tooling as the next product layer rather than mixing them into runtime stabilization.
+- Unresolved issues: beta scope must be named explicitly—runtime beta versus general-purpose language beta.
+- Next actions: write the beta conformance specification and CI matrix, then implement the P0 verification/hardening gate before adding more semantics.
+
+Signature: openai-codex/gpt-5.6-sol
