@@ -2,6 +2,7 @@ module delta_net_abstract_machine;
 
 import delta_net_abstract_machine::mitos;
 import delta_net_abstract_machine::mitos_jit;
+import delta_net_abstract_machine::mitos_mir;
 import std::core::main_stub;
 import std::io;
 import std::io::file;
@@ -47,13 +48,39 @@ fn bool parse_thread_count(String text, usz* result)
 	return true;
 }
 
+fn void print_diagnostic(
+	String source_name,
+	String message,
+	MitosSpan span = { }
+)
+{
+	usz row = span.start.row > 0 ? (usz)span.start.row : 1;
+	usz column = span.start.column > 0 ? (usz)span.start.column : 1;
+	io::eprintfn(
+		"%s:%d:%d: %s",
+		source_name, (long)row, (long)column, message
+	);
+}
+
+fn MitosSpan operation_span(
+	DeltaProgram* program,
+	OperationId operation_id
+)
+{
+	foreach (&operation : program.effects.operations)
+	{
+		if (operation.id != operation_id || !operation.span
+			|| (usz)operation.span > program.spans.len) continue;
+		return program.spans[(usz)operation.span - 1];
+	}
+	return { };
+}
+
 fn void print_diagnostics(String source_name, MitosDiagnostic[] diagnostics)
 {
 	foreach (&diagnostic : diagnostics)
 	{
-		usz row = diagnostic.span.start.row > 0 ? (usz)diagnostic.span.start.row : 1;
-		usz column = diagnostic.span.start.column > 0 ? (usz)diagnostic.span.start.column : 1;
-		io::eprintfn("%s:%d:%d: %s", source_name, (long)row, (long)column, diagnostic.message);
+		print_diagnostic(source_name, diagnostic.message, diagnostic.span);
 	}
 }
 
@@ -69,16 +96,25 @@ fn int run_delta(String source_name, DeltaProgram* program, usz threads)
  }
 	TypedDeltaExecutionResult execution = runtime.run(program);
 	defer execution.deinit();
-	if (!execution.ok())
+	if (execution.status == TYPED_DELTA_SUSPENDED)
 	{
-  foreach (&diagnostic : execution.diagnostics)
-  {
-   usz row = diagnostic.span.start.row > 0 ? (usz)diagnostic.span.start.row : 1;
-   usz column = diagnostic.span.start.column > 0 ? (usz)diagnostic.span.start.column : 1;
-   io::eprintfn(
-    "%s:%d:%d: %s", source_name, (long)row, (long)column, diagnostic.message
-   );
-  }
+		DeltaTokenActionResult cancelled = runtime.cancel(execution.token, mem);
+		defer cancelled.deinit();
+		String message = cancelled.ok
+			? "unexpected external effect suspension was cancelled"
+			: cancelled.diagnostic;
+		print_diagnostic(
+			source_name, message,
+			operation_span(program, execution.request.operation)
+		);
+		return 1;
+	}
+	if (execution.status == TYPED_DELTA_FAILED)
+	{
+		foreach (&diagnostic : execution.diagnostics)
+		{
+			print_diagnostic(source_name, diagnostic.message, diagnostic.span);
+		}
 		return 1;
 	}
 	io::printn(execution.formatted);
@@ -87,12 +123,22 @@ fn int run_delta(String source_name, DeltaProgram* program, usz threads)
 
 fn int run_jit(String source_name, DeltaProgram* program)
 {
-	MitosJitResult native = mitos_jit::jit_delta_program(program, null, mem);
+	mitos_mir::MirRuntime runtime;
+	runtime.init();
+	defer (void)runtime.free();
+	if (!runtime.ready())
+	{
+		io::eprintfn("%s:1:1: MIR runtime initialization failed", source_name);
+		return 1;
+	}
+	MitosJitResult native = mitos_jit::jit_delta_program(
+		program, mem, &runtime
+	);
 	defer native.free();
 	if (native.status != NATIVE)
 	{
 		String message = native.diagnostic.len ? native.diagnostic : "MIR Delta JIT failed without a diagnostic";
-		io::eprintfn("%s:1:1: %s", source_name, message);
+		print_diagnostic(source_name, message, native.diagnostic_span);
 		return 1;
 	}
 	io::printn(native.result);
@@ -105,8 +151,8 @@ fn int write_aot_program(String source_name, DeltaProgram* program, String outpu
 	defer artifact.free();
 	if (artifact.status != NATIVE)
 	{
-		String message = artifact.diagnostic.len ? artifact.diagnostic : "DeltaProgram AOT v3 serialization failed without a diagnostic";
-		io::eprintfn("%s:1:1: %s", source_name, message);
+		String message = artifact.diagnostic.len ? artifact.diagnostic : "DeltaProgram AOT v4 serialization failed without a diagnostic";
+		print_diagnostic(source_name, message, artifact.diagnostic_span);
 		return 1;
 	}
 	return 0;
@@ -120,7 +166,9 @@ fn int process_source(
 	String output = ""
 )
 {
-	MitosParseResult parsed = mitos::parse_program(source, mem);
+	mitos::ModuleKey source_module = mitos::default_module_key(mem);
+	defer source_module.deinit(mem);
+	MitosParseResult parsed = mitos::parse_program(source, mem, &source_module);
 	defer parsed.deinit();
 	if (!parsed.ok())
 	{
@@ -200,7 +248,7 @@ fn int run_aot_artifact(String path)
 	if (execution.status != NATIVE)
 	{
 		String message = execution.diagnostic.len ? execution.diagnostic : "AOT execution failed without a diagnostic";
-		io::eprintfn("%s:1:1: %s", path, message);
+		print_diagnostic(path, message, execution.diagnostic_span);
 		return 1;
 	}
 	io::printn(execution.result);

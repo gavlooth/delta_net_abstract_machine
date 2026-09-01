@@ -1,9 +1,308 @@
 module delta_net_abstract_machine;
 import std::collections::maybe;
+import delta_net_abstract_machine::mitos_storage;
+
+fn bool practical_agent_payload_equal(
+ Net* net,
+ AgentType agent_type,
+ PracticalAgent* left,
+ PracticalAgent* right
+)
+{
+ bool left_stored = left.storage != mitos_storage::INVALID_STORAGE_HANDLE;
+ bool right_stored = right.storage != mitos_storage::INVALID_STORAGE_HANDLE;
+ if (agent_type == STRING_AGENT
+  && left.type_id == (uint)mitos::TYPE_ID_STRING
+  && right.type_id == (uint)mitos::TYPE_ID_STRING)
+ {
+  return practical_string_payload_equal(
+   net, left, right, left_stored, right_stored
+  );
+ }
+ if (left.storage_policy != right.storage_policy
+  || left_stored != right_stored) return false;
+ if (!left_stored) return left.text == right.text;
+ if (left.storage_count != right.storage_count
+  || left.storage_stride != right.storage_stride) return false;
+ bool equal;
+ return mitos_storage::bytes_equal(
+  &net.storage, left.storage, right.storage, &equal
+ ) == mitos_storage::StorageError.STORAGE_OK && equal;
+}
+fn bool practical_storage_metadata_matches_agent(
+ AgentType agent_type,
+ mitos_storage::StorageMetadata* metadata
+) @private
+{
+ if (!metadata || metadata.kind != mitos::LayoutKind.LAYOUT_SEQUENCE)
+ {
+  return false;
+ }
+ switch (agent_type)
+ {
+ case STRING_AGENT:
+  return metadata.type_id == mitos::TYPE_ID_STRING
+   && metadata.element_type == mitos::TYPE_ID_INVALID
+   && metadata.stride == 1
+   && metadata.element_size == 1;
+ case ARRAY_AGENT:
+  return metadata.type_id != mitos::TYPE_ID_STRING
+   && metadata.element_type != mitos::TYPE_ID_INVALID;
+ default:
+  return false;
+ }
+}
+
+fn bool practical_inline_string_is_valid(PracticalAgent* practical) @private
+{
+ return practical
+  && practical.type_id == (uint)mitos::TYPE_ID_STRING
+  && practical.storage == mitos_storage::INVALID_STORAGE_HANDLE
+  && practical.storage_policy == mitos::CopyPolicy.COPY_TRIVIAL
+  && !practical.storage_count
+  && !practical.storage_stride
+  && practical.owns_text;
+}
+
+fn bool practical_stored_string_is_valid(
+ Net* net,
+ PracticalAgent* practical,
+ mitos_storage::StorageMetadata* metadata
+) @private
+{
+ if (!net || !practical || !metadata
+  || practical.type_id != (uint)mitos::TYPE_ID_STRING
+  || practical.storage == mitos_storage::INVALID_STORAGE_HANDLE
+  || practical.storage_policy != mitos::CopyPolicy.COPY_SHARED_IMMUTABLE
+  || practical.storage_stride != 1
+  || practical.owns_text
+  || practical.text.len
+  || mitos_storage::storage_metadata(
+   &net.storage, practical.storage, metadata
+  ) != mitos_storage::StorageError.STORAGE_OK) return false;
+ return practical_storage_metadata_matches_agent(STRING_AGENT, metadata)
+  && metadata.type_id == (mitos::TypeId)practical.type_id
+  && metadata.copy_policy == practical.storage_policy
+  && metadata.owner_count
+  && metadata.byte_length == practical.storage_count;
+}
+
+fn bool practical_string_payload_equal(
+ Net* net,
+ PracticalAgent* left,
+ PracticalAgent* right,
+ bool left_stored,
+ bool right_stored
+) @private
+{
+ if (!left_stored && !right_stored)
+ {
+  return practical_inline_string_is_valid(left)
+   && practical_inline_string_is_valid(right)
+   && left.text == right.text;
+ }
+ mitos_storage::StorageMetadata left_metadata;
+ mitos_storage::StorageMetadata right_metadata;
+ if (left_stored && right_stored)
+ {
+  if (!practical_stored_string_is_valid(net, left, &left_metadata)
+   || !practical_stored_string_is_valid(net, right, &right_metadata))
+  {
+   return false;
+  }
+  bool equal;
+  return mitos_storage::bytes_equal(
+   &net.storage, left.storage, right.storage, &equal
+  ) == mitos_storage::StorageError.STORAGE_OK && equal;
+ }
+ PracticalAgent* stored = left_stored ? left : right;
+ PracticalAgent* inline_string = left_stored ? right : left;
+ if (!practical_inline_string_is_valid(inline_string)
+  || !practical_stored_string_is_valid(net, stored, &left_metadata)
+  || left_metadata.byte_length != inline_string.text.len)
+ {
+  return false;
+ }
+ char[] bytes = alloc::new_array(
+  mem, char, (sz)left_metadata.byte_length
+ );
+ defer alloc::free(mem, bytes);
+ return mitos_storage::copy_all(&net.storage, stored.storage, bytes)
+   == mitos_storage::StorageError.STORAGE_OK
+  && (String)bytes == inline_string.text;
+}
+
+// Moves one generation-checked owner lease into a storage-backed practical
+// node. The caller's source becomes stale only after every payload invariant
+// succeeds.
+fn bool practical_agent_take_storage(
+ Net* net,
+ NetRef practical_ref,
+ mitos_storage::StorageHandle* source,
+ usz count,
+ usz stride
+)
+{
+ if (!net || !source || !net.nodes.contains_ref(practical_ref)) return false;
+ Node* node = net.nodes.get_ref(practical_ref);
+ if (!agent_type_supports_storage(node.type)) return false;
+ PracticalAgent* practical = &node.agent.practical;
+ if (practical.storage != mitos_storage::INVALID_STORAGE_HANDLE
+  || *source == mitos_storage::INVALID_STORAGE_HANDLE
+  || !practical.type_id || !stride
+  || practical.owns_text || practical.text.len
+  || practical.storage_policy != mitos::CopyPolicy.COPY_TRIVIAL
+  || practical.storage_count || practical.storage_stride) return false;
+ mitos_storage::StorageMetadata metadata;
+ if (mitos_storage::storage_metadata(&net.storage, *source, &metadata)
+   != mitos_storage::StorageError.STORAGE_OK
+  || !practical_storage_metadata_matches_agent(node.type, &metadata)
+  || metadata.type_id != (mitos::TypeId)practical.type_id
+  || metadata.copy_policy != mitos::CopyPolicy.COPY_SHARED_IMMUTABLE
+  || metadata.stride != stride
+  || metadata.element_size != stride
+  || !metadata.owner_count
+  || count > usz::max / stride
+  || metadata.byte_length != count * stride) return false;
+ if (mitos_storage::attach_owner(
+   &net.storage, source, &practical.storage
+  ) != mitos_storage::StorageError.STORAGE_OK) return false;
+ practical.storage_policy = metadata.copy_policy;
+ practical.storage_count = count;
+ practical.storage_stride = stride;
+ return true;
+}
+
+// A successful preflight guarantees that the node's storage owner can be
+// retired before any graph record is changed. Reductions are coordinator-
+// serialized, so the owner cannot change between this check and retirement.
+fn bool practical_agent_can_drop(Net* net, NetRef practical_ref) @private
+{
+ if (!net || !net.nodes.contains_ref(practical_ref)) return false;
+ Node* node = net.nodes.get_ref(practical_ref);
+ if (!is_practical_agent_type(node.type)) return false;
+ PracticalAgent* practical = &node.agent.practical;
+ if (practical.storage == mitos_storage::INVALID_STORAGE_HANDLE) return true;
+ return mitos_storage::storage_metadata(
+  &net.storage, practical.storage, null
+ ) == mitos_storage::StorageError.STORAGE_OK;
+}
+
+// Pair retirement is only atomic when each practical node owns a distinct
+// lease. Two copied handles name the same single-owner lease: releasing either
+// one would make the other stale before the graph rewrite commits.
+fn bool practical_agent_pair_can_drop(
+ Net* net,
+ NetRef first_ref,
+ NetRef second_ref
+) @private
+{
+ if (first_ref == second_ref
+  || !practical_agent_can_drop(net, first_ref)
+  || !practical_agent_can_drop(net, second_ref)) return false;
+ PracticalAgent* first = &net.nodes.get_ref(first_ref).agent.practical;
+ PracticalAgent* second = &net.nodes.get_ref(second_ref).agent.practical;
+ return first.storage == mitos_storage::INVALID_STORAGE_HANDLE
+  || second.storage == mitos_storage::INVALID_STORAGE_HANDLE
+  || first.storage != second.storage;
+}
+
+fn bool practical_agent_release_storage(
+ Net* net,
+ PracticalAgent* practical
+) @private
+{
+ if (practical.storage == mitos_storage::INVALID_STORAGE_HANDLE) return true;
+ if (mitos_storage::release(&net.storage, practical.storage)
+   != mitos_storage::StorageError.STORAGE_OK) return false;
+ practical.storage = mitos_storage::INVALID_STORAGE_HANDLE;
+ practical.storage_policy = mitos::CopyPolicy.COPY_TRIVIAL;
+ practical.storage_count = 0;
+ practical.storage_stride = 0;
+ return true;
+}
+// Retires storage ownership without freeing graph-owned payloads. A reduction
+// uses this after preflight and before changing ports, wires, continuations, or
+// node records; destroy_node_record later frees the remaining allocations.
+fn bool practical_agent_retire_storage(Net* net, NetRef practical_ref) @private
+{
+ if (!net || !net.nodes.contains_ref(practical_ref)) return false;
+ Node* node = net.nodes.get_ref(practical_ref);
+ if (!is_practical_agent_type(node.type)) return false;
+ return practical_agent_release_storage(net, &node.agent.practical);
+}
+
+
+fn void practical_agent_free_allocations(PracticalAgent* practical) @private
+{
+ mem::free(practical.auxiliaries);
+ practical.auxiliaries = { };
+ if (practical.owns_text) mem::free(practical.text);
+ practical.text = "";
+ practical.owns_text = false;
+}
+
+
+// Drops only a practical node owned by this net. A failed storage release
+// leaves the node and its sole owner handle intact so it can be diagnosed or
+// retried without orphaning the lease.
+fn bool practical_agent_drop(Net* net, NetRef practical_ref)
+{
+ if (!practical_agent_retire_storage(net, practical_ref)) return false;
+ Node* node = net.nodes.get_ref(practical_ref);
+ practical_agent_free_allocations(&node.agent.practical);
+ return true;
+}
+
+fn bool practical_agent_storage_copy(
+ Net* net,
+ NetRef practical_ref,
+ char[]* output,
+ Allocator allocator = mem
+)
+{
+ if (!net || !output || !net.nodes.contains_ref(practical_ref)) return false;
+ Node* node = net.nodes.get_ref(practical_ref);
+ if (!agent_type_supports_storage(node.type)) return false;
+ PracticalAgent* practical = &node.agent.practical;
+ if (practical.storage == mitos_storage::INVALID_STORAGE_HANDLE) return false;
+ usz length;
+ if (mitos_storage::byte_length(&net.storage, practical.storage, &length)
+   != mitos_storage::StorageError.STORAGE_OK) return false;
+ char[] bytes = alloc::new_array(allocator, char, (sz)length);
+ if (mitos_storage::copy_all(&net.storage, practical.storage, bytes)
+   != mitos_storage::StorageError.STORAGE_OK)
+ {
+  alloc::free(allocator, bytes);
+  return false;
+ }
+ *output = bytes;
+ return true;
+}
 
 // Net construction and mutation are coordinator-serialized in this wave.
 // Stable slot addresses therefore may be used across arena pushes here; worker
 // rewrites must claim every retained slot before parallel execution is enabled.
+
+fn void PracticalContinuationIndex.free(&self)
+{
+ if (self.allocator)
+ {
+  alloc::free(self.allocator, self.node_heads);
+  alloc::free(self.allocator, self.node_tails);
+  alloc::free(self.allocator, self.links);
+  alloc::free(self.allocator, self.effect_buckets);
+ }
+ *self = { };
+}
+
+fn void practical_continuation_index_invalidate(Net* net) @private
+{
+ ulong version = net.effects.continuation_shape_version;
+ net.effects.continuation_shape_version = version == ulong::max
+  ? 1 : version + 1;
+ net.effects.continuation_index.built = false;
+}
 
 fn Net* Net.init(&self)
 {
@@ -12,6 +311,9 @@ fn Net* Net.init(&self)
  self.nodes.init();
  self.interfaces.init();
  self.effects.continuations.init();
+ self.effects.continuation_index = { };
+ self.effects.continuation_shape_version = 1;
+ self.storage.init();
  return self;
 }
 
@@ -30,10 +332,10 @@ fn void Net.free(&self)
   }
   else if (is_practical_agent_type(node.type))
   {
-   mem::free(node.agent.practical.auxiliaries);
-   if (node.agent.practical.owns_text)
+   if (!practical_agent_drop(self, node_ref))
    {
-    mem::free(node.agent.practical.text);
+    // Bulk storage teardown below remains authoritative for a malformed lease.
+    practical_agent_free_allocations(&node.agent.practical);
    }
   }
  }
@@ -41,9 +343,11 @@ fn void Net.free(&self)
  self.wires.free();
  self.nodes.free();
  self.interfaces.free();
+ self.effects.continuation_index.free();
  self.effects.continuations.free();
  mem::free(self.effects.commits);
  self.effects = { };
+ self.storage.free();
 }
 
 fn NetRef clone_port_value(Net* net, Port source, NetRef node_id) @private
@@ -206,6 +510,8 @@ fn NetRef new_practical_agent(
    .source_order = source_order,
    .text = "",
    .owns_text = false,
+   .storage = mitos_storage::INVALID_STORAGE_HANDLE,
+   .storage_policy = mitos::CopyPolicy.COPY_TRIVIAL,
    .occurrence_order = 0,
    .continuation = INVALID_NET_REF,
   }},
@@ -282,10 +588,14 @@ fn NetRef new_effect_continuation(
   Node* second = net.nodes.get_ref(continuation.second_replicator);
   (void)connect(net, first.agent.replicator.principal, second.agent.replicator.principal);
   foreach (index, auxiliary : first.agent.replicator.auxiliaries)
+  {
    (void)connect(net, auxiliary, second.agent.replicator.auxiliaries[index]);
+  }
   continuation.state = CONTINUATION_REPLICATED;
  }
- return net.effects.continuations.push(continuation);
+ NetRef reference = net.effects.continuations.push(continuation);
+ practical_continuation_index_invalidate(net);
+ return reference;
 }
 
 fn NetRef new_interface(Net* net, InterfacePortType type, String name)
@@ -376,22 +686,20 @@ fn NetRef splice(Net* net, NetRef port_a, NetRef port_b)
  return wire_a_id;
 }
 
-fn void destroy_node_record(Net* net, NetRef node_id)
+fn bool destroy_node_record(Net* net, NetRef node_id)
 {
  Node* node = net.nodes.get_ref(node_id);
  if (node.type == REPLICATOR)
  {
   mem::free(node.agent.replicator.auxiliaries);
  }
- else if (is_practical_agent_type(node.type))
+ else if (is_practical_agent_type(node.type)
+  && !practical_agent_drop(net, node_id))
  {
-  mem::free(node.agent.practical.auxiliaries);
-  if (node.agent.practical.owns_text)
-  {
-   mem::free(node.agent.practical.text);
-  }
+  return false;
  }
  net.nodes.erase(node_id);
+ return true;
 }
 
 fn void destroy_port(Net* net, NetRef port_id) @private
@@ -409,7 +717,13 @@ fn void destroy_port(Net* net, NetRef port_id) @private
 
 fn void destroy_node(Net* net, NetRef node_id)
 {
- Node node = net.nodes.get(node_id);
+ Node* stored = net.nodes.get_ref(node_id);
+ if (is_practical_agent_type(stored.type)
+  && !practical_agent_release_storage(net, &stored.agent.practical))
+ {
+  return;
+ }
+ Node node = *stored;
  switch (node.type)
  {
  case FAN:
@@ -432,15 +746,40 @@ fn void destroy_node(Net* net, NetRef node_id)
   {
    destroy_port(net, auxiliary);
   }
-  mem::free(node.agent.practical.auxiliaries);
-  if (node.agent.practical.owns_text)
-  {
-   mem::free(node.agent.practical.text);
-  }
+  // Storage was released before graph mutation, so this cannot orphan a lease.
+  (void)practical_agent_drop(net, node_id);
  }
  net.nodes.erase(node_id);
 }
 
+
+fn bool node_references_port(Node* node, NetRef port_ref) @private
+{
+ switch (node.type)
+ {
+ case ERASER:
+  return node.agent.eraser.principal == port_ref;
+ case FAN:
+  return node.agent.fan.principal == port_ref
+   || node.agent.fan.left == port_ref
+   || node.agent.fan.right == port_ref;
+ case REPLICATOR:
+  if (node.agent.replicator.principal == port_ref) return true;
+  foreach (auxiliary : node.agent.replicator.auxiliaries)
+  {
+   if (auxiliary == port_ref) return true;
+  }
+  return false;
+ default:
+  if (!is_practical_agent_type(node.type)) return false;
+  if (node.agent.practical.principal == port_ref) return true;
+  foreach (auxiliary : node.agent.practical.auxiliaries)
+  {
+   if (auxiliary == port_ref) return true;
+  }
+  return false;
+ }
+}
 
 fn bool is_active(Net* net, NetRef wire_id)
 {

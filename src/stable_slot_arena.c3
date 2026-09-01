@@ -62,17 +62,17 @@ fn bool slot_state_is_active(SlotState state) @private
 	return state == SLOT_STATE_LIVE || state == SLOT_STATE_CLAIMED;
 }
 
-fn void StableSlotArena.lock_arena(&self) @private
+fn void lock_arena(StableSlotArena* self) @private
 {
 	if (catch self.mutex.lock()) unreachable("failed to lock stable slot arena");
 }
 
-fn void StableSlotArena.unlock_arena(&self) @private
+fn void unlock_arena(StableSlotArena* self) @private
 {
 	self.mutex.unlock();
 }
 
-fn StableSlot* StableSlotArena.slot_unlocked(&self, SlotId id) @private
+fn StableSlot* slot_unlocked(StableSlotArena* self, SlotId id) @private
 {
 	if (id >= self.next_id) return null;
 	usz raw_id = (usz)id;
@@ -81,7 +81,7 @@ fn StableSlot* StableSlotArena.slot_unlocked(&self, SlotId id) @private
 	return &self.pages[(sz)page_index].slots[slot_index];
 }
 
-fn StableSlotPage* StableSlotArena.allocate_page_unlocked(&self) @private
+fn StableSlotPage* allocate_page_unlocked(StableSlotArena* self) @private
 {
 	StableSlotPage* page = alloc::new_aligned(self.allocator, StableSlotPage)!!;
 	self.pages.push(page);
@@ -106,7 +106,7 @@ fn void StableSlotArena.free(&self)
 {
 	if (!self.allocator) return;
 
-	self.lock_arena();
+	lock_arena(self);
 	Allocator allocator = self.allocator;
 	foreach (page : self.pages)
 	{
@@ -116,7 +116,7 @@ fn void StableSlotArena.free(&self)
 	self.next_id = 0;
 	self.free_head = INVALID_SLOT_ID;
 	self.live_count = 0;
-	self.unlock_arena();
+	unlock_arena(self);
 	self.mutex.destroy();
 	*self = { };
 }
@@ -124,15 +124,15 @@ fn void StableSlotArena.free(&self)
 fn SlotRef StableSlotArena.push(&self, Type value)
 {
 	assert(self.allocator != null, "stable slot arena is not initialized");
-	self.lock_arena();
-	defer self.unlock_arena();
+	lock_arena(self);
+	defer unlock_arena(self);
 
 	SlotId id;
 	StableSlot* slot;
 	if (self.free_head != INVALID_SLOT_ID)
 	{
 		id = self.free_head;
-		slot = self.slot_unlocked(id);
+		slot = slot_unlocked(self, id);
 		assert(slot != null && slot.state == SLOT_STATE_FREE,
 			"stable slot arena free list is corrupt");
 		self.free_head = slot.next_free;
@@ -145,8 +145,8 @@ fn SlotRef StableSlotArena.push(&self, Type value)
 		assert(self.next_id < INVALID_SLOT_ID, "stable slot ID space exhausted");
 		id = self.next_id;
 		usz page_index = (usz)id / STABLE_SLOT_PAGE_CAPACITY;
-		if (page_index == (usz)self.pages.size) self.allocate_page_unlocked();
-		slot = self.slot_unlocked(id);
+		if (page_index == (usz)self.pages.size) allocate_page_unlocked(self);
+		slot = slot_unlocked(self, id);
 		// slot_unlocked excludes next_id until it is published.
 		if (!slot)
 		{
@@ -168,9 +168,9 @@ fn SlotRef StableSlotArena.push(&self, Type value)
 fn bool StableSlotArena.contains_ref(&self, SlotRef reference)
 {
 	assert(self.allocator != null, "stable slot arena is not initialized");
-	self.lock_arena();
-	defer self.unlock_arena();
-	StableSlot* slot = self.slot_unlocked(reference.id);
+	lock_arena(self);
+	defer unlock_arena(self);
+	StableSlot* slot = slot_unlocked(self, reference.id);
 	return slot != null
 		&& slot.generation == reference.generation
 		&& slot_state_is_active(slot.state);
@@ -181,18 +181,18 @@ fn bool StableSlotArena.contains_ref(&self, SlotRef reference)
 fn bool StableSlotArena.contains_id(&self, SlotId id)
 {
 	assert(self.allocator != null, "stable slot arena is not initialized");
-	self.lock_arena();
-	defer self.unlock_arena();
-	StableSlot* slot = self.slot_unlocked(id);
+	lock_arena(self);
+	defer unlock_arena(self);
+	StableSlot* slot = slot_unlocked(self, id);
 	return slot != null && slot_state_is_active(slot.state);
 }
 
 fn Type StableSlotArena.get(&self, SlotRef reference)
 {
 	assert(self.allocator != null, "stable slot arena is not initialized");
-	self.lock_arena();
-	defer self.unlock_arena();
-	StableSlot* slot = self.slot_unlocked(reference.id);
+	lock_arena(self);
+	defer unlock_arena(self);
+	StableSlot* slot = slot_unlocked(self, reference.id);
 	assert(slot != null
 		&& slot.generation == reference.generation
 		&& slot_state_is_active(slot.state),
@@ -205,9 +205,9 @@ fn Type StableSlotArena.get(&self, SlotRef reference)
 fn Type* StableSlotArena.get_ref(&self, SlotRef reference)
 {
 	assert(self.allocator != null, "stable slot arena is not initialized");
-	self.lock_arena();
-	defer self.unlock_arena();
-	StableSlot* slot = self.slot_unlocked(reference.id);
+	lock_arena(self);
+	defer unlock_arena(self);
+	StableSlot* slot = slot_unlocked(self, reference.id);
 	assert(slot != null
 		&& slot.generation == reference.generation
 		&& slot_state_is_active(slot.state),
@@ -221,9 +221,9 @@ fn Type* StableSlotArena.get_ref(&self, SlotRef reference)
 fn Type* StableSlotArena.get_ref_id(&self, SlotId id)
 {
 	assert(self.allocator != null, "stable slot arena is not initialized");
-	self.lock_arena();
-	defer self.unlock_arena();
-	StableSlot* slot = self.slot_unlocked(id);
+	lock_arena(self);
+	defer unlock_arena(self);
+	StableSlot* slot = slot_unlocked(self, id);
 	assert(slot != null && slot.state != SLOT_STATE_FREE,
 		"cannot access an unallocated stable slot ID");
 	return &slot.value;
@@ -232,9 +232,9 @@ fn Type* StableSlotArena.get_ref_id(&self, SlotId id)
 fn SlotRef StableSlotArena.generation_ref(&self, SlotId id)
 {
 	assert(self.allocator != null, "stable slot arena is not initialized");
-	self.lock_arena();
-	defer self.unlock_arena();
-	StableSlot* slot = self.slot_unlocked(id);
+	lock_arena(self);
+	defer unlock_arena(self);
+	StableSlot* slot = slot_unlocked(self, id);
 	assert(slot != null && slot_state_is_active(slot.state),
 		"cannot create a reference for an inactive stable slot ID");
 	return { .id = id, .generation = slot.generation };
@@ -243,9 +243,9 @@ fn SlotRef StableSlotArena.generation_ref(&self, SlotId id)
 fn bool StableSlotArena.claim(&self, SlotRef reference)
 {
 	assert(self.allocator != null, "stable slot arena is not initialized");
-	self.lock_arena();
-	defer self.unlock_arena();
-	StableSlot* slot = self.slot_unlocked(reference.id);
+	lock_arena(self);
+	defer unlock_arena(self);
+	StableSlot* slot = slot_unlocked(self, reference.id);
 	if (!slot
 		|| slot.generation != reference.generation
 		|| slot.state != SLOT_STATE_LIVE) return false;
@@ -256,9 +256,9 @@ fn bool StableSlotArena.claim(&self, SlotRef reference)
 fn bool StableSlotArena.release_claim(&self, SlotRef reference)
 {
 	assert(self.allocator != null, "stable slot arena is not initialized");
-	self.lock_arena();
-	defer self.unlock_arena();
-	StableSlot* slot = self.slot_unlocked(reference.id);
+	lock_arena(self);
+	defer unlock_arena(self);
+	StableSlot* slot = slot_unlocked(self, reference.id);
 	if (!slot
 		|| slot.generation != reference.generation
 		|| slot.state != SLOT_STATE_CLAIMED) return false;
@@ -269,9 +269,9 @@ fn bool StableSlotArena.release_claim(&self, SlotRef reference)
 fn bool StableSlotArena.retire_claimed(&self, SlotRef reference)
 {
 	assert(self.allocator != null, "stable slot arena is not initialized");
-	self.lock_arena();
-	defer self.unlock_arena();
-	StableSlot* slot = self.slot_unlocked(reference.id);
+	lock_arena(self);
+	defer unlock_arena(self);
+	StableSlot* slot = slot_unlocked(self, reference.id);
 	if (!slot
 		|| slot.generation != reference.generation
 		|| slot.state != SLOT_STATE_CLAIMED) return false;
@@ -287,9 +287,9 @@ fn bool StableSlotArena.retire_claimed(&self, SlotRef reference)
 fn bool StableSlotArena.erase(&self, SlotRef reference)
 {
 	assert(self.allocator != null, "stable slot arena is not initialized");
-	self.lock_arena();
-	defer self.unlock_arena();
-	StableSlot* slot = self.slot_unlocked(reference.id);
+	lock_arena(self);
+	defer unlock_arena(self);
+	StableSlot* slot = slot_unlocked(self, reference.id);
 	if (!slot
 		|| slot.generation != reference.generation
 		|| slot.state == SLOT_STATE_FREE
@@ -310,16 +310,16 @@ fn bool StableSlotArena.erase(&self, SlotRef reference)
 fn usz StableSlotArena.len(&self) @operator(len)
 {
 	assert(self.allocator != null, "stable slot arena is not initialized");
-	self.lock_arena();
-	defer self.unlock_arena();
+	lock_arena(self);
+	defer unlock_arena(self);
 	return self.live_count;
 }
 
 fn bool StableSlotArena.is_empty(&self)
 {
 	assert(self.allocator != null, "stable slot arena is not initialized");
-	self.lock_arena();
-	defer self.unlock_arena();
+	lock_arena(self);
+	defer unlock_arena(self);
 	return self.live_count == 0;
 }
 
@@ -330,11 +330,11 @@ fn bool StableSlotArena.is_empty(&self)
 macro void StableSlotArena.each_snapshot(&self, callback)
 {
 	assert(self.allocator != null, "stable slot arena is not initialized");
-	self.lock_arena();
-	defer self.unlock_arena();
+	lock_arena(self);
+	defer unlock_arena(self);
 	for (SlotId id = 0; id < self.next_id; id++)
 	{
-		StableSlot* slot = self.slot_unlocked(id);
+		StableSlot* slot = slot_unlocked(self, id);
 		if (!slot_state_is_active(slot.state)) continue;
 		SlotRef reference = { .id = id, .generation = slot.generation };
 		callback(reference, &slot.value);

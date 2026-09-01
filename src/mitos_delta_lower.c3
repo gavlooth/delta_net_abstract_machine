@@ -19,9 +19,11 @@ struct DeltaLowerScope
 {
 	DeltaLowerScope* parent;
 	String[] names;
-	EffectId[] effects;
+	TypeId[] types;
+	ResolvedEffectRow* effects;
 	bool has_effect_context;
 	DeltaResumeScope* resume;
+	bool resume_barrier;
 }
 
 struct DeltaProgramLowerer
@@ -38,6 +40,7 @@ struct DeltaProgramLowerer
 	List{MitosSpan} spans;
 	List{MitosDiagnostic} diagnostics;
 	usz parallel_order;
+	usz next_source_order;
 	List{DeltaHandlerDescriptor} handlers;
 	usz handler_order;
 }
@@ -56,6 +59,31 @@ fn bool delta_scope_contains(DeltaLowerScope* scope, String name) @private
 		foreach (candidate : current.names) if (candidate == name) return true;
 	}
 	return false;
+}
+
+fn TypeId delta_scope_type(DeltaLowerScope* scope, String name) @private
+{
+	for (DeltaLowerScope* current = scope; current; current = current.parent)
+	{
+		foreach (index, candidate : current.names)
+		{
+			if (candidate == name)
+			{
+				return index < current.types.len ? current.types[index] : TYPE_ID_ANY;
+			}
+		}
+	}
+	return TYPE_ID_ANY;
+}
+
+fn TypeId delta_node_static_type(
+	DeltaProgramLowerer* lowerer,
+	DeltaNodeId node
+) @private
+{
+	if (!node || (usz)node > (usz)lowerer.nodes.len()) return TYPE_ID_ANY;
+	TypeId type_id = lowerer.nodes[(sz)((usz)node - 1)].static_type;
+	return type_id ? type_id : TYPE_ID_ANY;
 }
 
 fn uint delta_record_span(DeltaProgramLowerer* lowerer, MitosSpan span) @private
@@ -99,7 +127,8 @@ fn sz delta_constructor_index(DeltaProgram* program, String name) @private
 {
 	foreach (index, &constructor : program.constructors)
 	{
-		if (constructor.name == name) return (sz)index;
+		if (constructor.name == name
+			&& module_key_equal(&constructor.key.owner, &program.module_key)) return (sz)index;
 	}
 	return -1;
 }
@@ -108,7 +137,8 @@ fn sz delta_generic_index(DeltaProgram* program, String name, usz arity) @privat
 {
 	foreach (index, &generic : program.methods.generics)
 	{
-		if (generic.name == name && generic.arity == arity) return (sz)index;
+		if (generic.name == name && generic.arity == arity
+			&& module_key_equal(&generic.key.owner, &program.module_key)) return (sz)index;
 	}
 	return -1;
 }
@@ -147,22 +177,25 @@ fn EffectId[] delta_current_effects(DeltaLowerScope* scope) @private
 {
 	for (DeltaLowerScope* current = scope; current; current = current.parent)
 	{
-		if (current.has_effect_context) return current.effects;
+		if (current.has_effect_context && current.effects)
+		{
+			return current.effects.required;
+		}
 	}
 	return { };
 }
 
-
-fn EffectId[] delta_lambda_effects(
+fn ResolvedEffectRow delta_lambda_effects(
 	DeltaProgramLowerer* lowerer,
 	MitosSpan span
 ) @private
 {
 	foreach (&lambda : lowerer.effect_analysis.lambdas)
 	{
-		if (lambda.span.start.offset != span.start.offset || lambda.span.end.offset != span.end.offset) continue;
-		EffectId[] effects = lambda.has_assertion ? lambda.asserted : lambda.inferred;
-		return alloc::clone_slice(lowerer.allocator, effects);
+		if (lambda.span.start.offset != span.start.offset
+			|| lambda.span.end.offset != span.end.offset) continue;
+		ResolvedEffectRow* row = lambda.has_assertion ? &lambda.asserted : &lambda.inferred;
+		return clone_resolved_effect_row(row, lowerer.allocator);
 	}
 	delta_lower_error(lowerer, "lambda effect analysis metadata is missing", span);
 	return { };
@@ -197,7 +230,11 @@ fn usz delta_primitive_descriptor(DeltaProgram* program, DeltaPrimitiveOp operat
 
 fn sz delta_effect_index(DeltaProgram* program, String name) @private
 {
-	foreach (index, &effect : program.effects.effects) if (effect.name == name) return (sz)index;
+	foreach (index, &effect : program.effects.effects)
+	{
+		if (effect.name == name
+			&& module_key_equal(&effect.key.owner, &program.module_key)) return (sz)index;
+	}
 	return -1;
 }
 
@@ -214,7 +251,7 @@ fn usz delta_count_resumes(SurfaceExpr* expression, usz depth = 0) @private
 	switch (expression.kind)
 	{
 		case SURFACE_RESUME: return 1 + delta_count_resumes(expression.data.resume.value, depth + 1);
-		case SURFACE_LAMBDA: return delta_count_resumes(expression.data.lambda.body, depth + 1);
+		case SURFACE_LAMBDA: return 0;
 		case SURFACE_APPLICATION:
 			usz count = delta_count_resumes(expression.data.application.callee, depth + 1);
 			foreach (argument : expression.data.application.arguments) count += delta_count_resumes(argument, depth + 1);
@@ -231,8 +268,13 @@ fn usz delta_count_resumes(SurfaceExpr* expression, usz depth = 0) @private
 				+ delta_count_resumes(expression.data.definition.body, depth + 1);
 		case SURFACE_MATCH:
 			usz count = delta_count_resumes(expression.data.match_expr.scrutinee, depth + 1);
-			foreach (&arm : expression.data.match_expr.arms) count += delta_count_resumes(arm.body, depth + 1);
-			return count;
+			usz arm_max = 0;
+			foreach (&arm : expression.data.match_expr.arms)
+			{
+				usz arm_count = delta_count_resumes(arm.body, depth + 1);
+				if (arm_count > arm_max) arm_max = arm_count;
+			}
+			return count + arm_max;
 		case SURFACE_PARALLEL:
 			usz count = delta_count_resumes(expression.data.parallel.result, depth + 1);
 			foreach (&binding : expression.data.parallel.bindings) count += delta_count_resumes(binding.value, depth + 1);
@@ -249,8 +291,19 @@ fn DeltaResumeScope* delta_current_resume(DeltaLowerScope* scope) @private
 	for (DeltaLowerScope* current = scope; current; current = current.parent)
 	{
 		if (current.resume) return current.resume;
+		if (current.resume_barrier) return null;
 	}
 	return null;
+}
+
+fn bool delta_resume_blocked_by_lambda(DeltaLowerScope* scope) @private
+{
+	for (DeltaLowerScope* current = scope; current; current = current.parent)
+	{
+		if (current.resume) return false;
+		if (current.resume_barrier) return true;
+	}
+	return false;
 }
 
 fn DeltaNodeId delta_lower_effect_operation(
@@ -306,6 +359,10 @@ fn DeltaNodeId delta_lower_effect_operation(
 	foreach (index, argument : performed.arguments)
 		inputs[index] = delta_lower_expression(lowerer, argument, scope);
 	return delta_node_with_span(lowerer, {
+		.key = clone_symbol_key(
+			&lowerer.program.effects.operations[(usz)operation_index].key,
+			lowerer.allocator
+		),
 		.kind = DELTA_EFFECT,
 		.static_type = resolved_types[performed.arguments.len],
 		.result_type = resolved_types[performed.arguments.len],
@@ -326,6 +383,7 @@ fn DeltaNodeId delta_lower_handler(
 	HandlerExpr* source = &expression.data.handler;
 	usz handler_index = (usz)lowerer.handlers.len();
 	lowerer.handlers.push({ });
+	usz handler_order = lowerer.handler_order++;
 	DeltaNodeId handled = delta_lower_expression(lowerer, source.handled, scope);
 	DeltaHandlerClauseDescriptor[] clauses = alloc::new_array(
 		lowerer.allocator, DeltaHandlerClauseDescriptor, (sz)source.clauses.len
@@ -391,13 +449,19 @@ fn DeltaNodeId delta_lower_handler(
 			.result_type = operation_result,
 			.resume_count = resume_count,
 		};
-		DeltaLowerScope clause_scope = { .parent = scope, .names = clause.parameters, .resume = &resume };
+		DeltaLowerScope clause_scope = {
+			.parent = scope,
+			.names = clause.parameters,
+			.types = parameter_types,
+			.resume = &resume,
+		};
 		DeltaNodeId body = delta_lower_expression(lowerer, clause.body, &clause_scope);
 		if (!resume_count)
 		{
 			DeltaNodeId[] abort_inputs = alloc::new_array(lowerer.allocator, DeltaNodeId, 1);
 			abort_inputs[0] = body;
 			body = delta_node_with_span(lowerer, {
+				.key = clone_symbol_key(&source_operation.key, lowerer.allocator),
 				.kind = DELTA_ABORT,
 				.static_type = TYPE_ID_ANY,
 				.descriptor = handler_index,
@@ -407,6 +471,7 @@ fn DeltaNodeId delta_lower_handler(
 		}
 		inputs[(usz)clause_index + 1] = body;
 		clauses[clause_index] = {
+			.key = clone_symbol_key(&source_operation.key, lowerer.allocator),
 			.stable_id = (uint)clause_index + 1,
 			.effect = concrete_effect,
 			.operation = source_operation.id,
@@ -420,8 +485,15 @@ fn DeltaNodeId delta_lower_handler(
 		};
 	}
 	HandlerReturnClause* return_clause = &source.return_clause;
+	TypeId return_type = delta_resolve_annotation(lowerer, &return_clause.annotation, true);
+	if (!return_clause.annotation.value) return_type = delta_node_static_type(lowerer, handled);
 	String[1] return_name = { return_clause.parameter };
-	DeltaLowerScope return_scope = { .parent = scope, .names = return_name[..] };
+	TypeId[1] return_types = { return_type };
+	DeltaLowerScope return_scope = {
+		.parent = scope,
+		.names = return_name[..],
+		.types = return_types[..],
+	};
 	DeltaNodeId return_body = delta_lower_expression(lowerer, return_clause.body, &return_scope);
 	inputs[source.clauses.len + 1] = return_body;
 	DeltaHandlerDescriptor handler = {
@@ -429,10 +501,10 @@ fn DeltaNodeId delta_lower_handler(
 		.handled = handled,
 		.clauses = clauses,
 		.return_parameter = return_clause.parameter.copy(lowerer.allocator),
-		.return_type = delta_resolve_annotation(lowerer, &return_clause.annotation, true),
+		.return_type = return_type,
 		.return_body = return_body,
 		.span = delta_record_span(lowerer, expression.span),
-		.source_order = lowerer.handler_order++,
+		.source_order = handler_order,
 	};
 	lowerer.handlers[(sz)handler_index] = handler;
 	return delta_node_with_span(lowerer, {
@@ -522,6 +594,7 @@ fn DeltaNodeId delta_lower_application(
 				}
 			}
 			return delta_node_with_span(lowerer, {
+				.key = clone_symbol_key(&descriptor.key, lowerer.allocator),
 				.kind = DELTA_CONSTRUCTOR,
 				.static_type = runtime_type ? runtime_type : TYPE_ID_ANY,
 				.runtime_type = runtime_type,
@@ -558,6 +631,7 @@ fn DeltaNodeId delta_lower_application(
 						"superpose branches must have one concrete runtime type",
 						argument.span
 					);
+					alloc::free(lowerer.allocator, inputs);
 					return DELTA_NODE_INVALID;
 				}
 			}
@@ -644,7 +718,9 @@ fn DeltaNodeId delta_lower_application(
 		{
 			DeltaNodeId[] inputs = alloc::new_array(lowerer.allocator, DeltaNodeId, (sz)arity);
 			foreach (index, argument : application.arguments) inputs[index] = delta_lower_expression(lowerer, argument, scope);
+			GenericFunction* selected_generic = &lowerer.program.methods.generics[generic];
 			return delta_node_with_span(lowerer, {
+				.key = clone_symbol_key(&selected_generic.key, lowerer.allocator),
 				.kind = DELTA_GENERIC_CALL,
 				.static_type = TYPE_ID_ANY,
 				.descriptor = (usz)generic,
@@ -655,10 +731,65 @@ fn DeltaNodeId delta_lower_application(
 	}
 	DeltaNodeId[] inputs = alloc::new_array(lowerer.allocator, DeltaNodeId, (sz)arity + 1);
 	inputs[0] = delta_lower_expression(lowerer, application.callee, scope);
-	foreach (index, argument : application.arguments) inputs[index + 1] = delta_lower_expression(lowerer, argument, scope);
+	foreach (index, argument : application.arguments)
+		inputs[index + 1] = delta_lower_expression(lowerer, argument, scope);
+	TypeId callee_type = delta_node_static_type(lowerer, inputs[0]);
+	TypeDescriptor* callee_descriptor = type_descriptor(&lowerer.program.types, callee_type);
+	ResolvedEffectRow application_effects = { };
+	TypeId result_type = TYPE_ID_ANY;
+	if (callee_descriptor && callee_descriptor.kind == TYPE_DESCRIPTOR_FUNCTION_INSTANCE)
+	{
+		application_effects = clone_resolved_effect_row(
+			&callee_descriptor.function_effects, lowerer.allocator
+		);
+		result_type = callee_descriptor.function_result;
+	}
 	return delta_node_with_span(lowerer, {
-		.kind = DELTA_APPLY, .static_type = TYPE_ID_ANY, .inputs = inputs,
+		.kind = DELTA_APPLY,
+		.static_type = result_type,
+		.result_type = result_type,
+		.effect_row = application_effects,
+		.inputs = inputs,
 	}, expression.span);
+}
+
+fn TypeId[] delta_match_binding_types(
+	DeltaProgramLowerer* lowerer,
+	sz constructor_index,
+	TypeId scrutinee_type,
+	usz binding_count
+) @private
+{
+	TypeId[] result = alloc::new_array(lowerer.allocator, TypeId, (sz)binding_count);
+	foreach (&binding_type : result) *binding_type = TYPE_ID_ANY;
+	if (constructor_index < 0) return result;
+	DeltaConstructorDescriptor* constructor =
+		&lowerer.program.constructors[(usz)constructor_index];
+	foreach (index, field_type : constructor.field_types)
+	{
+		if ((usz)index >= binding_count) break;
+		result[index] = field_type ? field_type : TYPE_ID_ANY;
+	}
+	if (!constructor.parameters.len) return result;
+	TypeDescriptor* scrutinee = type_descriptor(&lowerer.program.types, scrutinee_type);
+	if (!scrutinee || scrutinee.kind != TYPE_DESCRIPTOR_INSTANCE
+		|| scrutinee.constructor != constructor.type_constructor
+		|| scrutinee.arguments.len != constructor.parameters.len) return result;
+	TypePatternBinding[] bindings = alloc::new_array(
+		lowerer.allocator, TypePatternBinding, constructor.parameters.len
+	);
+	defer alloc::free(lowerer.allocator, bindings);
+	foreach (index, parameter : constructor.parameters)
+		bindings[index] = { .variable = parameter, .type_id = scrutinee.arguments[index] };
+	foreach (index, &pattern : constructor.field_patterns)
+	{
+		if ((usz)index >= binding_count) break;
+		TypeId instantiated = TYPE_ID_ANY;
+		if (instantiate_type_pattern(
+			&lowerer.program.types, pattern, bindings, &instantiated
+		)) result[index] = instantiated;
+	}
+	return result;
 }
 
 fn DeltaNodeId delta_lower_match(
@@ -671,8 +802,12 @@ fn DeltaNodeId delta_lower_match(
 	DeltaNodeId[] inputs = alloc::new_array(lowerer.allocator, DeltaNodeId, 1);
 	inputs[0] = delta_lower_expression(lowerer, match_expression.scrutinee, scope);
 	DeltaMatchBranch[] branches = alloc::new_array(lowerer.allocator, DeltaMatchBranch, (sz)match_expression.arms.len);
+	DeltaResumeScope* resume = delta_current_resume(scope);
+	usz resume_baseline = resume ? resume.next_resume : 0;
+	usz resume_merged = resume_baseline;
 	foreach (index, &arm : match_expression.arms)
 	{
+		if (resume) resume.next_resume = resume_baseline;
 		bool wildcard = arm.pattern.kind == PATTERN_WILDCARD;
 		sz constructor = wildcard ? -1 : delta_constructor_index(lowerer.program, arm.pattern.constructor);
 		if (!wildcard && constructor < 0)
@@ -682,15 +817,32 @@ fn DeltaNodeId delta_lower_match(
 		}
 		String[] bindings = alloc::new_array(lowerer.allocator, String, (sz)arm.pattern.bindings.len);
 		foreach (binding_index, binding : arm.pattern.bindings) bindings[binding_index] = binding.copy(lowerer.allocator);
-		DeltaLowerScope arm_scope = { .parent = scope, .names = arm.pattern.bindings };
+		TypeId[] binding_types = delta_match_binding_types(
+			lowerer,
+			constructor,
+			delta_known_node_type(lowerer, inputs[0]),
+			arm.pattern.bindings.len
+		);
+		DeltaLowerScope arm_scope = {
+			.parent = scope,
+			.names = arm.pattern.bindings,
+			.types = binding_types,
+		};
+		DeltaNodeId body = delta_lower_expression(lowerer, arm.body, &arm_scope);
+		if (resume && resume.next_resume > resume_merged)
+		{
+			resume_merged = resume.next_resume;
+		}
+		alloc::free(lowerer.allocator, binding_types);
 		branches[index] = {
 			.wildcard = wildcard,
 			.constructor = constructor < 0 ? uint::max : (uint)constructor,
 			.bindings = bindings,
-			.body = delta_lower_expression(lowerer, arm.body, &arm_scope),
+			.body = body,
 			.span = delta_record_span(lowerer, arm.span),
 		};
 	}
+	if (resume) resume.next_resume = resume_merged;
 	return delta_node_with_span(lowerer, {
 		.kind = DELTA_MATCH, .static_type = TYPE_ID_ANY, .inputs = inputs, .branches = branches,
 	}, expression.span);
@@ -703,6 +855,9 @@ fn DeltaNodeId delta_lower_parallel(
 ) @private
 {
 	ParallelExpr* parallel = &expression.data.parallel;
+	usz region_order = lowerer.parallel_order++;
+	usz first_root_order = lowerer.next_source_order;
+	lowerer.next_source_order += parallel.bindings.len;
 	DeltaNodeId[] roots = alloc::new_array(lowerer.allocator, DeltaNodeId, (sz)parallel.bindings.len);
 	String[] names = alloc::new_array(lowerer.allocator, String, (sz)parallel.bindings.len);
 	TypeId[] types = alloc::new_array(lowerer.allocator, TypeId, (sz)parallel.bindings.len);
@@ -729,14 +884,14 @@ fn DeltaNodeId delta_lower_parallel(
 		roots[index] = delta_node_with_span(lowerer, {
 			.kind = DELTA_PARALLEL_ROOT,
 			.static_type = annotation,
-			.descriptor = (usz)index,
+			.descriptor = first_root_order + (usz)index,
 			.name = binding.name.copy(lowerer.allocator),
 			.inputs = root_input,
 		}, binding.span);
 		names[index] = binding.name.copy(lowerer.allocator);
 		types[index] = annotation;
 	}
-	DeltaLowerScope result_scope = { .parent = scope, .names = names };
+	DeltaLowerScope result_scope = { .parent = scope, .names = names, .types = types };
 	DeltaNodeId result_body = delta_lower_expression(lowerer, parallel.result, &result_scope);
 	DeltaNodeId[] join_inputs = alloc::new_array(lowerer.allocator, DeltaNodeId, (sz)roots.len + 1);
 	foreach (index, root : roots) join_inputs[index] = root;
@@ -747,11 +902,11 @@ fn DeltaNodeId delta_lower_parallel(
 		.names = names,
 		.types = types,
 		.inputs = join_inputs,
-		.descriptor = lowerer.parallel_order,
+		.descriptor = region_order,
 	}, expression.span);
 	DeltaNodeId[] region_roots = alloc::clone_slice(lowerer.allocator, roots);
 	lowerer.parallel_regions.push({
-		.roots = region_roots, .join = join, .source_order = lowerer.parallel_order++,
+		.roots = region_roots, .join = join, .source_order = region_order,
 	});
 	alloc::free(lowerer.allocator, roots);
 	return join;
@@ -773,16 +928,21 @@ fn DeltaNodeId delta_lower_expression(
 		case SURFACE_VARIABLE:
 			String name = expression.data.variable.name;
 			if (delta_scope_contains(scope, name)) return delta_node_with_span(lowerer, {
-				.kind = DELTA_LOCAL, .static_type = TYPE_ID_ANY, .name = name.copy(lowerer.allocator),
+				.kind = DELTA_LOCAL,
+				.static_type = delta_scope_type(scope, name),
+				.name = name.copy(lowerer.allocator),
 			}, expression.span);
 			sz constructor = delta_constructor_index(lowerer.program, name);
 			if (constructor >= 0 && !lowerer.program.constructors[(usz)constructor].fields.len)
 			{
+				DeltaConstructorDescriptor* selected_constructor =
+					&lowerer.program.constructors[(usz)constructor];
 				return delta_node_with_span(lowerer, {
+					.key = clone_symbol_key(&selected_constructor.key, lowerer.allocator),
 					.kind = DELTA_CONSTRUCTOR,
-					.static_type = lowerer.program.constructors[(usz)constructor].runtime_type
-						? lowerer.program.constructors[(usz)constructor].runtime_type : TYPE_ID_ANY,
-					.runtime_type = lowerer.program.constructors[(usz)constructor].runtime_type,
+					.static_type = selected_constructor.runtime_type
+						? selected_constructor.runtime_type : TYPE_ID_ANY,
+					.runtime_type = selected_constructor.runtime_type,
 					.descriptor = (usz)constructor,
 				}, expression.span);
 			}
@@ -805,12 +965,16 @@ fn DeltaNodeId delta_lower_expression(
 					.descriptor = (usz)type_id,
 				}, expression.span);
 			}
-			if (delta_generic_index(lowerer.program, name, 0) >= 0)
+			sz zero_generic = delta_generic_index(lowerer.program, name, 0);
+			if (zero_generic >= 0)
 			{
+				GenericFunction* selected_generic =
+					&lowerer.program.methods.generics[(usz)zero_generic];
 				return delta_node_with_span(lowerer, {
+					.key = clone_symbol_key(&selected_generic.key, lowerer.allocator),
 					.kind = DELTA_GENERIC_CALL,
 					.static_type = TYPE_ID_ANY,
-					.descriptor = (usz)delta_generic_index(lowerer.program, name, 0),
+					.descriptor = (usz)zero_generic,
 					.name = name.copy(lowerer.allocator),
 				}, expression.span);
 			}
@@ -838,16 +1002,17 @@ fn DeltaNodeId delta_lower_expression(
 				parameter_types[index] = delta_resolve_annotation(lowerer, parameter_annotation, true);
 			}
 			TypeId result_type = delta_resolve_annotation(lowerer, &lambda.result, true);
-			EffectId[] effects = delta_lambda_effects(lowerer, expression.span);
+			ResolvedEffectRow owned_effects = delta_lambda_effects(lowerer, expression.span);
 			TypeId function_type;
 			MitosDiagnostic function_diagnostic;
 			if (!intern_function_type(
-				&lowerer.program.types, parameter_types, result_type, effects,
+				&lowerer.program.types, lowerer.effect_registry,
+				parameter_types, result_type, &owned_effects,
 				&function_type, &function_diagnostic, expression.span
 			))
 			{
 				lowerer.diagnostics.push(function_diagnostic);
-				alloc::free(lowerer.allocator, effects);
+				owned_effects.deinit(lowerer.allocator);
 				foreach (parameter : parameters) alloc::free(lowerer.allocator, parameter);
 				alloc::free(lowerer.allocator, parameters);
 				alloc::free(lowerer.allocator, parameter_types);
@@ -856,8 +1021,10 @@ fn DeltaNodeId delta_lower_expression(
 			DeltaLowerScope lambda_scope = {
 				.parent = scope,
 				.names = lambda.parameters,
-				.effects = effects,
+				.types = parameter_types,
+				.effects = &owned_effects,
 				.has_effect_context = true,
+				.resume_barrier = true,
 			};
 			DeltaNodeId[] lambda_inputs = alloc::new_array(lowerer.allocator, DeltaNodeId, 1);
 			lambda_inputs[0] = delta_lower_expression(lowerer, lambda.body, &lambda_scope);
@@ -868,7 +1035,7 @@ fn DeltaNodeId delta_lower_expression(
 				.result_type = result_type,
 				.names = parameters,
 				.types = parameter_types,
-				.effect_row = effects,
+				.effect_row = owned_effects,
 				.inputs = lambda_inputs,
 			}, expression.span);
 		case SURFACE_APPLICATION:
@@ -880,6 +1047,12 @@ fn DeltaNodeId delta_lower_expression(
 			DeltaPrimitiveOp operation = delta_primitive_for_binary(expression.data.binary.operator);
 			bool comparison = operation >= DELTA_PRIMITIVE_EQUAL;
 			return delta_node_with_span(lowerer, {
+				.key = clone_symbol_key(
+					&lowerer.program.primitives[
+						delta_primitive_descriptor(lowerer.program, operation)
+					].key,
+					lowerer.allocator
+				),
 				.kind = DELTA_PRIMITIVE,
 				.static_type = comparison ? TYPE_ID_BOOL : TYPE_ID_I64,
 				.descriptor = delta_primitive_descriptor(lowerer.program, operation),
@@ -899,7 +1072,12 @@ fn DeltaNodeId delta_lower_expression(
 				}, expression.span);
 			}
 			String[1] definition_name = { definition.name };
-			DeltaLowerScope definition_scope = { .parent = scope, .names = definition_name[..] };
+			TypeId[1] definition_type = { delta_node_static_type(lowerer, value) };
+			DeltaLowerScope definition_scope = {
+				.parent = scope,
+				.names = definition_name[..],
+				.types = definition_type[..],
+			};
 			DeltaNodeId[] let_inputs = alloc::new_array(lowerer.allocator, DeltaNodeId, 2);
 			let_inputs[0] = value;
 			let_inputs[1] = delta_lower_expression(lowerer, definition.body, &definition_scope);
@@ -920,7 +1098,13 @@ fn DeltaNodeId delta_lower_expression(
 			DeltaResumeScope* resume = delta_current_resume(scope);
 			if (!resume)
 			{
-				delta_lower_error(lowerer, "invalid resume outside an operation handler clause", expression.span);
+				delta_lower_error(
+					lowerer,
+					delta_resume_blocked_by_lambda(scope)
+						? "resume cannot escape its operation handler clause through a lambda"
+						: "invalid resume outside an operation handler clause",
+					expression.span
+				);
 				return DELTA_NODE_INVALID;
 			}
 			if (!resume.multi && resume.next_resume)
@@ -949,17 +1133,21 @@ fn DeltaNodeId delta_lower_expression(
 
 fn DeltaPrimitiveDescriptor[] delta_build_primitives(Allocator allocator) @private
 {
+	ModuleKey core = { .canonical = MITOS_CORE_MODULE_CANONICAL };
 	String[10] names = {
 		"add", "subtract", "multiply", "divide", "remainder",
 		"equal", "less", "lessEqual", "greater", "greaterEqual",
 	};
-	DeltaPrimitiveDescriptor[] primitives = alloc::new_array(allocator, DeltaPrimitiveDescriptor, 10);
+	DeltaPrimitiveDescriptor[] primitives = alloc::new_array(
+		allocator, DeltaPrimitiveDescriptor, 10
+	);
 	foreach (index, name : names)
 	{
 		TypeId[] parameters = alloc::new_array(allocator, TypeId, 2);
 		parameters[0] = TYPE_ID_I64;
 		parameters[1] = TYPE_ID_I64;
 		primitives[index] = {
+			.key = symbol_key(&core, SYMBOL_FUNCTION, name, 2, "primitive", allocator),
 			.id = (uint)index + 1,
 			.operation = (DeltaPrimitiveOp)index,
 			.name = name.copy(allocator),
@@ -977,20 +1165,31 @@ fn DeltaConstructorDescriptor[] delta_build_constructors(
 {
 	usz count = 0;
 	foreach (&enum_decl : lowerer.source.enums) count += enum_decl.variants.len;
-	foreach (&type_decl : lowerer.source.types) if (type_decl.kind == TYPE_DECL_CONCRETE) count++;
-	DeltaConstructorDescriptor[] constructors = alloc::new_array(lowerer.allocator, DeltaConstructorDescriptor, (sz)count);
+	foreach (&type_decl : lowerer.source.types)
+		if (type_decl.kind == TYPE_DECL_CONCRETE) count++;
+	DeltaConstructorDescriptor[] constructors = alloc::new_array(
+		lowerer.allocator, DeltaConstructorDescriptor, (sz)count
+	);
 	usz cursor = 0;
 	foreach (&enum_decl : lowerer.source.enums)
 	{
-		TypeId constructor_type = find_type(&lowerer.program.types, enum_decl.name);
+		TypeId constructor_type = find_type_by_key(&lowerer.program.types, &enum_decl.key);
 		foreach (&variant : enum_decl.variants)
 		{
-			String[] parameters = alloc::new_array(lowerer.allocator, String, enum_decl.parameters.len);
+			String[] parameters = alloc::new_array(
+				lowerer.allocator, String, enum_decl.parameters.len
+			);
 			foreach (index, &parameter : enum_decl.parameters)
 				parameters[index] = parameter.name.copy(lowerer.allocator);
-			String[] fields = alloc::new_array(lowerer.allocator, String, (sz)variant.parameters.len);
-			TypeId[] field_types = alloc::new_array(lowerer.allocator, TypeId, (sz)variant.parameters.len);
-			TypePattern[] field_patterns = alloc::new_array(lowerer.allocator, TypePattern, (sz)variant.parameters.len);
+			String[] fields = alloc::new_array(
+				lowerer.allocator, String, (sz)variant.parameters.len
+			);
+			TypeId[] field_types = alloc::new_array(
+				lowerer.allocator, TypeId, (sz)variant.parameters.len
+			);
+			TypePattern[] field_patterns = alloc::new_array(
+				lowerer.allocator, TypePattern, (sz)variant.parameters.len
+			);
 			foreach (index, parameter : variant.parameters)
 			{
 				fields[index] = parameter.copy(lowerer.allocator);
@@ -1000,15 +1199,14 @@ fn DeltaConstructorDescriptor[] delta_build_constructors(
 				if (!build_type_pattern(
 					&lowerer.program.types, annotation, enum_decl.parameters,
 					&field_patterns[index], &diagnostic, lowerer.allocator
-				))
-				{
-					lowerer.diagnostics.push(diagnostic);
-				}
+				)) lowerer.diagnostics.push(diagnostic);
 				if (!type_parameter_occurs(annotation, enum_decl.parameters))
 				{
 					TypeAnnotation* field_annotation = index < variant.parameter_annotations.len
 						? &variant.parameter_annotations[index] : null;
-					field_types[index] = delta_resolve_annotation(lowerer, field_annotation, false);
+					field_types[index] = delta_resolve_annotation(
+						lowerer, field_annotation, false
+					);
 				}
 				else
 				{
@@ -1016,6 +1214,7 @@ fn DeltaConstructorDescriptor[] delta_build_constructors(
 				}
 			}
 			constructors[cursor] = {
+				.key = clone_symbol_key(&variant.key, lowerer.allocator),
 				.id = (uint)cursor + 1,
 				.name = variant.name.copy(lowerer.allocator),
 				.runtime_type = enum_decl.parameters.len ? TYPE_ID_INVALID : constructor_type,
@@ -1032,24 +1231,41 @@ fn DeltaConstructorDescriptor[] delta_build_constructors(
 	foreach (&type_decl : lowerer.source.types)
 	{
 		if (type_decl.kind != TYPE_DECL_CONCRETE) continue;
-		TypeId constructor_type = find_type(&lowerer.program.types, type_decl.name);
+		TypeId constructor_type = find_type_by_key(&lowerer.program.types, &type_decl.key);
+		if (!constructor_type)
+		{
+			TypeId reserved = find_type(&lowerer.program.types, type_decl.name);
+			if (reserved <= TYPE_ID_SUPERPOSITION) constructor_type = reserved;
+		}
 		TypeDescriptor* type = type_descriptor(&lowerer.program.types, constructor_type);
-		String[] parameters = alloc::new_array(lowerer.allocator, String, type_decl.parameters.len);
+		String[] parameters = alloc::new_array(
+			lowerer.allocator, String, type_decl.parameters.len
+		);
 		foreach (index, &parameter : type_decl.parameters)
 			parameters[index] = parameter.name.copy(lowerer.allocator);
-		String[] fields = alloc::new_array(lowerer.allocator, String, (sz)type_decl.fields.len);
-		TypeId[] field_types = alloc::new_array(lowerer.allocator, TypeId, (sz)type_decl.fields.len);
-		TypePattern[] field_patterns = alloc::new_array(lowerer.allocator, TypePattern, (sz)type_decl.fields.len);
+		String[] fields = alloc::new_array(
+			lowerer.allocator, String, (sz)type_decl.fields.len
+		);
+		TypeId[] field_types = alloc::new_array(
+			lowerer.allocator, TypeId, (sz)type_decl.fields.len
+		);
+		TypePattern[] field_patterns = alloc::new_array(
+			lowerer.allocator, TypePattern, (sz)type_decl.fields.len
+		);
 		foreach (index, &field : type_decl.fields)
 		{
 			fields[index] = field.name.copy(lowerer.allocator);
-			field_types[index] = type && index < type.fields.len ? type.fields[index].declared_type : TYPE_ID_ANY;
+			field_types[index] = type && index < type.fields.len
+				? type.fields[index].declared_type : TYPE_ID_ANY;
 			if (type && index < type.fields.len)
 			{
-				field_patterns[index] = clone_type_pattern(&type.fields[index].pattern, lowerer.allocator);
+				field_patterns[index] = clone_type_pattern(
+					&type.fields[index].pattern, lowerer.allocator
+				);
 			}
 		}
 		constructors[cursor] = {
+			.key = clone_symbol_key(&type_decl.key, lowerer.allocator),
 			.id = (uint)cursor + 1,
 			.name = type_decl.name.copy(lowerer.allocator),
 			.runtime_type = type_decl.parameters.len ? TYPE_ID_INVALID : constructor_type,
@@ -1064,6 +1280,7 @@ fn DeltaConstructorDescriptor[] delta_build_constructors(
 	}
 	return constructors;
 }
+
 fn DeltaEffectHostKind delta_effect_host_kind(EffectHostPolicy policy) @private
 {
 	switch (policy)
@@ -1082,18 +1299,29 @@ fn void delta_copy_effect_section(
 {
 	DeltaEffectSection* section = &lowerer.program.effects;
 	section.epoch = registry.epoch;
-	section.next_effect_id = (EffectId)((usz)registry.effects.len() + 1);
+	section.next_effect_id = (EffectId)(
+		(usz)registry.effects.len() + (usz)registry.instances.len() + 1
+	);
 	section.next_operation_id = registry.next_operation_id;
-	section.effects = alloc::new_array(lowerer.allocator, DeltaEffectDescriptor, (sz)registry.effects.len());
+	section.effects = alloc::new_array(
+		lowerer.allocator, DeltaEffectDescriptor, (sz)registry.effects.len()
+	);
 	usz operation_count = 0;
 	foreach (&effect : registry.effects) operation_count += effect.operations.len;
-	section.operations = alloc::new_array(lowerer.allocator, DeltaOperationDescriptor, (sz)operation_count);
+	section.operations = alloc::new_array(
+		lowerer.allocator, DeltaOperationDescriptor, (sz)operation_count
+	);
 	usz operation_cursor = 0;
 	foreach (effect_index, &effect : registry.effects)
 	{
-		String[] parameters = alloc::new_array(lowerer.allocator, String, (sz)effect.parameters.len);
-		foreach (index, parameter : effect.parameters) parameters[index] = parameter.copy(lowerer.allocator);
-		OperationId[] operations = alloc::new_array(lowerer.allocator, OperationId, (sz)effect.operations.len);
+		String[] parameters = alloc::new_array(
+			lowerer.allocator, String, (sz)effect.parameters.len
+		);
+		foreach (index, parameter : effect.parameters)
+			parameters[index] = parameter.copy(lowerer.allocator);
+		OperationId[] operations = alloc::new_array(
+			lowerer.allocator, OperationId, (sz)effect.operations.len
+		);
 		foreach (index, &operation : effect.operations)
 		{
 			operations[index] = operation.id;
@@ -1106,22 +1334,28 @@ fn void delta_copy_effect_section(
 				lowerer.allocator, TypePattern, operation.parameter_types.len
 			);
 			foreach (pattern_index, &pattern : operation.parameter_types)
-				parameter_types[pattern_index] = clone_type_pattern(pattern, lowerer.allocator);
+				parameter_types[pattern_index] = clone_type_pattern(
+					pattern, lowerer.allocator
+				);
 			DeltaEffectHostKind host_kind = delta_effect_host_kind(operation.host_policy);
 			section.operations[operation_cursor++] = {
+				.key = clone_symbol_key(&operation.key, lowerer.allocator),
 				.id = operation.id,
 				.effect = operation.effect,
 				.name = operation.name.copy(lowerer.allocator),
 				.parameter_patterns = patterns,
 				.parameter_types = parameter_types,
 				.result_pattern = operation.result_pattern.copy(lowerer.allocator),
-				.result_type = clone_type_pattern(&operation.result_type, lowerer.allocator),
+				.result_type = clone_type_pattern(
+					&operation.result_type, lowerer.allocator
+				),
 				.span = delta_record_span(lowerer, effect.span),
 				.host_kind = host_kind,
 				.ordered = host_kind != DELTA_EFFECT_PURE,
 			};
 		}
 		section.effects[effect_index] = {
+			.key = clone_symbol_key(&effect.key, lowerer.allocator),
 			.id = effect.id,
 			.name = effect.name.copy(lowerer.allocator),
 			.multi = effect.multi,
@@ -1136,43 +1370,31 @@ fn void delta_copy_effect_section(
 	foreach (index, &instance : registry.instances)
 	{
 		section.instances[index] = {
+			.key = clone_symbol_key(&instance.key, lowerer.allocator),
 			.id = instance.id,
 			.constructor = instance.constructor,
 			.arguments = alloc::clone_slice(lowerer.allocator, instance.arguments),
 		};
 	}
-	section.rows = alloc::new_array(lowerer.allocator, DeltaEffectRowDescriptor, (sz)analysis.methods.len);
+	section.rows = alloc::new_array(
+		lowerer.allocator, DeltaEffectRowDescriptor, (sz)analysis.methods.len
+	);
 	foreach (index, &row : analysis.methods)
 	{
 		section.rows[index] = {
+			.key = row.function_index < lowerer.source.functions.len
+				? clone_symbol_key(
+					&lowerer.source.functions[row.function_index].key, lowerer.allocator
+				) : (SymbolKey){},
 			.function_index = row.function_index,
-			.inferred = alloc::clone_slice(lowerer.allocator, row.inferred),
-			.asserted = alloc::clone_slice(lowerer.allocator, row.asserted),
+			.inferred = clone_resolved_effect_row(&row.inferred, lowerer.allocator),
+			.asserted = clone_resolved_effect_row(&row.asserted, lowerer.allocator),
 			.has_assertion = row.has_assertion,
 			.effect_epoch = analysis.effect_epoch,
 		};
 	}
 }
 
-fn bool delta_find_method_location(
-	DeltaProgram* program,
-	usz function_index,
-	usz* generic_index,
-	usz* method_index
-) @private
-{
-	foreach (candidate_generic, &generic : program.methods.generics)
-	{
-		foreach (candidate_method, &method : generic.methods)
-		{
-			if (method.function_index != function_index) continue;
-			*generic_index = (usz)candidate_generic;
-			*method_index = (usz)candidate_method;
-			return true;
-		}
-	}
-	return false;
-}
 
 fn void delta_preintern_aggregate_types(DeltaProgramLowerer* lowerer) @private
 {
@@ -1194,17 +1416,22 @@ fn DeltaProgramBuildResult lower_delta_program(Program* source, Allocator alloca
 	DeltaProgramBuildResult result = { .allocator = allocator };
 	result.program = {
 		.allocator = allocator,
-		.format_version = DELTA_PROGRAM_FORMAT_VERSION,
-		.effects = { .next_effect_id = (EffectId)1, .next_operation_id = (OperationId)1 },
-		.helper_abi = {
-			.major = DELTA_HELPER_ABI_MAJOR,
-			.minor = DELTA_HELPER_ABI_MINOR,
-			.feature_bits = 0x1f,
-			.effect_tag = 32,
-			.handler_tag = 33,
-			.resume_tag = 34,
-			.abort_tag = 35,
+		.runtime_identity = new_runtime_identity(),
+		.schema = delta_schema_v4(),
+		.feature_manifest = delta_feature_manifest(
+			DELTA_V4_CORE_REQUIRED_FEATURES,
+			DELTA_FEATURE_TYPED | DELTA_FEATURE_EFFECTS | DELTA_FEATURE_PARALLEL
+				| DELTA_FEATURE_HOST | DELTA_FEATURE_SUPERPOSITION | DELTA_FEATURE_SUSPENSION
+		),
+		.effects = {
+			.next_effect_id = (EffectId)1,
+			.next_operation_id = (OperationId)1,
 		},
+		.helper_abi = delta_helper_abi_v2(delta_feature_manifest(
+			DELTA_V4_CORE_REQUIRED_FEATURES,
+			DELTA_FEATURE_TYPED | DELTA_FEATURE_EFFECTS | DELTA_FEATURE_PARALLEL
+				| DELTA_FEATURE_HOST | DELTA_FEATURE_SUPERPOSITION | DELTA_FEATURE_SUSPENSION
+		)),
 	};
 	if (!source)
 	{
@@ -1212,6 +1439,13 @@ fn DeltaProgramBuildResult lower_delta_program(Program* source, Allocator alloca
 		result.diagnostics[0].init(allocator, "Delta lowering requires a Program", { });
 		return result;
 	}
+	result.program.module_key = clone_module_key(&source.module_key, allocator);
+	result.program.feature_manifest = source.feature_manifest;
+	result.program.feature_manifest.required |= DELTA_V4_CORE_REQUIRED_FEATURES;
+	result.program.feature_manifest.optional |= DELTA_FEATURE_TYPED | DELTA_FEATURE_EFFECTS
+		| DELTA_FEATURE_PARALLEL | DELTA_FEATURE_HOST | DELTA_FEATURE_SUPERPOSITION
+		| DELTA_FEATURE_SUSPENSION;
+	result.program.helper_abi.features = result.program.feature_manifest;
 	result.diagnostics = validate_program(source, allocator);
 	if (result.diagnostics.len) return result;
 	alloc::free(allocator, result.diagnostics);
@@ -1238,6 +1472,12 @@ fn DeltaProgramBuildResult lower_delta_program(Program* source, Allocator alloca
 		method_build.deinit();
 		return result;
 	}
+	usz[] generic_by_function = method_build.generic_by_function;
+	usz[] method_by_function = method_build.method_by_function;
+	method_build.generic_by_function = { };
+	method_build.method_by_function = { };
+	defer alloc::free(allocator, generic_by_function);
+	defer alloc::free(allocator, method_by_function);
 	result.program.methods = method_build.table;
 	method_build.table = { };
 	method_build.deinit();
@@ -1269,6 +1509,7 @@ fn DeltaProgramBuildResult lower_delta_program(Program* source, Allocator alloca
 		.effect_registry = &effect_build.registry,
 		.effect_analysis = &effect_analysis,
 	};
+	lowerer.next_source_order = source.functions.len + 1;
 	lowerer.nodes.init(allocator);
 	lowerer.edges.init(allocator);
 	lowerer.interfaces.init(allocator);
@@ -1283,9 +1524,18 @@ fn DeltaProgramBuildResult lower_delta_program(Program* source, Allocator alloca
 
 	foreach (function_index, &function : source.functions)
 	{
-		usz generic_index = 0;
-		usz method_index = 0;
-		if (!delta_find_method_location(&result.program, (usz)function_index, &generic_index, &method_index))
+		usz source_index = (usz)function_index;
+		if (source_index >= (usz)generic_by_function.len
+			|| source_index >= (usz)method_by_function.len)
+		{
+			delta_lower_error(&lowerer, "method table lost a source function", function.span);
+			continue;
+		}
+		usz generic_index = generic_by_function[source_index];
+		usz method_index = method_by_function[source_index];
+		if (generic_index == usz::max || method_index == usz::max
+			|| generic_index >= (usz)result.program.methods.generics.len()
+			|| method_index >= (usz)result.program.methods.generics[(sz)generic_index].methods.len())
 		{
 			delta_lower_error(&lowerer, "method table lost a source function", function.span);
 			continue;
@@ -1302,22 +1552,35 @@ fn DeltaProgramBuildResult lower_delta_program(Program* source, Allocator alloca
 		GenericFunction* generic = &result.program.methods.generics[(sz)generic_index];
 		MethodDescriptor* method = &generic.methods[(sz)method_index];
 		String[] scope_names = alloc::new_array(
-			allocator,
-			String,
+			allocator, String,
 			(sz)function.parameters.len + (sz)method.type_variables.len
 		);
-		foreach (index, parameter : function.parameters) scope_names[index] = parameter;
+		TypeId[] scope_types = alloc::new_array(
+			allocator, TypeId,
+			(sz)function.parameters.len + (sz)method.type_variables.len
+		);
+		foreach (index, parameter : function.parameters)
+		{
+			scope_names[index] = parameter;
+			scope_types[index] = parameter_types[index];
+		}
 		foreach (index, variable : method.type_variables)
+		{
 			scope_names[function.parameters.len + index] = variable;
+			scope_types[function.parameters.len + index] = TYPE_ID_TYPE;
+		}
 		MethodEffectInfo* effect_info = &effect_analysis.methods[(usz)function_index];
-		EffectId[] method_effects = effect_info.has_assertion ? effect_info.asserted : effect_info.inferred;
+		ResolvedEffectRow* method_effect_row = effect_info.has_assertion
+			? &effect_info.asserted : &effect_info.inferred;
 		DeltaLowerScope scope = {
 			.names = scope_names,
-			.effects = method_effects,
+			.types = scope_types,
+			.effects = method_effect_row,
 			.has_effect_context = true,
 		};
 		DeltaNodeId root = delta_lower_expression(&lowerer, function.body, &scope);
 		alloc::free(allocator, scope_names);
+		alloc::free(allocator, scope_types);
 		TypeId result_type = delta_resolve_annotation(&lowerer, &function.result, true);
 		if (function.result.value)
 		{
@@ -1336,8 +1599,12 @@ fn DeltaProgramBuildResult lower_delta_program(Program* source, Allocator alloca
 		foreach (index, &pattern : method.parameters)
 			parameter_patterns[index] = clone_method_pattern(pattern, allocator);
 		MethodTypePattern result_pattern = clone_method_pattern(&method.result, allocator);
-		EffectId[] owned_effects = alloc::clone_slice(allocator, method_effects);
+		ResolvedEffectRow owned_effects = clone_resolved_effect_row(
+			method_effect_row, allocator
+		);
 		result.program.method_roots[function_index] = {
+			.key = clone_symbol_key(&method.key, allocator),
+			.generic_key = clone_symbol_key(&generic.key, allocator),
 			.function_index = (usz)function_index,
 			.generic_index = generic_index,
 			.method_index = method_index,
@@ -1351,6 +1618,7 @@ fn DeltaProgramBuildResult lower_delta_program(Program* source, Allocator alloca
 			.source_order = (usz)function_index,
 		};
 		lowerer.interfaces.push({
+			.key = clone_symbol_key(&method.key, allocator),
 			.kind = DELTA_INTERFACE_METHOD,
 			.name = function.name.copy(allocator),
 			.root = root,
@@ -1366,15 +1634,22 @@ fn DeltaProgramBuildResult lower_delta_program(Program* source, Allocator alloca
 	else
 	{
 		result.program.entry = delta_node_with_span(&lowerer, {
+			.key = clone_symbol_key(
+				&result.program.methods.generics[(usz)main_generic].key, allocator
+			),
 			.kind = DELTA_GENERIC_CALL,
 			.static_type = TYPE_ID_ANY,
 			.descriptor = (usz)main_generic,
 			.name = "main".copy(allocator),
 		}, { });
 		lowerer.interfaces.push({
+			.key = clone_symbol_key(
+				&result.program.methods.generics[(usz)main_generic].key, allocator
+			),
 			.kind = DELTA_INTERFACE_ENTRY,
 			.name = "main".copy(allocator),
 			.root = result.program.entry,
+			.source_order = source.functions.len,
 		});
 	}
 
@@ -1388,6 +1663,10 @@ fn DeltaProgramBuildResult lower_delta_program(Program* source, Allocator alloca
 	};
 	result.program.effects.handlers = lowerer.handlers.to_array(allocator);
 	result.program.spans = lowerer.spans.to_array(allocator);
+	DeltaFeatureBits semantic_features = delta_program_semantic_features(&result.program);
+	result.program.feature_manifest.required |= semantic_features;
+	result.program.feature_manifest.optional &= ~result.program.feature_manifest.required;
+	result.program.helper_abi.features = result.program.feature_manifest;
 	result.diagnostics = lowerer.diagnostics.to_array(allocator);
 	lowerer.nodes.free();
 	lowerer.edges.free();

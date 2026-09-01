@@ -2,9 +2,27 @@ module delta_net_abstract_machine::mitos;
 
 import std::collections::list;
 import std::core::mem;
-import std::io;
+import std::crypto::entropy;
 
 const usz MITOS_MAX_STRING_LITERAL_BYTES = 1024 * 1024;
+/** Fills the complete destination from the operating system CSPRNG or fails closed. */
+fn bool fill_secure_entropy(char[] destination)
+{
+	if (catch entropy::fill(destination)) return false;
+	return true;
+}
+
+/** Cryptographically unpredictable process-local identity; zero means unavailable. */
+fn ulong new_runtime_identity()
+{
+	for (usz attempt = 0; attempt < 8; attempt++)
+	{
+		ulong identity;
+		if (!fill_secure_entropy(((char*)&identity)[:ulong::size])) return 0;
+		if (identity) return identity;
+	}
+	return 0;
+}
 
 struct MitosPosition
 {
@@ -16,6 +34,170 @@ struct MitosSpan
 {
 	MitosPosition start;
 	MitosPosition end;
+}
+
+/** True exactly for the byte grammar accepted by the source lexer. */
+fn bool source_identifier_is_valid(String identifier)
+{
+	if (!identifier.len) return false;
+	char first = identifier[0];
+	if (!((first >= 'A' && first <= 'Z')
+			|| (first >= 'a' && first <= 'z') || first == '_'))
+	{
+		return false;
+	}
+	foreach (character : identifier[1..])
+	{
+		if (!((character >= 'A' && character <= 'Z')
+				|| (character >= 'a' && character <= 'z')
+				|| (character >= '0' && character <= '9')
+				|| character == '_'))
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+/** Allocator-owned canonical module identity. Display names never participate in equality. */
+struct ModuleKey
+{
+	String canonical;
+}
+
+const String MITOS_CORE_MODULE_CANONICAL = "mitos://core";
+const String MITOS_DEFAULT_MODULE_CANONICAL = "mitos://default";
+const String MITOS_REPL_MODULE_CANONICAL = "mitos://repl";
+
+enum SymbolKind : char
+{
+	SYMBOL_TYPE,
+	SYMBOL_ENUM,
+	SYMBOL_VARIANT,
+	SYMBOL_EFFECT,
+	SYMBOL_EFFECT_OPERATION,
+	SYMBOL_FUNCTION,
+	SYMBOL_EFFECT_ROW_TAIL,
+	SYMBOL_GENERIC,
+	SYMBOL_METHOD,
+}
+
+/**
+ * Allocator-owned structural symbol identity. `canonical_signature` is a
+ * canonical, display-independent signature; hashes may index but never replace
+ * comparisons of these fields.
+ */
+struct SymbolKey
+{
+	ModuleKey owner;
+	SymbolKind kind;
+	String name;
+	uint arity;
+	String canonical_signature;
+}
+
+fn ModuleKey module_key(String canonical, Allocator allocator = mem)
+{
+	return { .canonical = canonical.copy(allocator) };
+}
+
+fn ModuleKey core_module_key(Allocator allocator = mem)
+{
+	return module_key(MITOS_CORE_MODULE_CANONICAL, allocator);
+}
+
+fn ModuleKey default_module_key(Allocator allocator = mem)
+{
+	return module_key(MITOS_DEFAULT_MODULE_CANONICAL, allocator);
+}
+
+fn ModuleKey repl_module_key(Allocator allocator = mem)
+{
+	return module_key(MITOS_REPL_MODULE_CANONICAL, allocator);
+}
+
+fn ModuleKey clone_module_key(ModuleKey* key, Allocator allocator = mem)
+{
+	if (!key) return { };
+	return module_key(key.canonical, allocator);
+}
+
+fn bool module_key_equal(ModuleKey* left, ModuleKey* right)
+{
+	if (left == right) return true;
+	return left && right && left.canonical == right.canonical;
+}
+
+fn void ModuleKey.deinit(&self, Allocator allocator)
+{
+	alloc::free(allocator, self.canonical);
+	*self = { };
+}
+
+fn SymbolKey symbol_key(
+	ModuleKey* owner,
+	SymbolKind kind,
+	String name,
+	usz arity,
+	String canonical_signature,
+	Allocator allocator = mem
+)
+{
+	return {
+		.owner = clone_module_key(owner, allocator),
+		.kind = kind,
+		.name = name.copy(allocator),
+		.arity = (uint)arity,
+		.canonical_signature = canonical_signature.copy(allocator),
+	};
+}
+
+fn SymbolKey clone_symbol_key(SymbolKey* key, Allocator allocator = mem)
+{
+	if (!key) return { };
+	return symbol_key(
+		&key.owner, key.kind, key.name, key.arity, key.canonical_signature, allocator
+	);
+}
+
+fn bool symbol_key_equal(SymbolKey* left, SymbolKey* right)
+{
+	if (left == right) return true;
+	return left && right
+		&& module_key_equal(&left.owner, &right.owner)
+		&& left.kind == right.kind
+		&& left.name == right.name
+		&& left.arity == right.arity
+		&& left.canonical_signature == right.canonical_signature;
+}
+
+fn bool symbol_key_is_canonical(SymbolKey* key)
+{
+	return key && key.owner.canonical.len > 0 && key.name.len > 0;
+}
+
+fn SymbolKey declaration_symbol_key(
+	SymbolKey* declared,
+	ModuleKey* program_module,
+	SymbolKind kind,
+	String name,
+	usz arity,
+	String canonical_signature,
+	Allocator allocator = mem
+)
+{
+	if (symbol_key_is_canonical(declared)) return clone_symbol_key(declared, allocator);
+	ModuleKey fallback = { .canonical = MITOS_DEFAULT_MODULE_CANONICAL };
+	ModuleKey* owner = program_module && program_module.canonical.len ? program_module : &fallback;
+	return symbol_key(owner, kind, name, arity, canonical_signature, allocator);
+}
+
+fn void SymbolKey.deinit(&self, Allocator allocator)
+{
+	self.owner.deinit(allocator);
+	alloc::free(allocator, self.name);
+	alloc::free(allocator, self.canonical_signature);
+	*self = { };
 }
 
 struct MitosDiagnostic
@@ -91,17 +273,21 @@ struct TypeDecl
 	TypeParameterDecl[] parameters;
 	TypeExpr* supertype;
 	FieldDecl[] fields;
+	SymbolKey key;
 	MitosSpan span;
 }
 
 struct EffectRow
 {
 	TypeExpr*[] effects;
+	bool has_tail;
+	SymbolKey tail;
 	MitosSpan span;
 }
 
 struct EffectOperationDecl
 {
+	SymbolKey key;
 	String name;
 	String[] parameters;
 	TypeAnnotation[] parameter_annotations;
@@ -116,6 +302,7 @@ struct EffectDecl
 	TypeParameterDecl[] parameters;
 	EffectOperationDecl[] operations;
 	MitosSpan span;
+	SymbolKey key;
 }
 
 fn void TypeExpr.deinit(&self, Allocator allocator)
@@ -150,11 +337,13 @@ fn void EffectRow.deinit(&self, Allocator allocator)
 		alloc::free(allocator, effect);
 	}
 	alloc::free(allocator, self.effects);
+	if (self.has_tail) self.tail.deinit(allocator);
 	*self = { };
 }
 
 fn void TypeDecl.deinit(&self, Allocator allocator)
 {
+	self.key.deinit(allocator);
 	alloc::free(allocator, self.name);
 	foreach (&parameter : self.parameters) alloc::free(allocator, parameter.name);
 	alloc::free(allocator, self.parameters);
@@ -174,11 +363,13 @@ fn void TypeDecl.deinit(&self, Allocator allocator)
 
 fn void EffectDecl.deinit(&self, Allocator allocator)
 {
+	self.key.deinit(allocator);
 	alloc::free(allocator, self.name);
 	foreach (&parameter : self.parameters) alloc::free(allocator, parameter.name);
 	alloc::free(allocator, self.parameters);
 	foreach (&operation : self.operations)
 	{
+		operation.key.deinit(allocator);
 		alloc::free(allocator, operation.name);
 		foreach (parameter : operation.parameters) alloc::free(allocator, parameter);
 		alloc::free(allocator, operation.parameters);
@@ -354,10 +545,12 @@ struct SurfaceExpr
 {
 	SurfaceExprKind kind;
 	MitosSpan span;
+	usz structural_height;
 	SurfaceExprData data;
 }
 struct VariantDecl
 {
+	SymbolKey key;
 	String name;
 	String[] parameters;
 	TypeAnnotation[] parameter_annotations;
@@ -365,6 +558,7 @@ struct VariantDecl
 }
 struct EnumDecl
 {
+	SymbolKey key;
 	String name;
 	TypeParameterDecl[] parameters;
 	VariantDecl[] variants;
@@ -372,6 +566,8 @@ struct EnumDecl
 }
 struct FunctionDecl
 {
+	SymbolKey key;
+	SymbolKey generic_key;
 	String name;
 	String[] parameters;
 	TypeAnnotation[] parameter_annotations;
@@ -383,6 +579,8 @@ struct FunctionDecl
 struct Program
 {
 	Allocator allocator;
+	ModuleKey module_key;
+	DeltaFeatureManifest feature_manifest;
 	EnumDecl[] enums;
 	TypeDecl[] types;
 	EffectDecl[] effects;
@@ -556,13 +754,16 @@ fn void SurfaceExpr.deinit(&self, Allocator allocator)
 fn void Program.deinit(&self)
 {
 	if (!self.allocator) return;
+	self.module_key.deinit(self.allocator);
 	foreach (&enum_decl : self.enums)
 	{
+		enum_decl.key.deinit(self.allocator);
 		alloc::free(self.allocator, enum_decl.name);
 		foreach (&parameter : enum_decl.parameters) alloc::free(self.allocator, parameter.name);
 		alloc::free(self.allocator, enum_decl.parameters);
 		foreach (&variant : enum_decl.variants)
 		{
+			variant.key.deinit(self.allocator);
 			alloc::free(self.allocator, variant.name);
 			foreach (parameter : variant.parameters) alloc::free(self.allocator, parameter);
 			alloc::free(self.allocator, variant.parameters);
@@ -575,6 +776,8 @@ fn void Program.deinit(&self)
 	foreach (&effect : self.effects) effect.deinit(self.allocator);
 	foreach (&function : self.functions)
 	{
+		function.key.deinit(self.allocator);
+		function.generic_key.deinit(self.allocator);
 		alloc::free(self.allocator, function.name);
 		foreach (parameter : function.parameters) alloc::free(self.allocator, parameter);
 		alloc::free(self.allocator, function.parameters);
@@ -599,113 +802,6 @@ fn void Program.deinit(&self)
 	*self = { };
 }
 
-enum CoreExprKind : char
-{
-	CORE_VARIABLE,
-	CORE_ABSTRACTION,
-	CORE_APPLICATION,
-	CORE_PARALLEL,
-}
-struct CoreVariable
-{
-	String name;
-}
-struct CoreAbstraction
-{
-	String parameter;
-	CoreExpr* body;
-}
-struct CoreApplication
-{
-	CoreExpr* function;
-	CoreExpr* argument;
-}
-struct CoreParallelBinding
-{
-	String name;
-	CoreExpr* value;
-}
-struct CoreParallel
-{
-	CoreParallelBinding[] bindings;
-	CoreExpr* result;
-}
-union CoreExprData
-{
-	CoreVariable variable;
-	CoreAbstraction abstraction;
-	CoreApplication application;
-	CoreParallel parallel;
-}
-struct CoreExpr
-{
-	CoreExprKind kind;
-	CoreExprData data;
-}
-struct CoreProgram
-{
-	Allocator allocator;
-	CoreExpr* expression;
-}
-
-fn void CoreExpr.deinit(&self, Allocator allocator)
-{
-	switch (self.kind)
-	{
-		case CORE_VARIABLE:
-			alloc::free(allocator, self.data.variable.name);
-			break;
-		case CORE_ABSTRACTION:
-			alloc::free(allocator, self.data.abstraction.parameter);
-			if (self.data.abstraction.body)
-			{
-				self.data.abstraction.body.deinit(allocator);
-				alloc::free(allocator, self.data.abstraction.body);
-			}
-			break;
-		case CORE_APPLICATION:
-			if (self.data.application.function)
-			{
-				self.data.application.function.deinit(allocator);
-				alloc::free(allocator, self.data.application.function);
-			}
-			if (self.data.application.argument)
-			{
-				self.data.application.argument.deinit(allocator);
-				alloc::free(allocator, self.data.application.argument);
-			}
-			break;
-		case CORE_PARALLEL:
-			foreach (&binding : self.data.parallel.bindings)
-			{
-				alloc::free(allocator, binding.name);
-				if (!binding.value) continue;
-				binding.value.deinit(allocator);
-
-				alloc::free(allocator, binding.value);
-			}
-			alloc::free(allocator, self.data.parallel.bindings);
-			if (self.data.parallel.result)
-			{
-				self.data.parallel.result.deinit(allocator);
-				alloc::free(allocator, self.data.parallel.result);
-			}
-			break;
-		default:
-	}
-	*self = { };
-}
-
-fn void CoreProgram.deinit(&self)
-{
-	if (!self.allocator) return;
-	if (self.expression)
-	{
-		self.expression.deinit(self.allocator);
-		alloc::free(self.allocator, self.expression);
-	}
-	*self = { };
-}
 fn bool type_expr_equal(TypeExpr* left, TypeExpr* right)
 {
 	if (left == right) return true;
@@ -718,15 +814,16 @@ fn bool type_expr_equal(TypeExpr* left, TypeExpr* right)
 	return true;
 }
 
-fn bool annotation_equal(TypeAnnotation* left, TypeAnnotation* right)
-{
-	if (!left.value && !right.value) return true;
-	if (!left.value || !right.value) return false;
-	return type_expr_equal(left.value, right.value);
-}
 
 fn bool method_signature_equal(FunctionDecl* left, FunctionDecl* right) @private
 {
+	if (symbol_key_is_canonical(&left.key) && symbol_key_is_canonical(&right.key))
+	{
+		return symbol_key_equal(&left.key, &right.key);
+	}
+	if (symbol_key_is_canonical(&left.generic_key)
+		&& symbol_key_is_canonical(&right.generic_key)
+		&& !symbol_key_equal(&left.generic_key, &right.generic_key)) return false;
 	if (left.name != right.name || left.parameters.len != right.parameters.len) return false;
 	foreach (index, parameter : left.parameters)
 	{
@@ -742,22 +839,153 @@ fn bool method_signature_equal(FunctionDecl* left, FunctionDecl* right) @private
 	return true;
 }
 
-struct LowerResult
+const usz MITOS_MAX_VALIDATION_DIAGNOSTICS = 256;
+
+/** Borrowed-name open-addressed set used only for one validation pass. */
+struct ValidationNameIndex
 {
 	Allocator allocator;
-	CoreProgram program;
-	MitosDiagnostic[] diagnostics;
+	String[] names;
+	bool[] occupied;
 }
-fn bool LowerResult.ok(&self) => self.diagnostics.len == 0;
 
-fn void LowerResult.deinit(&self)
+fn ulong validation_hash_string(String value) @private
 {
-	if (!self.allocator) return;
-	self.program.deinit();
-	foreach (&diagnostic : self.diagnostics) diagnostic.deinit();
-	alloc::free(self.allocator, self.diagnostics);
+	ulong hash = 1469598103934665603UL;
+	foreach (byte : value)
+	{
+		hash ^= (ulong)byte;
+		hash *= 1099511628211UL;
+	}
+	return hash;
+}
+
+fn usz validation_index_capacity(usz count) @private
+{
+	usz capacity = 8;
+	while (capacity < count * 2) capacity *= 2;
+	return capacity;
+}
+
+fn void ValidationNameIndex.init(&self, Allocator allocator, usz count)
+{
+	self.allocator = allocator;
+	usz capacity = validation_index_capacity(count);
+	self.names = alloc::new_array(allocator, String, (sz)capacity);
+	self.occupied = alloc::new_array(allocator, bool, (sz)capacity);
+	foreach (&entry : self.occupied) *entry = false;
+}
+
+fn void ValidationNameIndex.deinit(&self)
+{
+	alloc::free(self.allocator, self.names);
+	alloc::free(self.allocator, self.occupied);
 	*self = { };
 }
+
+fn bool ValidationNameIndex.contains(&self, String name)
+{
+	usz mask = self.names.len - 1;
+	usz slot = (usz)validation_hash_string(name) & mask;
+	for (usz probe = 0; probe < self.names.len; probe++)
+	{
+		if (!self.occupied[slot]) return false;
+		if (self.names[slot] == name) return true;
+		slot = (slot + 1) & mask;
+	}
+	return false;
+}
+
+/** Returns true exactly when `name` was not already present. */
+fn bool ValidationNameIndex.insert(&self, String name)
+{
+	usz mask = self.names.len - 1;
+	usz slot = (usz)validation_hash_string(name) & mask;
+	for (usz probe = 0; probe < self.names.len; probe++)
+	{
+		if (!self.occupied[slot])
+		{
+			self.occupied[slot] = true;
+			self.names[slot] = name;
+			return true;
+		}
+		if (self.names[slot] == name) return false;
+		slot = (slot + 1) & mask;
+	}
+	return false;
+}
+
+struct ValidationMethodIndex
+{
+	Allocator allocator;
+	Program* program;
+	usz[] buckets;
+}
+
+fn ulong validation_hash_symbol_key(SymbolKey* key) @private
+{
+	ulong hash = validation_hash_string(key.owner.canonical);
+	hash ^= (ulong)key.kind;
+	hash *= 1099511628211UL;
+	hash ^= (ulong)key.arity;
+	hash *= 1099511628211UL;
+	hash ^= validation_hash_string(key.name);
+	hash *= 1099511628211UL;
+	hash ^= validation_hash_string(key.canonical_signature);
+	return hash;
+}
+
+fn ulong validation_method_hash(FunctionDecl* function) @private
+{
+	if (symbol_key_is_canonical(&function.key)) return validation_hash_symbol_key(&function.key);
+	ulong hash = validation_hash_string(function.name);
+	hash ^= (ulong)function.parameters.len;
+	hash *= 1099511628211UL;
+	foreach (&annotation : function.parameter_annotations)
+	{
+		TypeExpr* type = annotation.value;
+		hash ^= type ? validation_hash_string(type.name) : 0;
+		hash *= 1099511628211UL;
+	}
+	return hash;
+}
+
+fn void ValidationMethodIndex.init(&self, Program* program, Allocator allocator)
+{
+	self.allocator = allocator;
+	self.program = program;
+	self.buckets = alloc::new_array(
+		allocator, usz, (sz)validation_index_capacity(program.functions.len)
+	);
+	foreach (&bucket : self.buckets) *bucket = 0;
+}
+
+fn void ValidationMethodIndex.deinit(&self)
+{
+	alloc::free(self.allocator, self.buckets);
+	*self = { };
+}
+
+/** Returns true exactly when the current method signature was not indexed. */
+fn bool ValidationMethodIndex.insert(&self, usz function_index)
+{
+	FunctionDecl* function = &self.program.functions[function_index];
+	usz mask = self.buckets.len - 1;
+	usz slot = (usz)validation_method_hash(function) & mask;
+	for (usz probe = 0; probe < self.buckets.len; probe++)
+	{
+		usz entry = self.buckets[slot];
+		if (!entry)
+		{
+			self.buckets[slot] = function_index + 1;
+			return true;
+		}
+		if (method_signature_equal(&self.program.functions[entry - 1], function)) return false;
+		slot = (slot + 1) & mask;
+	}
+	return false;
+}
+
 
 struct ConstructorRef
 {
@@ -786,8 +1014,16 @@ fn void add_validation_error(
 	MitosSpan span
 ) @private
 {
+	if ((usz)diagnostics.len() >= MITOS_MAX_VALIDATION_DIAGNOSTICS) return;
 	MitosDiagnostic diagnostic;
-	diagnostic.init(allocator, message, span);
+	if ((usz)diagnostics.len() + 1 == MITOS_MAX_VALIDATION_DIAGNOSTICS)
+	{
+		diagnostic.init(allocator, "additional validation diagnostics omitted", span);
+	}
+	else
+	{
+		diagnostic.init(allocator, message, span);
+	}
 	diagnostics.push(diagnostic);
 }
 
@@ -1093,142 +1329,132 @@ fn MitosDiagnostic[] validate_program(Program* program, Allocator allocator = me
 	List{MitosDiagnostic} diagnostics;
 	diagnostics.init(allocator);
 	bool found_main = false;
-	foreach (enum_index, &enum_decl : program.enums)
+	usz constructor_count;
+	foreach (&enum_decl : program.enums) constructor_count += enum_decl.variants.len;
+
+	ValidationNameIndex enum_names;
+	ValidationNameIndex constructor_names;
+	ValidationNameIndex type_names;
+	ValidationNameIndex effect_names;
+	ValidationMethodIndex method_signatures;
+	enum_names.init(allocator, program.enums.len);
+	constructor_names.init(allocator, constructor_count);
+	type_names.init(allocator, program.types.len);
+	effect_names.init(allocator, program.effects.len);
+	method_signatures.init(program, allocator);
+
+	foreach (&enum_decl : program.enums)
 	{
-		for (sz previous_index = 0; previous_index < enum_index; previous_index++)
+		if (!enum_names.insert(enum_decl.name))
 		{
-			if (program.enums[(usz)previous_index].name == enum_decl.name)
-			{
-				add_validation_error(&diagnostics, allocator, "duplicate enum declaration", enum_decl.span);
-			}
+			add_validation_error(&diagnostics, allocator, "duplicate enum declaration", enum_decl.span);
 		}
 		foreach (parameter_index, &parameter : enum_decl.parameters)
 		{
 			for (sz previous_index = 0; previous_index < parameter_index; previous_index++)
 			{
-				if (enum_decl.parameters[(usz)previous_index].name == parameter.name)
-				{
-					add_validation_error(&diagnostics, allocator, "duplicate enum type parameter", parameter.span);
-				}
+				if (enum_decl.parameters[(usz)previous_index].name != parameter.name) continue;
+				add_validation_error(&diagnostics, allocator, "duplicate enum type parameter", parameter.span);
+				break;
 			}
 		}
-		foreach (variant_index, &variant : enum_decl.variants)
+		ValidationNameIndex variant_names;
+		variant_names.init(allocator, enum_decl.variants.len);
+		foreach (&variant : enum_decl.variants)
 		{
-			for (sz previous_index = 0; previous_index < variant_index; previous_index++)
+			if (!variant_names.insert(variant.name))
 			{
-				if (enum_decl.variants[(usz)previous_index].name == variant.name)
-				{
-					add_validation_error(&diagnostics, allocator, "duplicate enum variant", variant.span);
-				}
+				add_validation_error(&diagnostics, allocator, "duplicate enum variant", variant.span);
 			}
-			for (sz other_enum = 0; other_enum <= enum_index; other_enum++)
+			if (!constructor_names.insert(variant.name))
 			{
-				EnumDecl* candidate_enum = &program.enums[(usz)other_enum];
-				sz limit = other_enum == enum_index ? variant_index : (sz)candidate_enum.variants.len;
-				for (sz other_variant = 0; other_variant < limit; other_variant++)
-				{
-					if (candidate_enum.variants[(usz)other_variant].name == variant.name)
-					{
-						add_validation_error(
-							&diagnostics,
-							allocator,
-							"constructor names must be unique across enums",
-							variant.span
-						);
-					}
-				}
+				add_validation_error(
+					&diagnostics,
+					allocator,
+					"constructor names must be unique across enums",
+					variant.span
+				);
 			}
 			foreach (parameter_index, parameter : variant.parameters)
 			{
 				for (sz previous_index = 0; previous_index < parameter_index; previous_index++)
 				{
-					if (variant.parameters[(usz)previous_index] == parameter)
-					{
-						add_validation_error(&diagnostics, allocator, "duplicate constructor parameter", variant.span);
-					}
+					if (variant.parameters[(usz)previous_index] != parameter) continue;
+					add_validation_error(&diagnostics, allocator, "duplicate constructor parameter", variant.span);
+					break;
 				}
 			}
 		}
+		variant_names.deinit();
 	}
-	foreach (type_index, &type_decl : program.types)
+
+	foreach (&type_decl : program.types)
 	{
-		for (sz previous_index = 0; previous_index < type_index; previous_index++)
+		if (!type_names.insert(type_decl.name))
 		{
-			if (program.types[(usz)previous_index].name == type_decl.name)
-			{
-				add_validation_error(&diagnostics, allocator, "duplicate type declaration", type_decl.span);
-			}
+			add_validation_error(&diagnostics, allocator, "duplicate type declaration", type_decl.span);
 		}
-		foreach (&enum_decl : program.enums)
+		if (enum_names.contains(type_decl.name))
 		{
-			if (enum_decl.name == type_decl.name)
-			{
-				add_validation_error(&diagnostics, allocator, "type name collides with an enum name", type_decl.span);
-			}
+			add_validation_error(&diagnostics, allocator, "type name collides with an enum name", type_decl.span);
 		}
 		foreach (parameter_index, &parameter : type_decl.parameters)
 		{
 			for (sz previous_index = 0; previous_index < parameter_index; previous_index++)
 			{
-				if (type_decl.parameters[(usz)previous_index].name == parameter.name)
-				{
-					add_validation_error(&diagnostics, allocator, "duplicate type parameter", parameter.span);
-				}
+				if (type_decl.parameters[(usz)previous_index].name != parameter.name) continue;
+				add_validation_error(&diagnostics, allocator, "duplicate type parameter", parameter.span);
+				break;
 			}
 		}
-		foreach (field_index, &field : type_decl.fields)
+		ValidationNameIndex field_names;
+		field_names.init(allocator, type_decl.fields.len);
+		foreach (&field : type_decl.fields)
 		{
-			for (sz previous_index = 0; previous_index < field_index; previous_index++)
+			if (!field_names.insert(field.name))
 			{
-				if (type_decl.fields[(usz)previous_index].name == field.name)
-				{
-					add_validation_error(&diagnostics, allocator, "duplicate type field", field.span);
-				}
+				add_validation_error(&diagnostics, allocator, "duplicate type field", field.span);
 			}
 		}
+		field_names.deinit();
 		if (type_decl.kind == TYPE_DECL_ABSTRACT && type_decl.fields.len)
 		{
 			add_validation_error(&diagnostics, allocator, "abstract types cannot declare fields", type_decl.span);
 		}
 	}
-	foreach (effect_index, &effect : program.effects)
+
+	foreach (&effect : program.effects)
 	{
-		for (sz previous_index = 0; previous_index < effect_index; previous_index++)
+		if (!effect_names.insert(effect.name))
 		{
-			if (program.effects[(usz)previous_index].name == effect.name)
-			{
-				add_validation_error(&diagnostics, allocator, "duplicate effect declaration", effect.span);
-			}
+			add_validation_error(&diagnostics, allocator, "duplicate effect declaration", effect.span);
 		}
-		foreach (operation_index, &operation : effect.operations)
+		ValidationNameIndex operation_names;
+		operation_names.init(allocator, effect.operations.len);
+		foreach (&operation : effect.operations)
 		{
-			for (sz previous_index = 0; previous_index < operation_index; previous_index++)
+			if (!operation_names.insert(operation.name))
 			{
-				if (effect.operations[(usz)previous_index].name == operation.name)
-				{
-					add_validation_error(&diagnostics, allocator, "duplicate effect operation", operation.span);
-				}
+				add_validation_error(&diagnostics, allocator, "duplicate effect operation", operation.span);
 			}
 			foreach (parameter_index, parameter : operation.parameters)
 			{
 				for (sz previous_index = 0; previous_index < parameter_index; previous_index++)
 				{
-					if (operation.parameters[(usz)previous_index] == parameter)
-					{
-						add_validation_error(&diagnostics, allocator, "duplicate effect operation parameter", operation.span);
-					}
+					if (operation.parameters[(usz)previous_index] != parameter) continue;
+					add_validation_error(&diagnostics, allocator, "duplicate effect operation parameter", operation.span);
+					break;
 				}
 			}
 		}
+		operation_names.deinit();
 	}
+
 	foreach (function_index, &function : program.functions)
 	{
-		for (sz previous_index = 0; previous_index < function_index; previous_index++)
+		if (!method_signatures.insert((usz)function_index))
 		{
-			if (method_signature_equal(&program.functions[(usz)previous_index], function))
-			{
-				add_validation_error(&diagnostics, allocator, "duplicate method signature", function.span);
-			}
+			add_validation_error(&diagnostics, allocator, "duplicate method signature", function.span);
 		}
 		if (function.name == "superpose" || function.name == "collapse")
 		{
@@ -1239,40 +1465,30 @@ fn MitosDiagnostic[] validate_program(Program* program, Allocator allocator = me
 				function.span
 			);
 		}
-		foreach (&enum_decl : program.enums)
+		if (enum_names.contains(function.name))
 		{
-			if (enum_decl.name == function.name)
-			{
-				add_validation_error(&diagnostics, allocator, "duplicate declaration name", function.span);
-			}
-			foreach (&variant : enum_decl.variants)
-			{
-				if (variant.name == function.name)
-				{
-					add_validation_error(
-						&diagnostics,
-						allocator,
-						"generic function name collides with a constructor name",
-						function.span
-					);
-				}
-			}
+			add_validation_error(&diagnostics, allocator, "duplicate declaration name", function.span);
 		}
-		foreach (&type_decl : program.types)
+		if (constructor_names.contains(function.name))
 		{
-			if (type_decl.name == function.name)
-			{
-				add_validation_error(&diagnostics, allocator, "generic function name collides with a type name", function.span);
-			}
+			add_validation_error(
+				&diagnostics,
+				allocator,
+				"generic function name collides with a constructor name",
+				function.span
+			);
+		}
+		if (type_names.contains(function.name))
+		{
+			add_validation_error(&diagnostics, allocator, "generic function name collides with a type name", function.span);
 		}
 		foreach (parameter_index, parameter : function.parameters)
 		{
 			for (sz previous_index = 0; previous_index < parameter_index; previous_index++)
 			{
-				if (function.parameters[(usz)previous_index] == parameter)
-				{
-					add_validation_error(&diagnostics, allocator, "duplicate function parameter", function.span);
-				}
+				if (function.parameters[(usz)previous_index] != parameter) continue;
+				add_validation_error(&diagnostics, allocator, "duplicate function parameter", function.span);
+				break;
 			}
 		}
 		if (function.name == "main")
@@ -1290,370 +1506,13 @@ fn MitosDiagnostic[] validate_program(Program* program, Allocator allocator = me
 		MitosPosition start = { .offset = 0, .row = 1, .column = 1 };
 		add_validation_error(&diagnostics, allocator, "program must declare main", { .start = start, .end = start });
 	}
+
+	method_signatures.deinit();
+	effect_names.deinit();
+	type_names.deinit();
+	constructor_names.deinit();
+	enum_names.deinit();
 	MitosDiagnostic[] result = diagnostics.to_array(allocator);
 	diagnostics.free();
-	return result;
-}
-
-struct CoreNameScope
-{
-	CoreNameScope* parent;
-	String[] names;
-	ParallelBinding[] parallel_bindings;
-}
-
-fn bool core_name_is_bound(CoreNameScope* scope, String name) @private
-{
-	for (CoreNameScope* current = scope; current; current = current.parent)
-	{
-		foreach (bound_name : current.names) if (bound_name == name) return true;
-		foreach (&binding : current.parallel_bindings) if (binding.name == name) return true;
-	}
-	return false;
-}
-
-fn bool is_named_global_function(Program* program, String name) @private
-{
-	foreach (&function : program.functions) if (function.name == name) return true;
-	return false;
-}
-
-fn void validate_lambda_core_expression(
-	Program* program,
-	SurfaceExpr* expression,
-	CoreNameScope* scope,
-	List{MitosDiagnostic}* diagnostics,
-	Allocator allocator
-) @private
-{
-	if (!expression) return;
-	switch (expression.kind)
-	{
-		case SURFACE_VARIABLE:
-			if (!core_name_is_bound(scope, expression.data.variable.name)
-				&& is_named_global_function(program, expression.data.variable.name))
-			{
-				add_validation_error(
-					diagnostics,
-					allocator,
-					"lambda-core lowering does not support references between named functions",
-					expression.span
-				);
-			}
-		case SURFACE_INTEGER:
-		case SURFACE_LAMBDA:
-			CoreNameScope lambda_scope = { .parent = scope, .names = expression.data.lambda.parameters };
-			validate_lambda_core_expression(
-				program,
-				expression.data.lambda.body,
-				&lambda_scope,
-				diagnostics,
-				allocator
-			);
-		case SURFACE_APPLICATION:
-			validate_lambda_core_expression(program, expression.data.application.callee, scope, diagnostics, allocator);
-			foreach (argument : expression.data.application.arguments)
-			{
-				validate_lambda_core_expression(program, argument, scope, diagnostics, allocator);
-			}
-		case SURFACE_BINARY:
-			validate_lambda_core_expression(program, expression.data.binary.left, scope, diagnostics, allocator);
-			validate_lambda_core_expression(program, expression.data.binary.right, scope, diagnostics, allocator);
-		case SURFACE_DEFINITION:
-			validate_lambda_core_expression(program, expression.data.definition.value, scope, diagnostics, allocator);
-			String[1] definition_names = { expression.data.definition.name };
-			CoreNameScope definition_scope = { .parent = scope, .names = definition_names[..] };
-			validate_lambda_core_expression(program, expression.data.definition.body, &definition_scope, diagnostics, allocator);
-		case SURFACE_MATCH:
-			validate_lambda_core_expression(
-				program,
-				expression.data.match_expr.scrutinee,
-				scope,
-				diagnostics,
-				allocator
-			);
-			foreach (&arm : expression.data.match_expr.arms)
-			{
-				if (arm.pattern.kind == PATTERN_CONSTRUCTOR)
-				{
-					CoreNameScope arm_scope = { .parent = scope, .names = arm.pattern.bindings };
-					validate_lambda_core_expression(program, arm.body, &arm_scope, diagnostics, allocator);
-				}
-				else
-				{
-					validate_lambda_core_expression(program, arm.body, scope, diagnostics, allocator);
-				}
-			}
-		case SURFACE_PARALLEL:
-			foreach (&binding : expression.data.parallel.bindings)
-			{
-				validate_lambda_core_expression(program, binding.value, scope, diagnostics, allocator);
-			}
-			CoreNameScope parallel_scope = { .parent = scope, .parallel_bindings = expression.data.parallel.bindings, };
-			validate_lambda_core_expression(
-				program,
-				expression.data.parallel.result,
-				&parallel_scope,
-				diagnostics,
-				allocator
-			);
-		default:
-	}
-}
-
-fn MitosDiagnostic[] validate_lambda_core_program(Program* program, Allocator allocator) @private
-{
-	List{MitosDiagnostic} diagnostics;
-	diagnostics.init(allocator);
-	foreach (&function : program.functions)
-	{
-		if (function.name == "main") continue;
-		CoreNameScope function_scope = { .names = function.parameters };
-		validate_lambda_core_expression(program, function.body, &function_scope, &diagnostics, allocator);
-	}
-	MitosDiagnostic[] result = diagnostics.to_array(allocator);
-	diagnostics.free();
-	return result;
-}
-
-struct Lowerer
-{
-	Allocator allocator;
-	Program* source;
-	sz next_handler;
-}
-
-fn CoreExpr* core_variable(Lowerer* lowerer, String name) @private
-{
-	return alloc::new(
-		lowerer.allocator,
-		CoreExpr,
-		{ .kind = CORE_VARIABLE, .data = { .variable = { .name = name.copy(lowerer.allocator) } } }
-	);
-}
-
-fn CoreExpr* core_abstraction(Lowerer* lowerer, String parameter, CoreExpr* body) @private
-{
-	return alloc::new(
-		lowerer.allocator,
-		CoreExpr,
-		{
-			.kind = CORE_ABSTRACTION,
-			.data = { .abstraction = { .parameter = parameter.copy(lowerer.allocator), .body = body } }
-		}
-	);
-}
-
-fn CoreExpr* core_application(Lowerer* lowerer, CoreExpr* function, CoreExpr* argument) @private
-{
-	return alloc::new(
-		lowerer.allocator,
-		CoreExpr,
-		{ .kind = CORE_APPLICATION, .data = { .application = { .function = function, .argument = argument } } }
-	);
-}
-
-
-fn CoreExpr* core_parallel(Lowerer* lowerer, ParallelExpr* parallel_expression) @private
-{
-	CoreParallelBinding[] bindings = alloc::new_array(
-		lowerer.allocator,
-		CoreParallelBinding,
-		(sz)parallel_expression.bindings.len
-	);
-	foreach (index, &binding : parallel_expression.bindings)
-	{
-		bindings[index] = {
-			.name = binding.name.copy(lowerer.allocator),
-			.value = lower_expression(lowerer, binding.value),
-		};
-	}
-	return alloc::new(
-		lowerer.allocator,
-		CoreExpr,
-		{
-			.kind = CORE_PARALLEL,
-			.data = {
-				.parallel = {
-					.bindings = bindings,
-					.result = lower_expression(lowerer, parallel_expression.result),
-				}
-			}
-		}
-	);
-}
-fn CoreExpr* curry(Lowerer* lowerer, String[] parameters, CoreExpr* body) @private
-{
-	for (sz i = (sz)parameters.len - 1; i >= 0; i--) body = core_abstraction(lowerer, parameters[(usz)i], body);
-	return body;
-}
-
-fn String prelude_name(BinaryOperator operator) @private
-{
-	switch (operator)
-	{
-		case BINARY_ADD: return "mitos.add";
-		case BINARY_SUBTRACT: return "mitos.subtract";
-		case BINARY_MULTIPLY: return "mitos.multiply";
-		case BINARY_DIVIDE: return "mitos.divide";
-		case BINARY_REMAINDER: return "mitos.remainder";
-		case BINARY_EQUAL: return "mitos.equal";
-		case BINARY_LESS: return "mitos.less";
-		case BINARY_LESS_EQUAL: return "mitos.lessEqual";
-		case BINARY_GREATER: return "mitos.greater";
-		case BINARY_GREATER_EQUAL: return "mitos.greaterEqual";
-		default: return "mitos.invalidOperator";
-	}
-}
-
-
-fn CoreExpr* lower_constructor(Lowerer* lowerer, sz enum_index, sz variant_index) @private
-{
-	EnumDecl* enum_decl  = &lowerer.source.enums[(usz)enum_index];
-	VariantDecl* variant = &enum_decl.variants[(usz)variant_index];
-	sz first_handler     = lowerer.next_handler;
-	lowerer.next_handler += (sz)enum_decl.variants.len;
-	char[32] selected_buffer;
-	String selected_name = (String)io::bprintf(&selected_buffer, "$handler%d", (long)(first_handler + variant_index))!!;
-	CoreExpr* body = core_variable(lowerer, selected_name);
-	foreach (parameter : variant.parameters) body = core_application(lowerer, body, core_variable(lowerer, parameter));
-	for (sz i = (sz)enum_decl.variants.len - 1; i >= 0; i--)
-	{
-		char[32] handler_buffer;
-		String handler_name = (String)io::bprintf(&handler_buffer, "$handler%d", (long)(first_handler + i))!!;
-		body = core_abstraction(lowerer, handler_name, body);
-	}
-	return curry(lowerer, variant.parameters, body);
-}
-
-fn MatchArm* find_match_arm(MatchExpr* match_expr, String constructor) @private
-{
-	MatchArm* wildcard = null;
-	foreach (&arm : match_expr.arms)
-	{
-		if (arm.pattern.kind == PATTERN_WILDCARD)
-		{
-			wildcard = arm;
-		}
-		else if (arm.pattern.constructor == constructor)
-		{
-			return arm;
-		}
-	}
-	return wildcard;
-}
-
-fn CoreExpr* lower_match(Lowerer* lowerer, MatchExpr* match_expr) @private
-{
-	sz enum_index = -1;
-	foreach (&arm : match_expr.arms)
-	{
-		if (arm.pattern.kind != PATTERN_CONSTRUCTOR) continue;
-		ConstructorRef reference = find_constructor(lowerer.source, arm.pattern.constructor);
-		if (reference.found)
-		{
-			enum_index = reference.enum_index;
-			break;
-		}
-	}
-	CoreExpr* result    = lower_expression(lowerer, match_expr.scrutinee);
-	EnumDecl* enum_decl = &lowerer.source.enums[(usz)enum_index];
-	foreach (&variant : enum_decl.variants)
-	{
-		MatchArm* arm    = find_match_arm(match_expr, variant.name);
-		CoreExpr* branch = lower_expression(lowerer, arm.body);
-		if (arm.pattern.kind == PATTERN_CONSTRUCTOR)
-		{
-			branch = curry(lowerer, arm.pattern.bindings, branch);
-		}
-		else
-		{
-			for (sz i = (sz)variant.parameters.len - 1; i >= 0; i--)
-			{
-				branch = core_abstraction(lowerer, "$discard", branch);
-			}
-		}
-		result = core_application(lowerer, result, branch);
-	}
-	return result;
-}
-
-fn CoreExpr* lower_expression(Lowerer* lowerer, SurfaceExpr* expression) @private
-{
-	switch (expression.kind)
-	{
-		case SURFACE_VARIABLE:
-			return core_variable(lowerer, expression.data.variable.name);
-		case SURFACE_INTEGER:
-			char[32] buffer;
-			String value = (String)io::bprintf(&buffer, "%d", expression.data.integer.value)!!;
-			return core_variable(lowerer, value);
-		case SURFACE_LAMBDA:
-			return curry(
-				lowerer,
-				expression.data.lambda.parameters,
-				lower_expression(lowerer, expression.data.lambda.body)
-			);
-		case SURFACE_APPLICATION:
-			CoreExpr* application = lower_expression(lowerer, expression.data.application.callee);
-			foreach (argument : expression.data.application.arguments) application = core_application(
-				lowerer,
-				application,
-				lower_expression(lowerer, argument)
-			);
-			return application;
-		case SURFACE_BINARY:
-			CoreExpr* operation = core_variable(lowerer, prelude_name(expression.data.binary.operator));
-			operation = core_application(lowerer, operation, lower_expression(lowerer, expression.data.binary.left));
-			return core_application(lowerer, operation, lower_expression(lowerer, expression.data.binary.right));
-		case SURFACE_DEFINITION:
-			CoreExpr* body = lower_expression(lowerer, expression.data.definition.body);
-			return core_application(
-				lowerer,
-				core_abstraction(lowerer, expression.data.definition.name, body),
-				lower_expression(lowerer, expression.data.definition.value)
-			);
-		case SURFACE_MATCH:
-			return lower_match(lowerer, &expression.data.match_expr);
-		case SURFACE_PARALLEL:
-			return core_parallel(lowerer, &expression.data.parallel);
-		default:
-			return core_variable(lowerer, "mitos.invalidExpression");
-	}
-}
-
-fn LowerResult lower_program(Program* source, Allocator allocator = mem)
-{
-	LowerResult result = { .allocator = allocator };
-	result.diagnostics = validate_program(source, allocator);
-	if (result.diagnostics.len != 0) return result;
-	alloc::free(allocator, result.diagnostics);
-	result.diagnostics = validate_lambda_core_program(source, allocator);
-	if (result.diagnostics.len != 0) return result;
-	Lowerer lowerer             = { .allocator = allocator, .source = source };
-	FunctionDecl* main_function = null;
-	foreach (&function : source.functions) if (function.name == "main") main_function = function;
-	CoreExpr* expression = lower_expression(&lowerer, main_function.body);
-	for (sz i = (sz)source.functions.len - 1; i >= 0; i--)
-	{
-		FunctionDecl* function = &source.functions[(usz)i];
-		if (function.name == "main") continue;
-		CoreExpr* function_value = curry(&lowerer, function.parameters, lower_expression(&lowerer, function.body));
-		expression = core_application(&lowerer, core_abstraction(&lowerer, function.name, expression), function_value);
-	}
-	for (sz enum_index = (sz)source.enums.len - 1; enum_index >= 0; enum_index--)
-	{
-		EnumDecl* enum_decl = &source.enums[(usz)enum_index];
-		for (sz variant_index = (sz)enum_decl.variants.len - 1; variant_index >= 0; variant_index--)
-		{
-			VariantDecl* variant = &enum_decl.variants[(usz)variant_index];
-			expression = core_application(
-				&lowerer,
-				core_abstraction(&lowerer, variant.name, expression),
-				lower_constructor(&lowerer, enum_index, variant_index)
-			);
-		}
-	}
-	result.program = { .allocator = allocator, .expression = expression };
 	return result;
 }

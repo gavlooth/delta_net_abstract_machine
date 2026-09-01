@@ -66,7 +66,6 @@ src/
   main.c3              # CLI only
 ```
 
-Keep `stable_index_vector.c3` as storage. Do not poke it from every rewrite.
 
 ---
 

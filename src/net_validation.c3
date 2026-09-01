@@ -3,38 +3,6 @@ module delta_net_abstract_machine;
 // Validation is coordinator-only in this wave. Enumerating raw arena slots and
 // immediately upgrading each live ID to its generation-bearing reference is
 // safe because no rewrite may run concurrently with validation.
-fn bool node_references_port(Node* node, NetRef port_ref)
-{
- switch (node.type)
- {
- case ERASER:
-  return node.agent.eraser.principal == port_ref;
- case FAN:
-  return node.agent.fan.principal == port_ref
-   || node.agent.fan.left == port_ref
-   || node.agent.fan.right == port_ref;
- case REPLICATOR:
-  if (node.agent.replicator.principal == port_ref) return true;
-  foreach (auxiliary : node.agent.replicator.auxiliaries)
-  {
-   if (auxiliary == port_ref) return true;
-  }
-  return false;
- default:
-  if (!is_practical_agent_type(node.type)) return false;
-  if (node.agent.practical.principal == port_ref) return true;
-  foreach (auxiliary : node.agent.practical.auxiliaries)
-  {
-   if (auxiliary == port_ref) return true;
-  }
-  return false;
- }
-}
-
-fn bool interface_references_port(InterfacePort* boundary, NetRef port_ref)
-{
- return boundary.port == port_ref;
-}
 
 fn bool node_port_is_valid(Net* net, NetRef node_ref, NetRef port_ref,
  PortType expected_type)
@@ -90,10 +58,6 @@ fn bool node_is_valid(Net* net, NetRef node_ref, Node* node)
    if (auxiliary_port.polarity != auxiliary_polarity
     || !auxiliary_port.slot.properties.has_value
     || auxiliary_port.slot.properties.value.position != (usz)idx) return false;
-   foreach (other_idx, other : node.agent.replicator.auxiliaries)
-   {
-    if (idx != other_idx && auxiliary == other) return false;
-   }
   }
   return true;
  default:
@@ -110,15 +74,45 @@ fn bool node_is_valid(Net* net, NetRef node_ref, Node* node)
    if (auxiliary_port.polarity != practical_auxiliary_polarity
     || !auxiliary_port.slot.properties.has_value
     || auxiliary_port.slot.properties.value.position != (usz)idx) return false;
-   foreach (other_idx, other : node.agent.practical.auxiliaries)
-   {
-    if (idx != other_idx && auxiliary == other) return false;
-   }
   }
   PracticalAgent* practical = &node.agent.practical;
+  bool has_storage =
+   practical.storage != mitos_storage::INVALID_STORAGE_HANDLE;
+  if (has_storage)
+  {
+   if (!agent_type_supports_storage(node.type)
+    || practical.owns_text || practical.text.len) return false;
+   mitos_storage::StorageMetadata metadata;
+   if (!practical.type_id || !practical.storage_stride
+    || practical.storage_policy != mitos::CopyPolicy.COPY_SHARED_IMMUTABLE
+    || mitos_storage::storage_metadata(
+     &net.storage, practical.storage, &metadata
+    ) != mitos_storage::StorageError.STORAGE_OK
+    || !practical_storage_metadata_matches_agent(node.type, &metadata)
+    || metadata.type_id != (mitos::TypeId)practical.type_id
+    || metadata.copy_policy != practical.storage_policy
+    || metadata.stride != practical.storage_stride
+    || metadata.element_size != practical.storage_stride
+    || !metadata.owner_count
+    || practical.storage_count > usz::max / practical.storage_stride
+    || metadata.byte_length
+     != practical.storage_count * practical.storage_stride) return false;
+  }
+  else
+  {
+   if (practical.storage_count || practical.storage_stride
+    || practical.storage_policy != mitos::CopyPolicy.COPY_TRIVIAL) return false;
+   if (node.type == STRING_AGENT)
+   {
+    if (!practical.type_id || !practical.owns_text) return false;
+   }
+   else if (practical.owns_text || practical.text.len)
+   {
+    return false;
+   }
+  }
   if (node.type == COLLAPSE_AGENT && practical.auxiliaries.len != 1) return false;
-  if (node.type == STRING_AGENT
-   && (!practical.type_id || !practical.owns_text)) return false;
+  if (node.type == ARRAY_AGENT && has_storage && practical.auxiliaries.len) return false;
   if (node.type == EFFECT_AGENT
    && (!practical.effect_id || !practical.operation_id || !practical.effect_epoch)) return false;
   if (node.type == HANDLER_AGENT)
@@ -212,73 +206,71 @@ fn bool interfaces_are_valid(Net* net)
  return true;
 }
 
-fn bool ports_have_exactly_one_owner(Net* net)
+fn bool add_port_owner(Net* net, char[] owner_counts, NetRef port_ref) @private
 {
- for (SlotId port_id = 0; port_id < net.ports.next_id; port_id++)
- {
-  if (!net.ports.contains_id(port_id)) continue;
-  NetRef port_ref = net.ports.generation_ref(port_id);
-  usz owners = 0;
-
-  for (SlotId node_id = 0; node_id < net.nodes.next_id; node_id++)
-  {
-   if (!net.nodes.contains_id(node_id)) continue;
-   Node* node = net.nodes.get_ref(net.nodes.generation_ref(node_id));
-   if (node_references_port(node, port_ref) && ++owners > 1) return false;
-  }
-  for (SlotId interface_id = 0;
-   interface_id < net.interfaces.next_id; interface_id++)
-  {
-   if (!net.interfaces.contains_id(interface_id)) continue;
-   InterfacePort* boundary =
-    net.interfaces.get_ref(net.interfaces.generation_ref(interface_id));
-   if (interface_references_port(boundary, port_ref) && ++owners > 1) return false;
-  }
-  if (owners != 1) return false;
- }
+ if (!net.ports.contains_ref(port_ref)) return false;
+ usz port_id = (usz)port_ref.id;
+ if (owner_counts[port_id]) return false;
+ owner_counts[port_id] = 1;
  return true;
 }
 
-fn bool owned_port_slices_are_unique(Net* net)
+fn bool ports_have_exactly_one_owner(Net* net)
 {
- for (SlotId first_id = 0; first_id < net.nodes.next_id; first_id++)
- {
-  if (!net.nodes.contains_id(first_id)) continue;
-  Node* first = net.nodes.get_ref(net.nodes.generation_ref(first_id));
-  NetRef[] first_ports;
-  if (first.type == REPLICATOR)
-  {
-   first_ports = first.agent.replicator.auxiliaries;
-  }
-  else if (is_practical_agent_type(first.type))
-  {
-   first_ports = first.agent.practical.auxiliaries;
-  }
-  else
-  {
-   continue;
-  }
-  if (!first_ports.len) continue;
+ char[] owner_counts =
+  alloc::new_array(mem, char, (sz)net.ports.next_id);
+ defer alloc::free(mem, owner_counts);
+ foreach (&count : owner_counts) *count = 0;
 
-  for (SlotId second_id = first_id + 1;
-   second_id < net.nodes.next_id; second_id++)
+ for (SlotId node_id = 0; node_id < net.nodes.next_id; node_id++)
+ {
+  if (!net.nodes.contains_id(node_id)) continue;
+  Node* node = net.nodes.get_ref(net.nodes.generation_ref(node_id));
+  switch (node.type)
   {
-   if (!net.nodes.contains_id(second_id)) continue;
-   Node* second = net.nodes.get_ref(net.nodes.generation_ref(second_id));
-   NetRef[] second_ports;
-   if (second.type == REPLICATOR)
+  case ERASER:
+   if (!add_port_owner(net, owner_counts, node.agent.eraser.principal))
    {
-    second_ports = second.agent.replicator.auxiliaries;
+    return false;
    }
-   else if (is_practical_agent_type(second.type))
+  case FAN:
+   if (!add_port_owner(net, owner_counts, node.agent.fan.principal)
+    || !add_port_owner(net, owner_counts, node.agent.fan.left)
+    || !add_port_owner(net, owner_counts, node.agent.fan.right)) return false;
+  case REPLICATOR:
+   if (!add_port_owner(net, owner_counts, node.agent.replicator.principal))
    {
-    second_ports = second.agent.practical.auxiliaries;
+    return false;
    }
-   else
+   foreach (auxiliary : node.agent.replicator.auxiliaries)
    {
-    continue;
+    if (!add_port_owner(net, owner_counts, auxiliary)) return false;
    }
-   if (second_ports.len && first_ports.ptr == second_ports.ptr) return false;
+  default:
+   if (!is_practical_agent_type(node.type)
+    || !add_port_owner(net, owner_counts, node.agent.practical.principal))
+   {
+    return false;
+   }
+   foreach (auxiliary : node.agent.practical.auxiliaries)
+   {
+    if (!add_port_owner(net, owner_counts, auxiliary)) return false;
+   }
+  }
+ }
+ for (SlotId interface_id = 0;
+  interface_id < net.interfaces.next_id; interface_id++)
+ {
+  if (!net.interfaces.contains_id(interface_id)) continue;
+  InterfacePort* boundary =
+   net.interfaces.get_ref(net.interfaces.generation_ref(interface_id));
+  if (!add_port_owner(net, owner_counts, boundary.port)) return false;
+ }
+ for (SlotId port_id = 0; port_id < net.ports.next_id; port_id++)
+ {
+  if (net.ports.contains_id(port_id) && !owner_counts[(usz)port_id])
+  {
+   return false;
   }
  }
  return true;
@@ -312,6 +304,44 @@ fn bool ports_have_live_wires(Net* net)
   if (!net.wires.contains_ref(port.wire_id)) return false;
   Wire* wire = net.wires.get_ref(port.wire_id);
   if (wire.a != port_ref && wire.b != port_ref) return false;
+ }
+ return true;
+}
+
+// Storage handles are owner leases, not record IDs. One live handle may
+// therefore appear in at most one practical agent; replicated shared records
+// carry distinct handles and advertise their backing owner count via metadata.
+fn bool practical_storage_owners_are_unique(Net* net) @private
+{
+ bool has_storage = false;
+ usz last_owner_id = 0;
+ for (SlotId node_id = 0; node_id < net.nodes.next_id; node_id++)
+ {
+  if (!net.nodes.contains_id(node_id)) continue;
+  Node* node = net.nodes.get_ref(net.nodes.generation_ref(node_id));
+  if (!is_practical_agent_type(node.type)
+   || node.agent.practical.storage
+    == mitos_storage::INVALID_STORAGE_HANDLE) continue;
+  mitos_storage::StorageHandle handle = node.agent.practical.storage;
+  if (handle.id >= (ulong)sz::max) return false;
+  usz owner_id = (usz)handle.id;
+  if (!has_storage || owner_id > last_owner_id) last_owner_id = owner_id;
+  has_storage = true;
+ }
+ if (!has_storage) return true;
+ char[] seen = alloc::new_array(mem, char, (sz)(last_owner_id + 1));
+ defer alloc::free(mem, seen);
+ foreach (&value : seen) *value = 0;
+ for (SlotId node_id = 0; node_id < net.nodes.next_id; node_id++)
+ {
+  if (!net.nodes.contains_id(node_id)) continue;
+  Node* node = net.nodes.get_ref(net.nodes.generation_ref(node_id));
+  if (!is_practical_agent_type(node.type)
+   || node.agent.practical.storage
+    == mitos_storage::INVALID_STORAGE_HANDLE) continue;
+  usz owner_id = (usz)node.agent.practical.storage.id;
+  if (seen[owner_id]) return false;
+  seen[owner_id] = 1;
  }
  return true;
 }
@@ -371,7 +401,7 @@ fn bool validate_net(Net* net)
   && observable_origins_are_valid(net)
   && interfaces_are_valid(net)
   && ports_have_exactly_one_owner(net)
-  && owned_port_slices_are_unique(net)
+  && practical_storage_owners_are_unique(net)
   && wires_are_valid(net)
   && ports_have_live_wires(net)
   && effect_continuations_are_valid(net);

@@ -1,6 +1,8 @@
 build/
 out/
 obj/
+/testrun
+/storage_smoke
 
 # Large generated HTML exports
 *.html

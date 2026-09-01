@@ -1255,9 +1255,6 @@ src/
   main.c3              # CLI only
 ```
 
-Keep `stable_index_vector.c3`, but stop reaching into its guts from every
-rewrite. The vector is storage. The mutation API is the language your rewrites
-should speak.
 
 A first sequential CLI is enough:
 

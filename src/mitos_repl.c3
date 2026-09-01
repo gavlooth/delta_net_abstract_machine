@@ -2,14 +2,14 @@ module delta_net_abstract_machine;
 
 import delta_net_abstract_machine::mitos;
 import delta_net_abstract_machine::mitos_jit;
-import delta_net_abstract_machine::mitos_specialization;
+import delta_net_abstract_machine::mitos_mir;
 import std::collections::list;
 import std::io;
 
 const usz MITOS_REPL_MAX_SOURCE_BYTES = 16 * 1024 * 1024;
 const String MITOS_REPL_HELP = `commands:
   :help   show this help
-  :clear  forget declarations, bindings, epochs, and native specializations
+  :clear  forget declarations, bindings, and semantic epochs
   :quit   exit the REPL`;
 
 enum MitosReplRead : char
@@ -21,22 +21,71 @@ enum MitosReplRead : char
 
 struct ReplGenericEpoch
 {
-	String name;
-	usz arity;
-	usz method_count;
+	mitos::SymbolKey key;
+	String fingerprint;
 	ulong epoch;
+}
+
+struct ReplGenericEpochUpdate
+{
+	sz record_index;
+	mitos::SymbolKey key;
+	String fingerprint;
+	ulong epoch;
+}
+
+struct ReplEpochUpdate
+{
+	Allocator allocator;
+	List{ReplGenericEpochUpdate} generics;
+	String type_fingerprint;
+	String effect_fingerprint;
+	bool commit_type_fingerprint;
+	bool commit_effect_fingerprint;
+	ulong type_epoch;
+	ulong effect_epoch;
+}
+
+fn void ReplEpochUpdate.init(&self, Allocator allocator)
+{
+	self.allocator = allocator;
+	self.generics.init(allocator);
+}
+
+fn void ReplEpochUpdate.deinit(&self)
+{
+	foreach (&generic : self.generics)
+	{
+		if (generic.record_index < 0) generic.key.deinit(self.allocator);
+		alloc::free(self.allocator, generic.fingerprint);
+	}
+	self.generics.free();
+	alloc::free(self.allocator, self.type_fingerprint);
+	alloc::free(self.allocator, self.effect_fingerprint);
+	*self = { };
+}
+
+fn bool repl_advance_epoch(ulong* epoch)
+{
+	if (*epoch && *epoch < ulong::max)
+	{
+		(*epoch)++;
+		return false;
+	}
+	*epoch = 1;
+	return true;
 }
 
 struct ReplDeclaration
 {
 	String source;
-	String method_signature;
+	mitos::SymbolKey method_key;
 }
 
 fn void ReplDeclaration.deinit(&self, Allocator allocator)
 {
 	alloc::free(allocator, self.source);
-	alloc::free(allocator, self.method_signature);
+	self.method_key.deinit(allocator);
 	*self = { };
 }
 
@@ -62,24 +111,18 @@ fn usz repl_declarations_size(List{ReplDeclaration}* declarations)
 struct ReplEpochs
 {
 	Allocator allocator;
+	mitos::ModuleKey module_key;
 	List{ReplGenericEpoch} generics;
-	usz type_count;
-	usz effect_count;
+	String type_fingerprint;
+	String effect_fingerprint;
 	ulong type_epoch;
 	ulong effect_epoch;
-	uint delta_format_version;
-	uint helper_abi_major;
-	uint helper_abi_minor;
-	ulong helper_feature_bits;
-	uint helper_effect_tag;
-	uint helper_handler_tag;
-	uint helper_resume_tag;
-	uint helper_abort_tag;
 }
 
 fn void ReplEpochs.init(&self, Allocator allocator)
 {
 	self.allocator = allocator;
+	self.module_key = mitos::repl_module_key(allocator);
 	self.generics.init(allocator);
 	self.type_epoch = 1;
 	self.effect_epoch = 1;
@@ -87,103 +130,283 @@ fn void ReplEpochs.init(&self, Allocator allocator)
 
 fn void ReplEpochs.deinit(&self)
 {
-	foreach (&generic : self.generics) alloc::free(self.allocator, generic.name);
+	self.module_key.deinit(self.allocator);
+	foreach (&generic : self.generics)
+	{
+		generic.key.deinit(self.allocator);
+		alloc::free(self.allocator, generic.fingerprint);
+	}
 	self.generics.free();
+	alloc::free(self.allocator, self.type_fingerprint);
+	alloc::free(self.allocator, self.effect_fingerprint);
 	*self = { };
+}
+
+fn void ReplEpochUpdate.commit(&self, ReplEpochs* epochs)
+{
+	epochs.type_epoch = self.type_epoch;
+	epochs.effect_epoch = self.effect_epoch;
+	if (self.commit_type_fingerprint)
+	{
+		alloc::free(epochs.allocator, epochs.type_fingerprint);
+		epochs.type_fingerprint = self.type_fingerprint;
+		self.type_fingerprint = { };
+	}
+	if (self.commit_effect_fingerprint)
+	{
+		alloc::free(epochs.allocator, epochs.effect_fingerprint);
+		epochs.effect_fingerprint = self.effect_fingerprint;
+		self.effect_fingerprint = { };
+	}
+	foreach (&update : self.generics)
+	{
+		if (update.record_index >= 0)
+		{
+			ReplGenericEpoch* record = &epochs.generics[update.record_index];
+			alloc::free(epochs.allocator, record.fingerprint);
+			record.fingerprint = update.fingerprint;
+			record.epoch = update.epoch;
+			update.fingerprint = { };
+			continue;
+		}
+		epochs.generics.push({
+			.key = update.key,
+			.fingerprint = update.fingerprint,
+			.epoch = update.epoch,
+		});
+		update.key = { };
+		update.fingerprint = { };
+	}
 }
 
 fn void ReplEpochs.clear(&self)
 {
-	foreach (&generic : self.generics) alloc::free(self.allocator, generic.name);
+	foreach (&generic : self.generics)
+	{
+		generic.key.deinit(self.allocator);
+		alloc::free(self.allocator, generic.fingerprint);
+	}
 	self.generics.clear();
-	self.type_count = 0;
-	self.effect_count = 0;
-	self.type_epoch++;
-	self.effect_epoch++;
-	self.delta_format_version = 0;
-	self.helper_abi_major = 0;
-	self.helper_abi_minor = 0;
-	self.helper_feature_bits = 0;
-	self.helper_effect_tag = 0;
-	self.helper_handler_tag = 0;
-	self.helper_resume_tag = 0;
-	self.helper_abort_tag = 0;
+	alloc::free(self.allocator, self.type_fingerprint);
+	alloc::free(self.allocator, self.effect_fingerprint);
+	self.type_fingerprint = { };
+	self.effect_fingerprint = { };
+	(void)repl_advance_epoch(&self.type_epoch);
+	(void)repl_advance_epoch(&self.effect_epoch);
 }
 
-fn bool repl_update_epochs(
-	ReplEpochs* epochs,
-	mitos::DeltaProgram* program,
-	mitos_specialization::SpecializationCache* cache,
-	String replaced_generic = "",
-	usz replaced_arity = 0
+
+fn void repl_append_symbol_key(DString* output, mitos::SymbolKey* key)
+{
+	mitos::append_length_prefixed_component(output, key.owner.canonical);
+	char[32] kind;
+	output.append_string((String)io::bprintf(
+		&kind, "%d/%d:", (long)key.kind, (long)key.arity
+	)!!);
+	mitos::append_length_prefixed_component(output, key.name);
+	mitos::append_length_prefixed_component(output, key.canonical_signature);
+}
+
+fn void repl_append_effect_row(
+	DString* output,
+	mitos::ResolvedEffectRow* row
 )
 {
-	bool invalidate_all = false;
-	bool intrinsic_abi_changed = epochs.delta_format_version
-		&& (epochs.delta_format_version != program.format_version
-			|| epochs.helper_abi_major != program.helper_abi.major
-			|| epochs.helper_abi_minor != program.helper_abi.minor
-			|| epochs.helper_feature_bits != program.helper_abi.feature_bits
-			|| epochs.helper_effect_tag != program.helper_abi.effect_tag
-			|| epochs.helper_handler_tag != program.helper_abi.handler_tag
-			|| epochs.helper_resume_tag != program.helper_abi.resume_tag
-			|| epochs.helper_abort_tag != program.helper_abi.abort_tag);
-	epochs.delta_format_version = program.format_version;
-	epochs.helper_abi_major = program.helper_abi.major;
-	epochs.helper_abi_minor = program.helper_abi.minor;
-	epochs.helper_feature_bits = program.helper_abi.feature_bits;
-	epochs.helper_effect_tag = program.helper_abi.effect_tag;
-	epochs.helper_handler_tag = program.helper_abi.handler_tag;
-	epochs.helper_resume_tag = program.helper_abi.resume_tag;
-	epochs.helper_abort_tag = program.helper_abi.abort_tag;
-	if (intrinsic_abi_changed) invalidate_all = true;
-	usz type_count = (usz)program.types.descriptors.len();
-	if (epochs.type_count && epochs.type_count != type_count)
+	char[32] metadata;
+	output.append_string((String)io::bprintf(
+		&metadata, "row:%d:%d:", (long)row.required.len, row.has_tail ? 1L : 0L
+	)!!);
+	foreach (effect : row.required)
+		output.append_string((String)io::bprintf(
+			&metadata, "%d,", (long)effect
+		)!!);
+	if (row.has_tail) repl_append_symbol_key(output, &row.tail);
+	output.append_char(';');
+}
+
+fn String repl_type_fingerprint(mitos::DeltaProgram* program, Allocator allocator)
+{
+	DString output;
+	output.init(allocator);
+	foreach (&descriptor : program.types.descriptors)
 	{
-		epochs.type_epoch++;
-		invalidate_all = true;
-	}
-	epochs.type_count = type_count;
-	program.types.epoch = epochs.type_epoch;
-	usz effect_count = program.effects.effects.len + program.effects.operations.len;
-	if (epochs.effect_count && epochs.effect_count != effect_count)
-	{
-		epochs.effect_epoch++;
-		invalidate_all = true;
-	}
-	epochs.effect_count = effect_count;
-	program.effects.epoch = epochs.effect_epoch;
-	foreach (&row : program.effects.rows) row.effect_epoch = epochs.effect_epoch;
-	cache.invalidate_effect_epoch(epochs.effect_epoch);
-	if ((usz)epochs.generics.len() > (usz)program.methods.generics.len()) invalidate_all = true;
-	foreach (generic_index, &generic : program.methods.generics)
-	{
-		ReplGenericEpoch* record = null;
-		foreach (&candidate : epochs.generics)
+		repl_append_symbol_key(&output, &descriptor.key);
+		char[96] metadata;
+		output.append_string((String)io::bprintf(
+			&metadata, "%d/%d/%d/%d/%d/%d;",
+			(long)descriptor.kind, (long)descriptor.nominal_parent,
+			(long)descriptor.layout.size, (long)descriptor.layout.alignment,
+			(long)descriptor.layout.stride, (long)descriptor.layout.copy_policy
+		)!!);
+		foreach (&field : descriptor.fields)
 		{
-			if (candidate.name == generic.name && candidate.arity == generic.arity) { record = candidate; break; }
+			mitos::append_length_prefixed_component(&output, field.name);
+			mitos::append_length_prefixed_component(&output, field.type_pattern);
 		}
-		usz method_count = (usz)generic.methods.len();
-		if (!record)
+		if (descriptor.kind == mitos::TypeDescriptorKind.TYPE_DESCRIPTOR_FUNCTION_INSTANCE)
 		{
-			epochs.generics.push({
-				.name = generic.name.copy(epochs.allocator), .arity = generic.arity,
-				.method_count = method_count, .epoch = 1,
+			repl_append_effect_row(&output, &descriptor.function_effects);
+		}
+	}
+	String result = output.copy_str(allocator);
+	output.free();
+	return result;
+}
+
+fn String repl_effect_fingerprint(mitos::DeltaProgram* program, Allocator allocator)
+{
+	DString output;
+	output.init(allocator);
+	foreach (&effect : program.effects.effects)
+	{
+		repl_append_symbol_key(&output, &effect.key);
+		char[64] effect_metadata;
+		output.append_string((String)io::bprintf(
+			&effect_metadata, "%d/%d;", (long)effect.id, effect.multi ? 1L : 0L
+		)!!);
+		foreach (operation_id : effect.operations)
+			output.append_string((String)io::bprintf(
+				&effect_metadata, "%d;", (long)operation_id
+			)!!);
+	}
+	foreach (&operation : program.effects.operations)
+	{
+		repl_append_symbol_key(&output, &operation.key);
+		char[96] operation_metadata;
+		output.append_string((String)io::bprintf(
+			&operation_metadata, "%d/%d/%d/%d;",
+			(long)operation.id, (long)operation.effect,
+			(long)operation.host_kind, operation.ordered ? 1L : 0L
+		)!!);
+		foreach (pattern : operation.parameter_patterns)
+			mitos::append_length_prefixed_component(&output, pattern);
+		mitos::append_length_prefixed_component(&output, operation.result_pattern);
+	}
+	foreach (&instance : program.effects.instances)
+	{
+		repl_append_symbol_key(&output, &instance.key);
+		char[64] instance_metadata;
+		output.append_string((String)io::bprintf(
+			&instance_metadata, "%d/%d:", (long)instance.id, (long)instance.constructor
+		)!!);
+		foreach (argument : instance.arguments)
+			output.append_string((String)io::bprintf(
+				&instance_metadata, "%d,", (long)argument
+			)!!);
+	}
+	foreach (&row : program.effects.rows)
+	{
+		repl_append_symbol_key(&output, &row.key);
+		repl_append_effect_row(&output, &row.inferred);
+		repl_append_effect_row(&output, &row.asserted);
+		output.append_char(row.has_assertion ? '1' : '0');
+	}
+	String result = output.copy_str(allocator);
+	output.free();
+	return result;
+}
+
+fn String repl_generic_fingerprint(
+	mitos::GenericFunction* generic,
+	Allocator allocator
+)
+{
+	DString output;
+	output.init(allocator);
+	repl_append_symbol_key(&output, &generic.key);
+	foreach (&method : generic.methods) repl_append_symbol_key(&output, &method.key);
+	String result = output.copy_str(allocator);
+	output.free();
+	return result;
+}
+
+fn void repl_prepare_epoch_update(
+	ReplEpochUpdate* update,
+	ReplEpochs* epochs,
+	mitos::DeltaProgram* program,
+	mitos::SymbolKey* replaced_generic = null
+)
+{
+	update.init(epochs.allocator);
+	update.type_epoch = epochs.type_epoch;
+	update.effect_epoch = epochs.effect_epoch;
+
+	String type_fingerprint = repl_type_fingerprint(program, epochs.allocator);
+	if (epochs.type_fingerprint != type_fingerprint)
+	{
+		update.type_fingerprint = type_fingerprint;
+		update.commit_type_fingerprint = true;
+		if (epochs.type_fingerprint.len)
+		{
+			(void)repl_advance_epoch(&update.type_epoch);
+		}
+	}
+	else
+	{
+		alloc::free(epochs.allocator, type_fingerprint);
+	}
+	program.types.epoch = update.type_epoch;
+
+	String effect_fingerprint = repl_effect_fingerprint(program, epochs.allocator);
+	if (epochs.effect_fingerprint != effect_fingerprint)
+	{
+		update.effect_fingerprint = effect_fingerprint;
+		update.commit_effect_fingerprint = true;
+		if (epochs.effect_fingerprint.len)
+		{
+			(void)repl_advance_epoch(&update.effect_epoch);
+		}
+	}
+	else
+	{
+		alloc::free(epochs.allocator, effect_fingerprint);
+	}
+	program.effects.epoch = update.effect_epoch;
+	foreach (&row : program.effects.rows) row.effect_epoch = update.effect_epoch;
+
+	foreach (&generic : program.methods.generics)
+	{
+		sz record_index = -1;
+		foreach (index, &candidate : epochs.generics)
+		{
+			if (mitos::symbol_key_equal(&candidate.key, &generic.key))
+			{
+				record_index = index;
+				break;
+			}
+		}
+		String fingerprint = repl_generic_fingerprint(generic, epochs.allocator);
+		if (record_index < 0)
+		{
+			update.generics.push({
+				.record_index = -1,
+				.key = mitos::clone_symbol_key(&generic.key, epochs.allocator),
+				.fingerprint = fingerprint,
+				.epoch = 1,
 			});
-			record = &epochs.generics[epochs.generics.len() - 1];
-			if (epochs.generics.len() > 1) cache.invalidate_generic((usz)generic_index);
+			generic.epoch = 1;
+			continue;
 		}
-		else if (record.method_count != method_count
-			|| (replaced_generic.len && replaced_generic == generic.name && replaced_arity == generic.arity))
+		ReplGenericEpoch* record = &epochs.generics[record_index];
+		if (record.fingerprint != fingerprint
+			|| (replaced_generic
+				&& mitos::symbol_key_equal(replaced_generic, &generic.key)))
 		{
-			record.method_count = method_count;
-			record.epoch++;
-			cache.invalidate_generic((usz)generic_index);
+			ulong epoch = record.epoch;
+			(void)repl_advance_epoch(&epoch);
+			update.generics.push({
+				.record_index = record_index,
+				.fingerprint = fingerprint,
+				.epoch = epoch,
+			});
+			generic.epoch = epoch;
 		}
-		generic.epoch = record.epoch;
+		else
+		{
+			alloc::free(epochs.allocator, fingerprint);
+			generic.epoch = record.epoch;
+		}
 	}
-	if (invalidate_all) cache.invalidate_all();
-	return invalidate_all;
 }
 
 fn void repl_prompt(bool continuation)
@@ -192,36 +415,307 @@ fn void repl_prompt(bool continuation)
 	(void)io::stdout().flush();
 }
 
-fn int repl_block_delta(String line, bool first_line)
+// Keep only the production lexer distinctions that affect entry boundaries.
+// This scanner is incremental: each input byte is visited once and prefixes
+// are never reparsed as a multiline entry grows.
+enum ReplFrameToken : char
 {
-	String trimmed = line.trim();
-	if (trimmed == "end") return -1;
-	if ((trimmed.starts_with("enum ") || trimmed.starts_with("abstract ")
-		|| trimmed.starts_with("type ") || trimmed.starts_with("effect ")
-		|| trimmed.starts_with("multi effect "))
-		&& trimmed.ends_with(":")) return 1;
-	String block = trimmed;
-	sz? definition = trimmed.index_of(":=");
-	if (try position = definition)
+	REPL_FRAME_NONE,
+	REPL_FRAME_IDENTIFIER,
+	REPL_FRAME_KEYWORD,
+	REPL_FRAME_ENUM,
+	REPL_FRAME_DO,
+	REPL_FRAME_MATCH,
+	REPL_FRAME_END,
+	REPL_FRAME_PARALLEL,
+	REPL_FRAME_TYPE,
+	REPL_FRAME_EFFECT,
+	REPL_FRAME_MULTI,
+	REPL_FRAME_HANDLE,
+	REPL_FRAME_LPAREN,
+	REPL_FRAME_COLON,
+	REPL_FRAME_OTHER,
+}
+
+enum ReplFrameKind : char
+{
+	REPL_BLOCK_DECLARATION,
+	REPL_BLOCK_FUNCTION,
+	REPL_BLOCK_DO,
+	REPL_BLOCK_MATCH,
+	REPL_BLOCK_PARALLEL,
+	REPL_BLOCK_HANDLE,
+}
+
+struct ReplFrame
+{
+	ReplFrameKind kind;
+	bool open;
+	bool ready;
+}
+
+const usz MITOS_REPL_MAX_FRAME_DEPTH = 257;
+
+struct ReplFrameState
+{
+	ReplFrame[MITOS_REPL_MAX_FRAME_DEPTH] frames;
+	usz depth;
+	bool valid;
+}
+
+fn bool repl_frame_push(ReplFrameState* state, ReplFrameKind kind, bool ready)
+{
+	if (state.depth >= MITOS_REPL_MAX_FRAME_DEPTH)
 	{
-		block = trimmed[position + 2..].trim();
+		state.valid = false;
+		return false;
 	}
-	sz? arm_body = block.index_of(": ");
-	if (try position = arm_body)
+	state.frames[state.depth++] = { .kind = kind, .ready = ready };
+	return true;
+}
+
+fn ReplFrame* repl_frame_top(ReplFrameState* state)
+{
+	return state.depth ? &state.frames[state.depth - 1] : null;
+}
+
+fn ReplFrameToken repl_frame_identifier_token(String identifier)
+{
+	if (identifier == "enum") return REPL_FRAME_ENUM;
+	if (identifier == "do") return REPL_FRAME_DO;
+	if (identifier == "match") return REPL_FRAME_MATCH;
+	if (identifier == "end") return REPL_FRAME_END;
+	if (identifier == "parallel") return REPL_FRAME_PARALLEL;
+	if (identifier == "type") return REPL_FRAME_TYPE;
+	if (identifier == "effect") return REPL_FRAME_EFFECT;
+	if (identifier == "multi") return REPL_FRAME_MULTI;
+	if (identifier == "handle") return REPL_FRAME_HANDLE;
+	if (identifier == "of" || identifier == "is" || identifier == "abstract"
+		|| identifier == "does" || identifier == "resume" || identifier == "return"
+		|| identifier == "where") return REPL_FRAME_KEYWORD;
+	return REPL_FRAME_IDENTIFIER;
+}
+
+fn void repl_frame_accept_token(
+	ReplFrameState* state,
+	ReplFrameToken token,
+	ReplFrameToken first,
+	usz token_index,
+	bool first_line
+)
+{
+	if (!state.valid) return;
+	ReplFrame* top = repl_frame_top(state);
+	if (top && !top.open && !top.ready)
 	{
-		block = block[position + 2..].trim();
+		if (top.kind == REPL_BLOCK_DO)
+		{
+			if (token != REPL_FRAME_LPAREN)
+			{
+				state.depth--;
+			}
+			else
+			{
+				top.ready = true;
+			}
+		}
+		else if (top.kind == REPL_BLOCK_PARALLEL)
+		{
+			if (token == REPL_FRAME_COLON)
+			{
+				top.ready = true;
+				top.open = true;
+				return;
+			}
+			state.depth--;
+		}
+		else if (top.kind == REPL_BLOCK_HANDLE || top.kind == REPL_BLOCK_MATCH)
+		{
+			if (token == REPL_FRAME_COLON || token == REPL_FRAME_END)
+			{
+				state.valid = false;
+				return;
+			}
+			top.ready = true;
+		}
 	}
-	if (block.starts_with("match ") && block.ends_with(":")) return 1;
-	if (block == "parallel:") return 1;
-	if (block.starts_with("do(") && block.ends_with(":")) return 1;
-	if (first_line && trimmed.ends_with(":") && trimmed.contains("(")) return 1;
-	return 0;
+
+	if (first_line && token_index == 0)
+	{
+		if (token == REPL_FRAME_ENUM || token == REPL_FRAME_TYPE
+			|| token == REPL_FRAME_EFFECT)
+		{
+			if (!repl_frame_push(state, REPL_BLOCK_DECLARATION, true)) return;
+		}
+	}
+	else if (first_line && token_index == 1)
+	{
+		if (first == REPL_FRAME_MULTI && token == REPL_FRAME_EFFECT)
+		{
+			if (!repl_frame_push(state, REPL_BLOCK_DECLARATION, true)) return;
+		}
+		else if (first == REPL_FRAME_IDENTIFIER && token == REPL_FRAME_LPAREN)
+		{
+			if (!repl_frame_push(state, REPL_BLOCK_FUNCTION, true)) return;
+		}
+	}
+
+	if (token == REPL_FRAME_END)
+	{
+		top = repl_frame_top(state);
+		if (top && !top.open)
+		{
+			state.valid = false;
+			return;
+		}
+		if (top) state.depth--;
+		return;
+	}
+	if (token == REPL_FRAME_COLON)
+	{
+		top = repl_frame_top(state);
+		if (top && !top.open)
+		{
+			if (!top.ready)
+			{
+				state.valid = false;
+				return;
+			}
+			top.open = true;
+		}
+		return;
+	}
+	if (token == REPL_FRAME_DO)
+	{
+		(void)repl_frame_push(state, REPL_BLOCK_DO, false);
+	}
+	else if (token == REPL_FRAME_MATCH)
+	{
+		(void)repl_frame_push(state, REPL_BLOCK_MATCH, false);
+	}
+	else if (token == REPL_FRAME_PARALLEL)
+	{
+		(void)repl_frame_push(state, REPL_BLOCK_PARALLEL, false);
+	}
+	else if (token == REPL_FRAME_HANDLE)
+	{
+		(void)repl_frame_push(state, REPL_BLOCK_HANDLE, false);
+	}
+}
+
+fn bool repl_frame_scan_line(ReplFrameState* state, String line, bool first_line)
+{
+	usz index = 0;
+	usz token_index = 0;
+	ReplFrameToken first = REPL_FRAME_NONE;
+	while (index < line.len)
+	{
+		char character = line[index];
+		if (character == ' ' || character == '\t' || character == '\f'
+			|| character == '\v' || character == '\r' || character == '\n')
+		{
+			index++;
+			continue;
+		}
+		if (character == '/' && index + 1 < line.len && line[index + 1] == '/')
+		{
+			break;
+		}
+
+		ReplFrameToken token = REPL_FRAME_OTHER;
+		if (character == '"')
+		{
+			index++;
+			bool closed = false;
+			while (index < line.len)
+			{
+				character = line[index++];
+				if (character == '\\')
+				{
+					if (index >= line.len) break;
+					index++;
+				}
+				else if (character == '"')
+				{
+					closed = true;
+					break;
+				}
+			}
+			if (!closed) return false;
+		}
+		else if (character == '_' || (character >= 'a' && character <= 'z')
+			|| (character >= 'A' && character <= 'Z'))
+		{
+			usz start = index++;
+			while (index < line.len)
+			{
+				character = line[index];
+				if (character != '_' && !(character >= 'a' && character <= 'z')
+					&& !(character >= 'A' && character <= 'Z')
+					&& !(character >= '0' && character <= '9')) break;
+				index++;
+			}
+			token = repl_frame_identifier_token(line[start:index - start]);
+		}
+		else if (character >= '0' && character <= '9')
+		{
+			do { index++; } while (index < line.len && line[index] >= '0' && line[index] <= '9');
+		}
+		else
+		{
+			if (character == '(')
+			{
+				token = REPL_FRAME_LPAREN;
+			}
+			else if (character == ':')
+			{
+				if (index + 1 < line.len && (line[index + 1] == '=' || line[index + 1] == ':'))
+				{
+					index++;
+				}
+				else
+				{
+					token = REPL_FRAME_COLON;
+				}
+			}
+			else if (character == '<' && index + 1 < line.len
+				&& (line[index + 1] == '=' || line[index + 1] == ':'))
+			{
+				index++;
+			}
+			else if (character == '>' && index + 1 < line.len && line[index + 1] == '=')
+			{
+				index++;
+			}
+			else if (character != '+' && character != '-' && character != '*'
+				&& character != '/' && character != '%' && character != '='
+				&& character != '<' && character != '>' && character != ','
+				&& character != ')' && character != '.' && character != '['
+				&& character != ']' && character != '|')
+			{
+				return false;
+			}
+			index++;
+		}
+		if (token_index == 0) first = token;
+		repl_frame_accept_token(state, token, first, token_index, first_line);
+		if (!state.valid) return false;
+		token_index++;
+	}
+
+	ReplFrame* top = repl_frame_top(state);
+	while (top && !top.open)
+	{
+		state.depth--;
+		top = repl_frame_top(state);
+	}
+	return true;
 }
 
 fn MitosReplRead repl_read_entry(DString* entry)
 {
 	entry.clear();
-	int balance = 0;
+	ReplFrameState framing = { .valid = true };
 	bool first_line = true;
 	for (;;)
 	{
@@ -248,19 +742,24 @@ fn MitosReplRead repl_read_entry(DString* entry)
 		}
 		entry.append_string(line);
 		entry.append_char('\n');
-		balance += repl_block_delta(line, first_line);
+		bool framed = repl_frame_scan_line(&framing, line, first_line);
 		first_line = false;
-		if (balance <= 0) return REPL_ENTRY;
+		if (!framed || framing.depth == 0) return REPL_ENTRY;
 	}
+}
+
+fn void repl_print_diagnostic(String message, mitos::MitosSpan span = { })
+{
+	usz row = span.start.row > 0 ? (usz)span.start.row : 1;
+	usz column = span.start.column > 0 ? (usz)span.start.column : 1;
+	io::eprintfn("<repl>:%d:%d: %s", (long)row, (long)column, message);
 }
 
 fn void repl_print_diagnostics(mitos::MitosDiagnostic[] diagnostics)
 {
 	foreach (&diagnostic : diagnostics)
 	{
-		usz row = diagnostic.span.start.row > 0 ? (usz)diagnostic.span.start.row : 1;
-		usz column = diagnostic.span.start.column > 0 ? (usz)diagnostic.span.start.column : 1;
-		io::eprintfn("<repl>:%d:%d: %s", (long)row, (long)column, diagnostic.message);
+		repl_print_diagnostic(diagnostic.message, diagnostic.span);
 	}
 }
 
@@ -268,28 +767,35 @@ fn bool repl_delta_jit(
 	String source,
 	bool print_value,
 	ReplEpochs* epochs,
-	mitos_specialization::SpecializationCache* cache,
-	String replaced_generic = "",
-	usz replaced_arity = 0
+	mitos_mir::MirRuntime* mir_runtime,
+	mitos::SymbolKey* replaced_generic = null
 )
 {
-	mitos::MitosParseResult parsed = mitos::parse_program(source, mem);
+	mitos::MitosParseResult parsed = mitos::parse_program(
+		source, mem, &epochs.module_key
+	);
 	defer parsed.deinit();
 	if (!parsed.ok()) { repl_print_diagnostics(parsed.diagnostics); return false; }
 	mitos::DeltaProgramBuildResult lowered = mitos::lower_delta_program(&parsed.program, mem);
 	defer lowered.deinit();
 	if (!lowered.ok()) { repl_print_diagnostics(lowered.diagnostics); return false; }
-	(void)repl_update_epochs(epochs, &lowered.program, cache, replaced_generic, replaced_arity);
-	mitos_jit::MitosJitResult native = mitos_jit::jit_delta_program(&lowered.program, cache, mem);
+	ReplEpochUpdate update;
+	repl_prepare_epoch_update(
+		&update, epochs, &lowered.program, replaced_generic
+	);
+	defer update.deinit();
+	mitos_jit::MitosJitResult native = mitos_jit::jit_delta_program(
+		&lowered.program, mem, mir_runtime
+	);
 	defer native.free();
 	if (native.status != NATIVE)
 	{
 		String message = native.diagnostic.len ? native.diagnostic : "MIR Delta JIT failed without a diagnostic";
-		io::eprintfn("<repl>:1:1: %s", message);
-		cache.invalidate_all();
+		repl_print_diagnostic(message, native.diagnostic_span);
 		return false;
 	}
 	if (print_value) io::printn(native.result);
+	update.commit(epochs);
 	return true;
 }
 
@@ -305,70 +811,36 @@ fn void repl_append_indented(DString* destination, String source)
 	if (!source.len || source[source.len - 1] != '\n') destination.append_char('\n');
 }
 
-fn usz repl_signature_variable(List{String}* variables, String name)
-{
-	foreach (index, variable : *variables) if (variable == name) return (usz)index;
-	variables.push(name);
-	return (usz)variables.len() - 1;
-}
 
-fn void repl_append_signature_type(DString* signature, mitos::TypeExpr* expression, List{String}* variables)
+fn bool repl_method_identity(
+	String entry,
+	mitos::ModuleKey* source_module,
+	mitos::SymbolKey* method_key,
+	mitos::SymbolKey* generic_key
+)
 {
-	if (!expression)
-	{
-		signature.append_string("Any");
-		return;
-	}
-	if (expression.kind == mitos::TypeExprKind.TYPE_EXPR_NAMED && expression.name.len == 1
-		&& expression.name[0] >= 'A' && expression.name[0] <= 'Z')
-	{
-		char[32] buffer;
-		usz variable = repl_signature_variable(variables, expression.name);
-		signature.append_string((String)io::bprintf(&buffer, "$%d", (long)variable)!!);
-		return;
-	}
-	signature.append_string(expression.name);
-	if (expression.kind != mitos::TypeExprKind.TYPE_EXPR_APPLICATION) return;
-	signature.append_char('<');
-	foreach (index, &argument : expression.arguments)
-	{
-		if (index) signature.append_char(',');
-		repl_append_signature_type(signature, argument.value, variables);
-	}
-	signature.append_char('>');
-}
-
-fn bool repl_method_identity(String entry, String* signature, String* generic_name, usz* arity)
-{
-	mitos::MitosParseResult parsed = mitos::parse_program(entry, mem);
+	mitos::MitosParseResult parsed = mitos::parse_program(entry, mem, source_module);
 	defer parsed.deinit();
-	if (!parsed.ok() || parsed.program.functions.len != 1) return false;
+	bool standalone_method = parsed.diagnostics.len == 1
+		&& parsed.diagnostics[0].message == "program must declare main";
+	if ((!parsed.ok() && !standalone_method)
+		|| parsed.program.functions.len != 1) return false;
 	mitos::FunctionDecl* method = &parsed.program.functions[0];
-	DString key;
-	key.init(mem);
-	defer key.free();
-	List{String} variables;
-	variables.init(mem);
-	defer variables.free();
-	key.append_string(method.name);
-	key.append_char('(');
-	foreach (index, &annotation : method.parameter_annotations)
-	{
-		if (index) key.append_char(',');
-		repl_append_signature_type(&key, annotation.value, &variables);
-	}
-	key.append_char(')');
-	*signature = key.copy_str(mem);
-	*generic_name = method.name.copy(mem);
-	*arity = (usz)method.parameters.len;
+	if (!mitos::symbol_key_is_canonical(&method.key)
+		|| !mitos::symbol_key_is_canonical(&method.generic_key)) return false;
+	*method_key = mitos::clone_symbol_key(&method.key, mem);
+	*generic_key = mitos::clone_symbol_key(&method.generic_key, mem);
 	return true;
 }
 
-fn sz repl_replacement_index(List{ReplDeclaration}* declarations, String signature)
+fn sz repl_replacement_index(
+	List{ReplDeclaration}* declarations,
+	mitos::SymbolKey* method_key
+)
 {
-	if (!signature.len) return -1;
+	if (!mitos::symbol_key_is_canonical(method_key)) return -1;
 	foreach (index, &declaration : *declarations)
-		if (declaration.method_signature == signature) return index;
+		if (mitos::symbol_key_equal(&declaration.method_key, method_key)) return index;
 	return -1;
 }
 
@@ -383,10 +855,13 @@ fn void repl_append_declarations(DString* destination, List{ReplDeclaration}* de
 
 fn bool repl_binding(String entry, String* name)
 {
-	sz? delimiter_result = entry.index_of(":=");
+	String first = entry;
+	sz? newline = entry.index_of_char('\n');
+	if (try position = newline) first = entry[:position];
+	sz? delimiter_result = first.index_of(":=");
 	if (catch err = delimiter_result) { (void)err; return false; }
 	sz delimiter = delimiter_result;
-	String candidate = entry[:delimiter].trim();
+	String candidate = first[:delimiter].trim();
 	if (!candidate.len) return false;
 	usz identifier_end = 0;
 	foreach (index, character : candidate)
@@ -409,21 +884,93 @@ fn bool repl_binding(String entry, String* name)
 	return true;
 }
 
+fn String repl_line_code(String line)
+{
+	bool quoted = false;
+	bool escaped = false;
+	foreach (index, character : line)
+	{
+		if (quoted)
+		{
+			if (escaped)
+			{
+				escaped = false;
+			}
+			else if (character == '\\')
+			{
+				escaped = true;
+			}
+			else if (character == '"')
+			{
+				quoted = false;
+			}
+			continue;
+		}
+		if (character == '"')
+		{
+			quoted = true;
+			continue;
+		}
+		if (character == '/' && index + 1 < line.len && line[index + 1] == '/')
+		{
+			return line[:index];
+		}
+	}
+	return line;
+}
+
+fn bool repl_keyword_prefix(String source, String keyword)
+{
+	if (!source.starts_with(keyword)) return false;
+	if (source.len == keyword.len) return true;
+	char next = source[keyword.len];
+	return next != '_' && !(next >= 'a' && next <= 'z')
+		&& !(next >= 'A' && next <= 'Z') && !(next >= '0' && next <= '9');
+}
+
+fn bool repl_is_function_header(String source)
+{
+	if (!source.ends_with(":") || !source.len) return false;
+	usz index = 0;
+	char character = source[index];
+	if (character != '_' && !(character >= 'a' && character <= 'z')
+		&& !(character >= 'A' && character <= 'Z')) return false;
+	do
+	{
+		index++;
+		if (index >= source.len) return false;
+		character = source[index];
+	} while (character == '_' || (character >= 'a' && character <= 'z')
+		|| (character >= 'A' && character <= 'Z')
+		|| (character >= '0' && character <= '9'));
+	while (index < source.len && (source[index] == ' ' || source[index] == '\t'
+		|| source[index] == '\f' || source[index] == '\v' || source[index] == '\r'))
+	{
+		index++;
+	}
+	return index < source.len && source[index] == '(';
+}
+
 fn bool repl_is_declaration(String entry)
 {
 	String first = entry;
 	sz? newline = entry.index_of_char('\n');
-	if (try position = newline)
+	if (try position = newline) first = entry[:position];
+	first = repl_line_code(first).trim();
+	if (repl_keyword_prefix(first, "abstract") || repl_keyword_prefix(first, "type"))
 	{
-		first = entry[:position];
+		return true;
 	}
-	first = first.trim();
-	if (first.starts_with("abstract ") || first.starts_with("type ")) return true;
-	if ((first.starts_with("enum ") || first.starts_with("effect ")
-		|| first.starts_with("multi effect ")) && first.ends_with(":")) return true;
-	return first.ends_with(":") && first.contains("(")
-		&& !first.starts_with("match ") && !first.starts_with("handle ")
-		&& !first.starts_with("do(");
+	if (repl_keyword_prefix(first, "enum") || repl_keyword_prefix(first, "effect"))
+	{
+		return first.ends_with(":");
+	}
+	if (repl_keyword_prefix(first, "multi"))
+	{
+		String remainder = first[5..].trim();
+		return repl_keyword_prefix(remainder, "effect") && first.ends_with(":");
+	}
+	return repl_is_function_header(first);
 }
 
 fn bool repl_build_and_jit(
@@ -434,10 +981,9 @@ fn bool repl_build_and_jit(
 	String binding_name,
 	bool declaration,
 	sz replacement,
-	String replaced_generic,
-	usz replaced_arity,
+	mitos::SymbolKey* replaced_generic,
 	ReplEpochs* epochs,
-	mitos_specialization::SpecializationCache* cache
+	mitos_mir::MirRuntime* mir_runtime
 )
 {
 	scratch.clear();
@@ -461,22 +1007,22 @@ fn bool repl_build_and_jit(
 	}
 	if (declaration)
 	{
-		if (replaced_generic != "main" || replaced_arity != 0)
+		if (!replaced_generic || replaced_generic.name != "main" || replaced_generic.arity != 0)
 		{
 			scratch.append_string("main():\n  0\nend\n");
 		}
 		return repl_delta_jit(
-			scratch.str_view(), false, epochs, cache,
-			replacement >= 0 ? replaced_generic : "", replaced_arity
+			scratch.str_view(), false, epochs, mir_runtime,
+			replacement >= 0 ? replaced_generic : null
 		);
 	}
 	scratch.append_string("main():\n"); scratch.append_string(bindings.str_view());
 	repl_append_indented(scratch, entry);
 	if (binding_name.len) { scratch.append_string("  "); scratch.append_string(binding_name); scratch.append_char('\n'); }
 	scratch.append_string("end\n");
-	bool succeeded = repl_delta_jit(scratch.str_view(), true, epochs, cache, "main", 0);
-	if (succeeded && !binding_name.len) cache.invalidate_all();
-	return succeeded;
+	return repl_delta_jit(
+		scratch.str_view(), true, epochs, mir_runtime
+	);
 }
 
 fn int run_mitos_repl()
@@ -488,7 +1034,13 @@ fn int run_mitos_repl()
 	bindings.init(mem); entry.init(mem); scratch.init(mem);
 	defer bindings.free(); defer entry.free(); defer scratch.free();
 	ReplEpochs epochs; epochs.init(mem); defer epochs.deinit();
-	mitos_specialization::SpecializationCache cache; cache.init(mem); defer cache.deinit();
+	mitos_mir::MirRuntime mir_runtime; mir_runtime.init();
+	defer (void)mir_runtime.free();
+	if (!mir_runtime.ready())
+	{
+		io::eprintn("<repl>:1:1: MIR runtime initialization failed");
+		return 1;
+	}
 	for (;;)
 	{
 		MitosReplRead read_status = repl_read_entry(&entry);
@@ -501,18 +1053,20 @@ fn int run_mitos_repl()
 		if (trimmed == ":clear")
 		{
 			repl_clear_declarations(&declarations, mem);
-			bindings.clear(); epochs.clear(); cache.invalidate_all(); continue;
+			bindings.clear(); epochs.clear(); continue;
 		}
 		if (trimmed.starts_with(":")) { io::eprintfn("<repl>:1:1: unknown command '%s'", trimmed); continue; }
-		bool declaration = repl_is_declaration(source); String binding_name;
-		if (!declaration) (void)repl_binding(source, &binding_name);
-		String method_signature;
-		String generic_name;
-		usz generic_arity = 0;
-		if (declaration) (void)repl_method_identity(source, &method_signature, &generic_name, &generic_arity);
-		defer alloc::free(mem, method_signature);
-		defer alloc::free(mem, generic_name);
-		sz replacement = repl_replacement_index(&declarations, method_signature);
+		String binding_name;
+		bool binding = repl_binding(source, &binding_name);
+		bool declaration = !binding && repl_is_declaration(source);
+		mitos::SymbolKey method_key;
+		mitos::SymbolKey generic_key;
+		if (declaration) (void)repl_method_identity(
+			source, &epochs.module_key, &method_key, &generic_key
+		);
+		defer method_key.deinit(mem);
+		defer generic_key.deinit(mem);
+		sz replacement = repl_replacement_index(&declarations, &method_key);
 		usz declarations_size = repl_declarations_size(&declarations);
 		if (replacement >= 0) declarations_size -= declarations[replacement].source.len + 1;
 		usz projected = declarations_size + bindings.str_view().len + source.len + 32;
@@ -520,13 +1074,13 @@ fn int run_mitos_repl()
 		{ io::eprintn("<repl>:1:1: accumulated source exceeds the 16 MiB limit; use :clear"); continue; }
 		if (!repl_build_and_jit(
 			&scratch, &declarations, &bindings, source, binding_name, declaration,
-			replacement, generic_name, generic_arity, &epochs, &cache
+			replacement, &generic_key, &epochs, &mir_runtime
 		)) continue;
 		if (declaration)
 		{
 			ReplDeclaration retained = {
 				.source = source.copy(mem),
-				.method_signature = method_signature.copy(mem),
+				.method_key = mitos::clone_symbol_key(&method_key, mem),
 			};
 			if (replacement >= 0)
 			{

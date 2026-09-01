@@ -8,6 +8,7 @@ import std::io;
 const usz MITOS_MAX_EXPRESSION_DEPTH = 256;
 const usz MITOS_MAX_TYPE_DEPTH = 256;
 const sz MITOS_MAX_TOKENS = 100_000;
+const sz MITOS_MAX_LEXER_MATCHES = MITOS_MAX_TOKENS * 2;
 const sz MITOS_MAX_TOP_LEVEL_DECLARATIONS = 2_048;
 const sz MITOS_MAX_PARAMETERS = 256;
 const sz MITOS_MAX_TYPE_ARGUMENTS = 256;
@@ -97,6 +98,99 @@ fn SourcePos mitos_source_end(String source) @private
 	return position;
 }
 
+fn void mitos_advance_source_position(SourcePos* position, String text) @private
+{
+	foreach (character : text)
+	{
+		position.offset++;
+		if (character == '\n')
+		{
+			position.row++;
+			position.column = 1;
+		}
+		else
+		{
+			position.column++;
+		}
+	}
+}
+
+fn LexResult mitos_lex_bounded(
+	Lexer* lexer,
+	String input,
+	sz max_tokens,
+	sz max_matches
+) @private
+{
+	LexResult result;
+	result.allocator = lexer.allocator;
+	result.tokens.init(lexer.allocator);
+	result.diagnostics.init(lexer.allocator);
+	SourcePos position = { .offset = 0, .row = 1, .column = 1 };
+	sz matched_count;
+	while ((usz)position.offset < input.len)
+	{
+		if (matched_count >= max_matches)
+		{
+			Diagnostic diagnostic;
+			diagnostic.init(
+				lexer.allocator, "source cannot contain more than 200000 lexer matches",
+				{ .start = position, .end = position }
+			);
+			result.diagnostics.push(diagnostic);
+			return result;
+		}
+		usz offset = (usz)position.offset;
+		String remaining = input[offset:input.len - offset];
+		sz best_rule = -1;
+		sz best_length = 0;
+		for (sz index = 0; index < lexer.rules.len(); index++)
+		{
+			sz consumed = 0;
+			if (mpc::match_prefix(lexer.rules[index].parser, remaining, &consumed)
+				&& consumed > best_length)
+			{
+				best_rule = index;
+				best_length = consumed;
+			}
+		}
+		if (best_rule < 0)
+		{
+			SourcePos start = position;
+			mitos_advance_source_position(&position, input[offset:1]);
+			Diagnostic diagnostic;
+			diagnostic.init(
+				lexer.allocator, "no lexer rule matches this input",
+				{ .start = start, .end = position }
+			);
+			result.diagnostics.push(diagnostic);
+			return result;
+		}
+		SourcePos start = position;
+		String text = input[offset:(usz)best_length];
+		mitos_advance_source_position(&position, text);
+		matched_count++;
+		CompiledLexerRule* rule = &lexer.rules[(usz)best_rule];
+		if (rule.ignored) continue;
+		if (result.tokens.len() >= max_tokens)
+		{
+			Diagnostic diagnostic;
+			diagnostic.init(
+				lexer.allocator, "source cannot contain more than 100000 tokens",
+				{ .start = start, .end = position }
+			);
+			result.diagnostics.push(diagnostic);
+			return result;
+		}
+		result.tokens.push({
+			.kind = rule.kind,
+			.text = text,
+			.span = { .start = start, .end = position },
+		});
+	}
+	return result;
+}
+
 fn MitosSpan mitos_current_span(MitosSourceParser* parser) @private
 {
 	Token* token = parser.cursor.peek();
@@ -134,6 +228,17 @@ fn void mitos_free_expression(Allocator allocator, SurfaceExpr* expression) @pri
 	if (!expression) return;
 	expression.deinit(allocator);
 	alloc::free(allocator, expression);
+}
+
+fn bool mitos_check_expression_height(
+	MitosSourceParser* parser,
+	usz child_height,
+	MitosSpan span
+) @private
+{
+	if (child_height < MITOS_MAX_EXPRESSION_DEPTH) return true;
+	mitos_add_error(parser, "expression structure exceeds the maximum height of 256", span);
+	return false;
 }
 
 fn void mitos_free_expressions(Allocator allocator, List{SurfaceExpr*}* expressions) @private
@@ -192,6 +297,7 @@ fn SurfaceExpr* mitos_new_variable(MitosSourceParser* parser, Token* token) @pri
 {
 	return alloc::new(parser.allocator, SurfaceExpr, {
 		.kind = SURFACE_VARIABLE,
+		.structural_height = 1,
 		.span = mitos_span(token.span),
 		.data = { .variable = { .name = token.text.copy(parser.allocator) } },
 	});
@@ -212,6 +318,7 @@ fn SurfaceExpr* mitos_new_integer(MitosSourceParser* parser, Token* token) @priv
 	}
 	return alloc::new(parser.allocator, SurfaceExpr, {
 		.kind = SURFACE_INTEGER,
+		.structural_height = 1,
 		.span = mitos_span(token.span),
 		.data = { .integer = { .value = (long)value } },
 	});
@@ -285,6 +392,7 @@ fn SurfaceExpr* mitos_new_string(MitosSourceParser* parser, Token* token) @priva
 	}
 	return alloc::new(parser.allocator, SurfaceExpr, {
 		.kind = SURFACE_STRING,
+		.structural_height = 1,
 		.span = span,
 		.data = { .string = { .value = decoded.copy_str(parser.allocator) } },
 	});
@@ -292,11 +400,24 @@ fn SurfaceExpr* mitos_new_string(MitosSourceParser* parser, Token* token) @priva
 
 fn SurfaceExpr* mitos_new_application(MitosSourceParser* parser, SurfaceExpr* callee, List{SurfaceExpr*}* arguments, SourcePos end) @private
 {
+	usz child_height = callee.structural_height;
+	foreach (argument : *arguments)
+	{
+		if (argument.structural_height > child_height) child_height = argument.structural_height;
+	}
+	MitosSpan span = { .start = callee.span.start, .end = mitos_position(end) };
+	if (!mitos_check_expression_height(parser, child_height, span))
+	{
+		mitos_free_expression(parser.allocator, callee);
+		mitos_free_expressions(parser.allocator, arguments);
+		return null;
+	}
 	SurfaceExpr*[] owned_arguments = arguments.to_array(parser.allocator);
 	arguments.free();
 	return alloc::new(parser.allocator, SurfaceExpr, {
 		.kind = SURFACE_APPLICATION,
-		.span = { .start = callee.span.start, .end = mitos_position(end) },
+		.span = span,
+		.structural_height = child_height + 1,
 		.data = { .application = { .callee = callee, .arguments = owned_arguments } },
 	});
 }
@@ -656,13 +777,24 @@ fn SurfaceExpr* mitos_parse_lambda(MitosSourceParser* parser) @private
 		mitos_free_expression(parser.allocator, body);
 		return null;
 	}
+	MitosSpan span = mitos_span_between(start.span.start, end.span.end);
+	if (!mitos_check_expression_height(parser, body.structural_height, span))
+	{
+		mitos_free_names(parser.allocator, &parameters);
+		mitos_free_annotations(parser.allocator, &annotations);
+		result.deinit(parser.allocator);
+		if (effect_row) { effect_row.deinit(parser.allocator); alloc::free(parser.allocator, effect_row); }
+		mitos_free_expression(parser.allocator, body);
+		return null;
+	}
 	String[] owned_parameters = parameters.to_array(parser.allocator);
 	TypeAnnotation[] owned_annotations = annotations.to_array(parser.allocator);
 	parameters.free();
 	annotations.free();
 	return alloc::new(parser.allocator, SurfaceExpr, {
 		.kind = SURFACE_LAMBDA,
-		.span = mitos_span_between(start.span.start, end.span.end),
+		.span = span,
+		.structural_height = body.structural_height + 1,
 		.data = { .lambda = {
 			.parameters = owned_parameters,
 			.parameter_annotations = owned_annotations,
@@ -814,11 +946,24 @@ fn SurfaceExpr* mitos_parse_match(MitosSourceParser* parser) @private
 		return null;
 	}
 	Token* end = parser.cursor.advance();
+	usz child_height = scrutinee.structural_height;
+	foreach (&arm : arms)
+	{
+		if (arm.body.structural_height > child_height) child_height = arm.body.structural_height;
+	}
+	MitosSpan span = mitos_span_between(start.span.start, end.span.end);
+	if (!mitos_check_expression_height(parser, child_height, span))
+	{
+		mitos_free_expression(parser.allocator, scrutinee);
+		mitos_free_match_arms(parser.allocator, &arms);
+		return null;
+	}
 	MatchArm[] owned_arms = arms.to_array(parser.allocator);
 	arms.free();
 	return alloc::new(parser.allocator, SurfaceExpr, {
 		.kind = SURFACE_MATCH,
-		.span = mitos_span_between(start.span.start, end.span.end),
+		.span = span,
+		.structural_height = child_height + 1,
 		.data = { .match_expr = { .scrutinee = scrutinee, .arms = owned_arms } },
 	});
 }
@@ -949,11 +1094,24 @@ fn SurfaceExpr* mitos_parse_parallel(MitosSourceParser* parser) @private
 		return null;
 	}
 	Token* end = parser.cursor.advance();
+	usz child_height = result.structural_height;
+	foreach (&binding : bindings)
+	{
+		if (binding.value.structural_height > child_height) child_height = binding.value.structural_height;
+	}
+	MitosSpan span = mitos_span_between(start.span.start, end.span.end);
+	if (!mitos_check_expression_height(parser, child_height, span))
+	{
+		mitos_free_expression(parser.allocator, result);
+		mitos_free_parallel_bindings(parser.allocator, &bindings);
+		return null;
+	}
 	ParallelBinding[] owned_bindings = bindings.to_array(parser.allocator);
 	bindings.free();
 	return alloc::new(parser.allocator, SurfaceExpr, {
 		.kind = SURFACE_PARALLEL,
-		.span = mitos_span_between(start.span.start, end.span.end),
+		.span = span,
+		.structural_height = child_height + 1,
 		.data = { .parallel = { .bindings = owned_bindings, .result = result } },
 	});
 }
@@ -1136,11 +1294,31 @@ fn SurfaceExpr* mitos_parse_handler(MitosSourceParser* parser) @private
 		return null;
 	}
 	Token* end = parser.cursor.advance();
+	usz child_height = handled.structural_height;
+	if (return_clause.body.structural_height > child_height)
+	{
+		child_height = return_clause.body.structural_height;
+	}
+	foreach (&clause : clauses)
+	{
+		if (clause.body.structural_height > child_height) child_height = clause.body.structural_height;
+	}
+	MitosSpan span = mitos_span_between(start.span.start, end.span.end);
+	if (!mitos_check_expression_height(parser, child_height, span))
+	{
+		alloc::free(parser.allocator, return_clause.parameter);
+		return_clause.annotation.deinit(parser.allocator);
+		mitos_free_expression(parser.allocator, return_clause.body);
+		mitos_free_handler_clauses(parser.allocator, &clauses);
+		mitos_free_expression(parser.allocator, handled);
+		return null;
+	}
 	HandlerClause[] owned_clauses = clauses.to_array(parser.allocator);
 	clauses.free();
 	return alloc::new(parser.allocator, SurfaceExpr, {
 		.kind = SURFACE_HANDLER,
-		.span = mitos_span_between(start.span.start, end.span.end),
+		.span = span,
+		.structural_height = child_height + 1,
 		.data = { .handler = {
 			.handled = handled,
 			.clauses = owned_clauses,
@@ -1167,9 +1345,16 @@ fn SurfaceExpr* mitos_parse_resume(MitosSourceParser* parser) @private
 		mitos_free_expression(parser.allocator, value);
 		return null;
 	}
+	MitosSpan span = mitos_span_between(start.span.start, close.span.end);
+	if (!mitos_check_expression_height(parser, value.structural_height, span))
+	{
+		mitos_free_expression(parser.allocator, value);
+		return null;
+	}
 	return alloc::new(parser.allocator, SurfaceExpr, {
 		.kind = SURFACE_RESUME,
-		.span = mitos_span_between(start.span.start, close.span.end),
+		.span = span,
+		.structural_height = value.structural_height + 1,
 		.data = { .resume = { .value = value } },
 	});
 }
@@ -1208,11 +1393,23 @@ fn SurfaceExpr* mitos_parse_effect_operation(MitosSourceParser* parser) @private
 		mitos_free_expressions(parser.allocator, &arguments);
 		return null;
 	}
+	usz child_height = 0;
+	foreach (argument : arguments)
+	{
+		if (argument.structural_height > child_height) child_height = argument.structural_height;
+	}
+	MitosSpan span = mitos_span_between(effect.span.start, close.span.end);
+	if (!mitos_check_expression_height(parser, child_height, span))
+	{
+		mitos_free_expressions(parser.allocator, &arguments);
+		return null;
+	}
 	SurfaceExpr*[] owned_arguments = arguments.to_array(parser.allocator);
 	arguments.free();
 	return alloc::new(parser.allocator, SurfaceExpr, {
 		.kind = SURFACE_EFFECT_OPERATION,
-		.span = mitos_span_between(effect.span.start, close.span.end),
+		.span = span,
+		.structural_height = child_height + 1,
 		.data = { .effect_operation = {
 			.effect_name = effect.text.copy(parser.allocator),
 			.operation_name = operation.text.copy(parser.allocator),
@@ -1325,6 +1522,7 @@ fn SurfaceExpr* mitos_parse_parenthesized_calls(MitosSourceParser* parser, Surfa
 			return null;
 		}
 		callee = mitos_new_application(parser, callee, &arguments, end.span.end);
+		if (!callee) return null;
 	}
 	return callee;
 }
@@ -1379,6 +1577,7 @@ fn SurfaceExpr* mitos_parse_expression(MitosSourceParser* parser, int minimum_pr
 			parser.cursor.advance();
 			left = alloc::new(parser.allocator, SurfaceExpr, {
 				.kind = SURFACE_INTEGER,
+				.structural_height = 1,
 				.span = mitos_span_between(minus.span.start, magnitude.span.end),
 				.data = { .integer = { .value = long::min } },
 			});
@@ -1389,12 +1588,21 @@ fn SurfaceExpr* mitos_parse_expression(MitosSourceParser* parser, int minimum_pr
 			if (!right) return null;
 			SurfaceExpr* zero = alloc::new(parser.allocator, SurfaceExpr, {
 				.kind = SURFACE_INTEGER,
+				.structural_height = 1,
 				.span = mitos_span(minus.span),
 				.data = { .integer = { .value = 0 } },
 			});
+			MitosSpan span = { .start = mitos_position(minus.span.start), .end = right.span.end };
+			if (!mitos_check_expression_height(parser, right.structural_height, span))
+			{
+				mitos_free_expression(parser.allocator, zero);
+				mitos_free_expression(parser.allocator, right);
+				return null;
+			}
 			left = alloc::new(parser.allocator, SurfaceExpr, {
 				.kind = SURFACE_BINARY,
-				.span = { .start = mitos_position(minus.span.start), .end = right.span.end },
+				.span = span,
+				.structural_height = right.structural_height + 1,
 				.data = { .binary = { .operator = BINARY_SUBTRACT, .left = zero, .right = right } },
 			});
 		}
@@ -1416,9 +1624,19 @@ fn SurfaceExpr* mitos_parse_expression(MitosSourceParser* parser, int minimum_pr
 			mitos_free_expression(parser.allocator, left);
 			return null;
 		}
+		usz child_height = left.structural_height > right.structural_height
+			? left.structural_height : right.structural_height;
+		MitosSpan span = { .start = left.span.start, .end = right.span.end };
+		if (!mitos_check_expression_height(parser, child_height, span))
+		{
+			mitos_free_expression(parser.allocator, left);
+			mitos_free_expression(parser.allocator, right);
+			return null;
+		}
 		left = alloc::new(parser.allocator, SurfaceExpr, {
 			.kind = SURFACE_BINARY,
-			.span = { .start = left.span.start, .end = right.span.end },
+			.span = span,
+			.structural_height = child_height + 1,
 			.data = { .binary = { .operator = mitos_binary_operator(operator), .left = left, .right = right } },
 		});
 	}
@@ -1509,9 +1727,19 @@ fn SurfaceExpr* mitos_parse_sequence(MitosSourceParser* parser, MitosParseStop s
 	for (sz index = definitions.len() - 1; index >= 0; index--)
 	{
 		MitosPendingDefinition* definition = &definitions[(usz)index];
+		usz child_height = definition.value.structural_height > body.structural_height
+			? definition.value.structural_height : body.structural_height;
+		MitosSpan span = { .start = definition.span.start, .end = body.span.end };
+		if (!mitos_check_expression_height(parser, child_height, span))
+		{
+			mitos_free_expression(parser.allocator, body);
+			mitos_free_pending_definitions(parser.allocator, &definitions);
+			return null;
+		}
 		body = alloc::new(parser.allocator, SurfaceExpr, {
 			.kind = SURFACE_DEFINITION,
-			.span = { .start = definition.span.start, .end = body.span.end },
+			.span = span,
+			.structural_height = child_height + 1,
 			.data = {
 				.definition = {
 					.name = definition.name,
@@ -1545,7 +1773,8 @@ fn void mitos_free_variants(Allocator allocator, List{VariantDecl}* variants) @p
 fn bool mitos_parse_header_parameters(
 	MitosSourceParser* parser,
 	List{TypeParameterDecl}* parameters,
-	SourcePos* end
+	SourcePos* end,
+	String duplicate_subject
 ) @private
 {
 	if (!parser.cursor.match("OF")) return true;
@@ -1557,6 +1786,12 @@ fn bool mitos_parse_header_parameters(
 		if (parameters.len() >= MITOS_MAX_TYPE_ARGUMENTS)
 		{
 			mitos_add_error(parser, "type header cannot contain more than 256 parameters", mitos_span(parameter.span));
+			return false;
+		}
+		foreach (&existing : *parameters)
+		{
+			if (existing.name != parameter.text) continue;
+			mitos_add_error(parser, duplicate_subject, mitos_span(parameter.span));
 			return false;
 		}
 		parameters.push({ .name = parameter.text.copy(parser.allocator), .span = mitos_span(parameter.span) });
@@ -1579,7 +1814,9 @@ fn bool mitos_parse_enum(MitosSourceParser* parser, EnumDecl* declaration) @priv
 	List{TypeParameterDecl} type_parameters;
 	type_parameters.init(parser.allocator);
 	SourcePos header_end = name.span.end;
-	if (!mitos_parse_header_parameters(parser, &type_parameters, &header_end)
+	if (!mitos_parse_header_parameters(
+		parser, &type_parameters, &header_end, "duplicate enum type parameter"
+	)
 		|| !mitos_expect(parser, "COLON", "expected ':' after the enum header"))
 	{
 		mitos_free_type_parameters(parser.allocator, &type_parameters);
@@ -1686,7 +1923,9 @@ fn bool mitos_parse_type_declaration(MitosSourceParser* parser, TypeDecl* declar
 	List{TypeParameterDecl} parameters;
 	parameters.init(parser.allocator);
 	SourcePos end_position = name.span.end;
-	if (!mitos_parse_header_parameters(parser, &parameters, &end_position))
+	if (!mitos_parse_header_parameters(
+		parser, &parameters, &end_position, "duplicate type parameter"
+	))
 	{
 		mitos_free_type_parameters(parser.allocator, &parameters);
 		return false;
@@ -1801,7 +2040,9 @@ fn bool mitos_parse_effect(MitosSourceParser* parser, EffectDecl* declaration) @
 	List{TypeParameterDecl} parameters;
 	parameters.init(parser.allocator);
 	SourcePos header_end = name.span.end;
-	if (!mitos_parse_header_parameters(parser, &parameters, &header_end)
+	if (!mitos_parse_header_parameters(
+		parser, &parameters, &header_end, "duplicate effect type parameter"
+	)
 		|| !mitos_expect(parser, "COLON", "expected ':' after the effect header"))
 	{
 		mitos_free_type_parameters(parser.allocator, &parameters);
@@ -1978,6 +2219,217 @@ fn bool mitos_parse_function(MitosSourceParser* parser, FunctionDecl* declaratio
 	return true;
 }
 
+fn usz mitos_identity_variable(List{String}* variables, String name) @private
+{
+	foreach (index, variable : *variables) if (variable == name) return (usz)index;
+	variables.push(name);
+	return (usz)variables.len() - 1;
+}
+
+fn bool mitos_builtin_type_name(String name) @private
+{
+	return name == "Any" || name == "Never" || name == "Type" || name == "I64"
+		|| name == "Bool" || name == "Unit" || name == "String" || name == "Array"
+		|| name == "Function" || name == "Superposition";
+}
+
+fn SymbolKey* mitos_declared_nominal_key(Program* program, String name) @private
+{
+	foreach (&type_decl : program.types) if (type_decl.name == name) return &type_decl.key;
+	foreach (&enum_decl : program.enums) if (enum_decl.name == name) return &enum_decl.key;
+	return null;
+}
+
+fn void mitos_append_identity_component(DString* signature, String component) @private
+{
+	char[32] length;
+	signature.append_string((String)io::bprintf(&length, "%d:", (long)component.len)!!);
+	signature.append_string(component);
+}
+
+fn void mitos_append_identity_nominal(
+	DString* signature,
+	Program* program,
+	ModuleKey* source_module,
+	String name
+) @private
+{
+	if (mitos_builtin_type_name(name))
+	{
+		mitos_append_identity_component(signature, MITOS_CORE_MODULE_CANONICAL);
+		mitos_append_identity_component(signature, name);
+		mitos_append_identity_component(signature, "");
+		return;
+	}
+	SymbolKey* declared = mitos_declared_nominal_key(program, name);
+	if (declared)
+	{
+		mitos_append_identity_component(signature, declared.owner.canonical);
+		mitos_append_identity_component(signature, declared.name);
+		mitos_append_identity_component(signature, declared.canonical_signature);
+		return;
+	}
+	mitos_append_identity_component(signature, source_module.canonical);
+	mitos_append_identity_component(signature, name);
+	mitos_append_identity_component(signature, "");
+}
+
+fn void mitos_append_identity_type(
+	DString* signature,
+	Program* program,
+	ModuleKey* source_module,
+	TypeExpr* expression,
+	List{String}* variables
+) @private
+{
+	if (!expression || (expression.kind == TYPE_EXPR_NAMED && expression.name == "Any"))
+	{
+		signature.append_char('*');
+		return;
+	}
+	bool declared_nominal = mitos_builtin_type_name(expression.name)
+		|| mitos_declared_nominal_key(program, expression.name);
+	if (expression.kind == TYPE_EXPR_NAMED && !declared_nominal
+		&& expression.name.len == 1
+		&& expression.name[0] >= 'A' && expression.name[0] <= 'Z')
+	{
+		char[32] ordinal;
+		usz variable = mitos_identity_variable(variables, expression.name);
+		signature.append_string((String)io::bprintf(&ordinal, "$%d", (long)variable)!!);
+		return;
+	}
+	signature.append_char(expression.kind == TYPE_EXPR_APPLICATION ? '@' : '=');
+	mitos_append_identity_nominal(signature, program, source_module, expression.name);
+	if (expression.kind != TYPE_EXPR_APPLICATION) return;
+	signature.append_char('[');
+	foreach (&argument : expression.arguments)
+	{
+		mitos_append_identity_type(signature, program, source_module, argument.value, variables);
+		signature.append_char(';');
+	}
+	signature.append_char(']');
+}
+
+fn String mitos_method_identity_signature(
+	Program* program,
+	ModuleKey* source_module,
+	FunctionDecl* function,
+	Allocator allocator
+) @private
+{
+	DString signature;
+	signature.init(allocator);
+	List{String} variables;
+	variables.init(allocator);
+	signature.append_char('(');
+	foreach (index, &annotation : function.parameter_annotations)
+	{
+		if (index) signature.append_char(',');
+		mitos_append_identity_type(
+			&signature, program, source_module, annotation.value, &variables
+		);
+	}
+	signature.append_char(')');
+	String result = signature.copy_str(allocator);
+	signature.free();
+	variables.free();
+	return result;
+}
+
+fn void mitos_append_parent_key_component(
+	DString* signature,
+	String component
+) @private
+{
+	char[32] buffer;
+	signature.append_string((String)io::bprintf(
+		&buffer, "%d:", (long)component.len
+	)!!);
+	signature.append_string(component);
+}
+
+fn String mitos_parent_identity_signature(
+	SymbolKey* parent,
+	Allocator allocator
+) @private
+{
+	DString signature;
+	signature.init(allocator);
+	char[32] buffer;
+	mitos_append_parent_key_component(&signature, parent.owner.canonical);
+	signature.append_char('/');
+	signature.append_string((String)io::bprintf(
+		&buffer, "%d/", (long)parent.kind
+	)!!);
+	mitos_append_parent_key_component(&signature, parent.name);
+	signature.append_char('/');
+	signature.append_string((String)io::bprintf(
+		&buffer, "%d/", (long)parent.arity
+	)!!);
+	mitos_append_parent_key_component(&signature, parent.canonical_signature);
+	String result = signature.copy_str(allocator);
+	signature.free();
+	return result;
+}
+
+fn void mitos_stamp_program_identity(Program* program, ModuleKey* source_module) @private
+{
+	foreach (&enum_decl : program.enums)
+	{
+		enum_decl.key = symbol_key(
+			source_module, SYMBOL_ENUM, enum_decl.name, enum_decl.parameters.len, "", program.allocator
+		);
+		String parent_signature = mitos_parent_identity_signature(
+			&enum_decl.key, program.allocator
+		);
+		foreach (&variant : enum_decl.variants)
+		{
+			variant.key = symbol_key(
+				source_module, SYMBOL_VARIANT, variant.name, variant.parameters.len,
+				parent_signature, program.allocator
+			);
+		}
+		alloc::free(program.allocator, parent_signature);
+	}
+	foreach (&type_decl : program.types)
+	{
+		type_decl.key = symbol_key(
+			source_module, SYMBOL_TYPE, type_decl.name, type_decl.parameters.len, "", program.allocator
+		);
+	}
+	foreach (&effect : program.effects)
+	{
+		effect.key = symbol_key(
+			source_module, SYMBOL_EFFECT, effect.name, effect.parameters.len, "", program.allocator
+		);
+		String parent_signature = mitos_parent_identity_signature(
+			&effect.key, program.allocator
+		);
+		foreach (&operation : effect.operations)
+		{
+			operation.key = symbol_key(
+				source_module, SYMBOL_EFFECT_OPERATION, operation.name, operation.parameters.len,
+				parent_signature, program.allocator
+			);
+		}
+		alloc::free(program.allocator, parent_signature);
+	}
+	foreach (&function : program.functions)
+	{
+		function.generic_key = symbol_key(
+			source_module, SYMBOL_GENERIC, function.name, function.parameters.len, "", program.allocator
+		);
+		String signature = mitos_method_identity_signature(
+			program, source_module, function, program.allocator
+		);
+		function.key = symbol_key(
+			source_module, SYMBOL_METHOD, function.name, function.parameters.len,
+			signature, program.allocator
+		);
+		alloc::free(program.allocator, signature);
+	}
+}
+
 fn void mitos_free_top_level(
 	Allocator allocator,
 	List{EnumDecl}* enums,
@@ -2000,7 +2452,56 @@ fn void mitos_free_top_level(
 	partial.deinit();
 }
 
-fn bool mitos_parse_top_level(MitosSourceParser* parser, Program* program) @private
+fn bool mitos_validate_bare_constructor_namespace(
+	MitosSourceParser* parser,
+	List{EnumDecl}* enums,
+	List{TypeDecl}* types
+) @private
+{
+	usz variant_count = 0;
+	foreach (&enum_decl : *enums)
+	{
+		if (enum_decl.variants.len > usz::max - variant_count)
+		{
+			mitos_add_error(
+				parser,
+				"value constructor namespace exceeds its size bound",
+				enum_decl.span
+			);
+			return false;
+		}
+		variant_count += enum_decl.variants.len;
+	}
+	ValidationNameIndex constructors;
+	constructors.init(parser.allocator, variant_count);
+	defer constructors.deinit();
+	foreach (&enum_decl : *enums)
+	{
+		foreach (&variant : enum_decl.variants)
+		{
+			if (!constructors.insert(variant.name)) continue;
+		}
+	}
+	bool valid = true;
+	foreach (&type_decl : *types)
+	{
+		if (type_decl.kind != TYPE_DECL_CONCRETE
+			|| !constructors.contains(type_decl.name)) continue;
+		mitos_add_error(
+			parser,
+			"concrete type constructor name collides with an enum variant",
+			type_decl.span
+		);
+		valid = false;
+	}
+	return valid;
+}
+
+fn bool mitos_parse_top_level(
+	MitosSourceParser* parser,
+	ModuleKey* source_module,
+	Program* program
+) @private
 {
 	List{EnumDecl} enums;
 	List{TypeDecl} types;
@@ -2102,6 +2603,10 @@ fn bool mitos_parse_top_level(MitosSourceParser* parser, Program* program) @priv
 		}
 		mitos_skip_newlines(parser);
 	}
+	if (!failed && !mitos_validate_bare_constructor_namespace(parser, &enums, &types))
+	{
+		failed = true;
+	}
 	if (failed)
 	{
 		mitos_free_top_level(parser.allocator, &enums, &types, &effects, &functions);
@@ -2109,11 +2614,16 @@ fn bool mitos_parse_top_level(MitosSourceParser* parser, Program* program) @priv
 	}
 	*program = {
 		.allocator = parser.allocator,
+		.module_key = clone_module_key(source_module, parser.allocator),
+		.feature_manifest = delta_feature_manifest(
+			DELTA_V4_CORE_REQUIRED_FEATURES, (DeltaFeatureBits)0
+		),
 		.enums = enums.to_array(parser.allocator),
 		.types = types.to_array(parser.allocator),
 		.effects = effects.to_array(parser.allocator),
 		.functions = functions.to_array(parser.allocator),
 	};
+	mitos_stamp_program_identity(program, source_module);
 	enums.free();
 	types.free();
 	effects.free();
@@ -2121,11 +2631,24 @@ fn bool mitos_parse_top_level(MitosSourceParser* parser, Program* program) @priv
 	return true;
 }
 
-fn MitosParseResult parse_program(String source, Allocator allocator = mem)
+fn MitosParseResult parse_program(
+	String source,
+	Allocator allocator = mem,
+	ModuleKey* canonical_module = null
+)
 {
+	ModuleKey fallback = { .canonical = MITOS_DEFAULT_MODULE_CANONICAL };
+	ModuleKey* effective_module = canonical_module && canonical_module.canonical.len
+		? canonical_module : &fallback;
 	MitosParseResult result = {
 		.allocator = allocator,
-		.program = { .allocator = allocator },
+		.program = {
+			.allocator = allocator,
+			.module_key = clone_module_key(effective_module, allocator),
+			.feature_manifest = delta_feature_manifest(
+				DELTA_V4_CORE_REQUIRED_FEATURES, (DeltaFeatureBits)0
+			),
+		},
 	};
 	List{MitosDiagnostic} diagnostics;
 	diagnostics.init(allocator);
@@ -2188,23 +2711,12 @@ fn MitosParseResult parse_program(String source, Allocator allocator = mem)
 		return result;
 	}
 
-	LexResult lexed = compiled.lexer.lex(source);
+	LexResult lexed = mitos_lex_bounded(
+		&compiled.lexer, source, MITOS_MAX_TOKENS, MITOS_MAX_LEXER_MATCHES
+	);
 	if (!lexed.ok())
 	{
 		foreach (&diagnostic : lexed.diagnostics) mitos_copy_mpc_diagnostic(&diagnostics, allocator, diagnostic);
-		result.diagnostics = diagnostics.to_array(allocator);
-		diagnostics.free();
-		lexed.deinit();
-		compiled.deinit();
-		arena.deinit();
-		return result;
-	}
-	if (lexed.tokens.len() > MITOS_MAX_TOKENS)
-	{
-		MitosDiagnostic diagnostic;
-		diagnostic.init(allocator, "source cannot contain more than 100000 tokens",
-			mitos_span(lexed.tokens[MITOS_MAX_TOKENS].span));
-		diagnostics.push(diagnostic);
 		result.diagnostics = diagnostics.to_array(allocator);
 		diagnostics.free();
 		lexed.deinit();
@@ -2221,7 +2733,7 @@ fn MitosParseResult parse_program(String source, Allocator allocator = mem)
 		.diagnostics = &diagnostics,
 	};
 	Program parsed_program;
-	bool parsed = mitos_parse_top_level(&parser, &parsed_program);
+	bool parsed = mitos_parse_top_level(&parser, effective_module, &parsed_program);
 	foreach (&diagnostic : cursor.diagnostics) mitos_copy_mpc_diagnostic(&diagnostics, allocator, diagnostic);
 	if (parsed && diagnostics.len() == 0)
 	{

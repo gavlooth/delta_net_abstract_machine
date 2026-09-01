@@ -606,6 +606,211 @@ fn EvalResult eval(Parser* parser, ParseCursor start, EvalContext* context)
 	}
 }
 
+
+/**
+ * Borrowing recognizer used by lexers. It mirrors `eval`'s cursor and
+ * backtracking semantics without owning the input or constructing AST nodes.
+ */
+struct PrefixContext
+{
+	String input;
+	Parser*[128] active_rules;
+	sz[128] active_offsets;
+	sz active_count;
+}
+
+
+fn EvalResult recognize_sequence(Parser* parser, ParseCursor start, PrefixContext* context)
+{
+	ParseCursor cursor = start;
+	foreach (part : parser.parts)
+	{
+		EvalResult item = recognize_eval(part, cursor, context);
+		if (!item.ok) return { .cursor = start, .error = item.error };
+		cursor = item.cursor;
+	}
+	return { .ok = true, .cursor = cursor };
+}
+
+fn EvalResult recognize_choice(
+	Parser* parser,
+	ParseCursor start,
+	PrefixContext* context,
+	bool predictive
+)
+{
+	ParseErrorInfo combined;
+	foreach (part : parser.parts)
+	{
+		EvalResult item = recognize_eval(part, start, context);
+		if (item.ok) return item;
+		merge_error(&combined, item.error);
+		if (predictive && item.error.set && item.error.position.offset > start.position.offset)
+		{
+			return { .cursor = start, .error = item.error };
+		}
+	}
+	if (!combined.set) combined = error_at(start.position, "alternative");
+	return { .cursor = start, .error = combined };
+}
+
+fn EvalResult recognize_repeat(
+	Parser* parser,
+	ParseCursor start,
+	PrefixContext* context,
+	sz minimum,
+	sz maximum
+)
+{
+	ParseCursor cursor = start;
+	sz matched;
+	ParseErrorInfo last_error;
+	while (matched < maximum)
+	{
+		EvalResult item = recognize_eval(parser.first, cursor, context);
+		if (!item.ok) { last_error = item.error; break; }
+		if (item.cursor.position.offset == cursor.position.offset) break;
+		cursor = item.cursor;
+		matched++;
+	}
+	if (matched < minimum)
+	{
+		if (!last_error.set) last_error = error_at(cursor.position, "non-empty repetition");
+		return { .cursor = start, .error = last_error };
+	}
+	return { .ok = true, .cursor = cursor };
+}
+
+fn EvalResult recognize_sep_by(Parser* parser, ParseCursor start, PrefixContext* context)
+{
+	EvalResult first = recognize_eval(parser.first, start, context);
+	if (!first.ok)
+	{
+		if (!parser.flag) return first;
+		return { .ok = true, .cursor = start };
+	}
+	ParseCursor cursor = first.cursor;
+	while (true)
+	{
+		EvalResult separator = recognize_eval(parser.second, cursor, context);
+		if (!separator.ok) break;
+		EvalResult item = recognize_eval(parser.first, separator.cursor, context);
+		if (!item.ok || item.cursor.position.offset == cursor.position.offset) break;
+		cursor = item.cursor;
+	}
+	return { .ok = true, .cursor = cursor };
+}
+
+fn EvalResult recognize_eval(Parser* parser, ParseCursor start, PrefixContext* context)
+{
+	String input = context.input;
+	switch (parser.kind)
+	{
+		case ANY_CHAR:
+			if (start.position.offset >= input.len) return { .cursor = start, .error = error_at(start.position, parser_label(parser)) };
+			ParseCursor any_end = start;
+			advance_cursor(&any_end, input[any_end.position.offset]);
+			return { .ok = true, .cursor = any_end };
+		case CHARACTER:
+			if (start.position.offset >= input.len || input[start.position.offset] != parser.low) return { .cursor = start, .error = error_at(start.position, parser_label(parser)) };
+			ParseCursor char_end = start;
+			advance_cursor(&char_end, input[char_end.position.offset]);
+			return { .ok = true, .cursor = char_end };
+		case RANGE:
+			if (start.position.offset >= input.len || input[start.position.offset] < parser.low || input[start.position.offset] > parser.high) return { .cursor = start, .error = error_at(start.position, parser_label(parser)) };
+			ParseCursor range_end = start;
+			advance_cursor(&range_end, input[range_end.position.offset]);
+			return { .ok = true, .cursor = range_end };
+		case ONE_OF:
+		case NONE_OF:
+			if (start.position.offset >= input.len) return { .cursor = start, .error = error_at(start.position, parser_label(parser)) };
+			bool found = contains_char(parser.text, input[start.position.offset]);
+			if ((parser.kind == ONE_OF && !found) || (parser.kind == NONE_OF && found)) return { .cursor = start, .error = error_at(start.position, parser_label(parser)) };
+			ParseCursor set_end = start;
+			advance_cursor(&set_end, input[set_end.position.offset]);
+			return { .ok = true, .cursor = set_end };
+		case LITERAL:
+			ParseCursor literal_end = start;
+			foreach (expected : parser.text)
+			{
+				if (literal_end.position.offset >= input.len || input[literal_end.position.offset] != expected) return { .cursor = start, .error = error_at(literal_end.position, parser_label(parser)) };
+				advance_cursor(&literal_end, expected);
+			}
+			return { .ok = true, .cursor = literal_end };
+		case SOI:
+			if (start.position.offset != 0) return { .cursor = start, .error = error_at(start.position, parser_label(parser)) };
+			return { .ok = true, .cursor = start };
+		case EOI:
+			if (start.position.offset != input.len) return { .cursor = start, .error = error_at(start.position, parser_label(parser)) };
+			return { .ok = true, .cursor = start };
+		case PASS: return { .ok = true, .cursor = start };
+		case FAIL: return { .cursor = start, .error = error_at(start.position, parser_label(parser)) };
+		case EXPECT:
+			EvalResult expected_result = recognize_eval(parser.first, start, context);
+			if (!expected_result.ok) expected_result.error = error_at(expected_result.error.set ? expected_result.error.position : start.position, parser.text);
+			return expected_result;
+		case SEQUENCE: return recognize_sequence(parser, start, context);
+		case CHOICE: return recognize_choice(parser, start, context, false);
+		case PREDICTIVE_CHOICE: return recognize_choice(parser, start, context, true);
+		case OPTIONAL:
+			EvalResult optional_result = recognize_eval(parser.first, start, context);
+			return optional_result.ok ? optional_result : { .ok = true, .cursor = start };
+		case MANY: return recognize_repeat(parser, start, context, 0, sz::max);
+		case MANY1: return recognize_repeat(parser, start, context, 1, sz::max);
+		case COUNT: return recognize_repeat(parser, start, context, parser.amount, parser.amount);
+		case SEP_BY: return recognize_sep_by(parser, start, context);
+		case LOOKAHEAD:
+			EvalResult ahead = recognize_eval(parser.first, start, context);
+			return ahead.ok ? { .ok = true, .cursor = start } : { .cursor = start, .error = ahead.error };
+		case NOT_FOLLOWED_BY:
+			EvalResult negative = recognize_eval(parser.first, start, context);
+			if (negative.ok) return { .cursor = start, .error = error_at(start.position, "negative lookahead") };
+			return { .ok = true, .cursor = start };
+		case TOKEN:
+			EvalResult token_result = recognize_eval(parser.first, start, context);
+			if (!token_result.ok) return token_result;
+			while (token_result.cursor.position.offset < input.len && is_space(input[token_result.cursor.position.offset])) advance_cursor(&token_result.cursor, input[token_result.cursor.position.offset]);
+			return token_result;
+		case WHOLE:
+			EvalResult whole_result = recognize_eval(parser.first, start, context);
+			if (!whole_result.ok) return whole_result;
+			while (whole_result.cursor.position.offset < input.len && is_space(input[whole_result.cursor.position.offset])) advance_cursor(&whole_result.cursor, input[whole_result.cursor.position.offset]);
+			if (whole_result.cursor.position.offset != input.len) return { .cursor = start, .error = error_at(whole_result.cursor.position, "end of input") };
+			return whole_result;
+		case BETWEEN:
+			EvalResult open_result = recognize_eval(parser.first, start, context);
+			if (!open_result.ok) return open_result;
+			EvalResult inner_result = recognize_eval(parser.second, open_result.cursor, context);
+			if (!inner_result.ok) return { .cursor = start, .error = inner_result.error };
+			EvalResult close_result = recognize_eval(parser.third, inner_result.cursor, context);
+			if (!close_result.ok) return { .cursor = start, .error = close_result.error };
+			inner_result.cursor = close_result.cursor;
+			return inner_result;
+		case RULE:
+			if (!parser.target) return { .cursor = start, .error = error_at(start.position, parser.name) };
+			for (sz i = 0; i < context.active_count; i++) if (context.active_rules[i] == parser && context.active_offsets[i] == start.position.offset) return { .cursor = start, .error = error_at(start.position, parser.name) };
+			if (context.active_count >= context.active_rules.len) return { .cursor = start, .error = error_at(start.position, "recursion limit") };
+			context.active_rules[context.active_count] = parser;
+			context.active_offsets[context.active_count++] = start.position.offset;
+			EvalResult rule_result = recognize_eval(parser.target, start, context);
+			context.active_count--;
+			return rule_result;
+		case NAMED: return recognize_eval(parser.first, start, context);
+		case WORD_BOUNDARY:
+			bool left_word = start.position.offset > 0 && is_word_char(input[start.position.offset - 1]);
+			bool right_word = start.position.offset < input.len && is_word_char(input[start.position.offset]);
+			bool boundary = left_word != right_word;
+			if (parser.flag) boundary = !boundary;
+			return boundary ? { .ok = true, .cursor = start } : { .cursor = start, .error = error_at(start.position, parser_label(parser)) };
+		case LINE_START:
+			if (start.position.offset == 0 || input[start.position.offset - 1] == '\n') return { .ok = true, .cursor = start };
+			return { .cursor = start, .error = error_at(start.position, parser_label(parser)) };
+		case LINE_END:
+			if (start.position.offset == input.len || input[start.position.offset] == '\n') return { .ok = true, .cursor = start };
+			return { .cursor = start, .error = error_at(start.position, parser_label(parser)) };
+	}
+}
+
 fn ParseResult parse(Parser* parser, String input, Allocator allocator, String source_name = "<input>")
 {
 	ParseResult result = { .allocator = allocator, .source_name = source_name.copy(allocator), .input = input.copy(allocator) };
@@ -632,11 +837,12 @@ fn ParseResult? parse_file(Parser* parser, String path, Allocator allocator)
 	return parse(parser, (String)contents, allocator, path);
 }
 
-fn bool match_prefix(Parser* parser, String input, sz* consumed) => @pool()
+fn bool match_prefix(Parser* parser, String input, sz* consumed)
 {
-	ParseResult result = parse(parser, input, tmem);
-	defer result.deinit();
+	ParseCursor start = { .position = source_start() };
+	PrefixContext context = { .input = input };
+	EvalResult result = recognize_eval(parser, start, &context);
 	if (!result.ok) { *consumed = 0; return false; }
-	*consumed = result.consumed.end.offset;
+	*consumed = result.cursor.position.offset;
 	return true;
 }

@@ -1,6 +1,8 @@
 module delta_net_abstract_machine;
 import std::collections::maybe;
 import delta_net_abstract_machine::stable_slot_arena;
+import delta_net_abstract_machine::mitos;
+import delta_net_abstract_machine::mitos_storage;
 alias NetRef = SlotRef;
 const NetRef INVALID_NET_REF = { .id = stable_slot_arena::INVALID_SLOT_ID, .generation = 0 };
 enum ReplicatorStatus
@@ -133,6 +135,11 @@ fn bool is_practical_agent_type(AgentType type)
  }
 }
 
+fn bool agent_type_supports_storage(AgentType type)
+{
+ return type == STRING_AGENT || type == ARRAY_AGENT;
+}
+
 // Canonical nets produced by the lambda-term translation guarantee that
 // equal-level replicators are equal. Enable this for defensive validation of
 // arbitrary/proper nets as well.
@@ -213,6 +220,10 @@ struct PracticalAgent
  long payload;
  String text;
  bool owns_text;
+ mitos_storage::StorageHandle storage;
+ mitos::CopyPolicy storage_policy;
+ usz storage_count;
+ usz storage_stride;
  usz occurrence_order;
  usz descriptor;
  usz source_order;
@@ -257,6 +268,29 @@ struct OrderedEffectCommit
  bool committed;
 }
 
+// Each net owns its lazily-built continuation adjacency and effect lookup.
+// The captured allocator keeps teardown independent of the ambient allocator.
+struct PracticalContinuationLink @private
+{
+ NetRef continuation;
+ SlotId next;
+}
+
+struct PracticalContinuationIndex @private
+{
+ Allocator allocator;
+ ulong shape_version;
+ SlotId continuation_next_id;
+ usz continuation_live_count;
+ SlotId[] node_heads;
+ SlotId[] node_tails;
+ PracticalContinuationLink[] links;
+ usz links_used;
+ NetRef[] effect_buckets;
+ usz ordered_commit_tombstones;
+ bool built;
+}
+
 struct EffectNetMetadata
 {
  StableSlotArena{EffectContinuation} continuations;
@@ -264,6 +298,8 @@ struct EffectNetMetadata
  usz committed;
  ulong program_epoch;
  ulong execution_epoch;
+ ulong continuation_shape_version;
+ PracticalContinuationIndex continuation_index;
 }
 union Agent
 {
@@ -286,4 +322,5 @@ struct Net
  StableSlotArena{Node} nodes;
  StableSlotArena{InterfacePort} interfaces;
  EffectNetMetadata effects;
+ mitos_storage::StorageRuntime storage;
 }

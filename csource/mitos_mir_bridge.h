@@ -32,7 +32,7 @@ typedef enum MitosMirOpcode {
     MITOS_MIR_TYPE_OF,
     MITOS_MIR_TYPE_ASSERT,
     MITOS_MIR_STRING_CONST,
-    MITOS_MIR_CACHED_CALL,
+    MITOS_MIR_RESERVED_31,
     MITOS_MIR_EXTERNAL_EFFECT,
     MITOS_MIR_PARALLEL_CALL,
     MITOS_MIR_PARALLEL_JOIN,
@@ -51,6 +51,22 @@ typedef enum MitosMirStatus {
     MITOS_MIR_NATIVE = 0,
     MITOS_MIR_ERROR = 1
 } MitosMirStatus;
+
+typedef uint32_t MitosMirHostDisposition;
+enum {
+    MITOS_MIR_HOST_READY = 0,
+    MITOS_MIR_HOST_SUSPEND = 1,
+    MITOS_MIR_HOST_FAIL = 2
+};
+
+typedef enum MitosMirCapability {
+    MITOS_MIR_CAP_HOST_ABI_2 = 1u << 0
+} MitosMirCapability;
+
+typedef enum MitosMirEffectOperationFlag {
+    MITOS_MIR_EFFECT_ORDERED = 1u << 0,
+    MITOS_MIR_EFFECT_EXTERNAL = 1u << 1
+} MitosMirEffectOperationFlag;
 
 typedef struct MitosMirFunction {
     uint32_t parameter_count;
@@ -89,6 +105,18 @@ typedef struct MitosMirType {
     uint32_t argument;
 } MitosMirType;
 
+typedef struct MitosMirLayout {
+    uint32_t type_id;
+    uint32_t kind;
+    uint32_t copy_policy;
+    uint32_t flags;
+    uint64_t size;
+    uint64_t alignment;
+    uint64_t stride;
+    uint32_t element_type;
+    uint32_t reserved;
+} MitosMirLayout;
+
 typedef struct MitosMirString {
     const char *bytes;
     size_t length;
@@ -97,8 +125,10 @@ typedef struct MitosMirString {
 } MitosMirString;
 
 typedef struct MitosMirEffectOperation {
+    uint32_t dense_handle;
     uint32_t effect;
     uint32_t operation;
+    uint32_t arity;
     uint32_t result_type;
     uint32_t abi_major;
     uint32_t abi_minor;
@@ -108,6 +138,15 @@ typedef struct MitosMirMatchArm {
     uint32_t constructor;
     uint32_t flags;
 } MitosMirMatchArm;
+typedef struct MitosMirSpan {
+    uint64_t start_offset;
+    uint64_t start_row;
+    uint64_t start_column;
+    uint64_t end_offset;
+    uint64_t end_row;
+    uint64_t end_column;
+} MitosMirSpan;
+
 
 
 typedef struct MitosMirProgram {
@@ -116,17 +155,20 @@ typedef struct MitosMirProgram {
     const uint32_t *operands;
     const MitosMirConstructor *constructors;
     const MitosMirType *types;
+    const MitosMirLayout *layouts;
     const MitosMirString *strings;
     const MitosMirEffectOperation *effect_operations;
-    void *const *native_methods;
+    void *const *reserved_methods;
+    uint64_t program_identity;
     uint32_t function_count;
     uint32_t instruction_count;
     uint32_t operand_count;
     uint32_t constructor_count;
     uint32_t type_count;
+    uint32_t layout_count;
     uint32_t string_count;
     uint32_t effect_operation_count;
-    uint32_t native_method_count;
+    uint32_t reserved_method_count;
     uint32_t main_function;
     uint32_t true_tag;
     uint32_t false_tag;
@@ -141,6 +183,9 @@ typedef struct MitosMirProgram {
     const MitosMirMatchArm *match_arms;
     uint32_t match_arm_count;
     uint32_t reserved2;
+    const MitosMirSpan *spans;
+    uint32_t span_count;
+    uint32_t max_source_order;
 } MitosMirProgram;
 
 typedef struct MitosMirOutcome {
@@ -148,12 +193,9 @@ typedef struct MitosMirOutcome {
     uint32_t reserved;
     char *result;
     char *diagnostic;
+    MitosMirSpan diagnostic_span;
 } MitosMirOutcome;
 
-typedef struct MitosMirNativeCompileOutcome {
-    void *native_result;
-    char *diagnostic;
-} MitosMirNativeCompileOutcome;
 
 
 typedef enum MitosMirHostValueKind {
@@ -194,21 +236,46 @@ typedef struct MitosMirHostCall {
     size_t diagnostic_length;
 } MitosMirHostCall;
 
-typedef int (*MitosMirHostHandler)(MitosMirHostCall *call, void *context);
-
-int mitos_mir_register_host_helper(uint32_t operation, uint32_t abi_major,
-                                   uint32_t abi_minor, MitosMirHostHandler handler,
-                                   void *context);
-void mitos_mir_unregister_host_helper(uint32_t operation);
-
-MitosMirOutcome mitos_mir_execute(const MitosMirProgram *program);
-MitosMirNativeCompileOutcome mitos_mir_compile_method(
-    const MitosMirProgram *program,
-    uint32_t function_index
+typedef MitosMirHostDisposition (*MitosMirHostHandler)(
+    MitosMirHostCall *call,
+    void *context
 );
-void mitos_mir_compile_outcome_free(MitosMirNativeCompileOutcome *outcome);
+
+typedef struct MitosMirRuntime MitosMirRuntime;
+
+typedef struct MitosMirRegistrySnapshot {
+    uint64_t generation;
+    uint32_t helper_count;
+    uint32_t capabilities;
+} MitosMirRegistrySnapshot;
+
+MitosMirRuntime *mitos_mir_runtime_create(void);
+uint32_t mitos_mir_runtime_destroy(MitosMirRuntime *runtime);
+uint32_t mitos_mir_runtime_capabilities(MitosMirRuntime *runtime);
+uint32_t mitos_mir_runtime_snapshot(
+    MitosMirRuntime *runtime,
+    MitosMirRegistrySnapshot *snapshot
+);
+uint32_t mitos_mir_runtime_register_host_helper(
+    MitosMirRuntime *runtime,
+    const MitosMirProgram *program,
+    uint32_t dense_handle,
+    uint32_t abi_major,
+    uint32_t abi_minor,
+    MitosMirHostHandler handler,
+    void *context
+);
+uint32_t mitos_mir_runtime_unregister_host_helper(
+    MitosMirRuntime *runtime,
+    const MitosMirProgram *program,
+    uint32_t dense_handle
+);
+
+MitosMirOutcome mitos_mir_execute(
+    MitosMirRuntime *runtime,
+    const MitosMirProgram *program
+);
 void mitos_mir_outcome_free(MitosMirOutcome *outcome);
-void mitos_mir_native_result_free(void *native_result);
 
 #ifdef __cplusplus
 }

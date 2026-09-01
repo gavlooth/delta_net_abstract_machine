@@ -1,12 +1,12 @@
 # Mitos syntax
 
-Mitos source files use the `.mitos` extension. A complete program declares one or more methods and must provide a zero-argument `main()` method. Parsing and validation produce an owned typed `DeltaProgram`; the Delta runtime, MIR JIT, REPL, and AOT v3 all consume that same semantic image.
+Mitos source files use the `.mitos` extension. A complete program declares one or more methods and must provide a zero-argument `main()` method. Parsing and validation produce an owned typed `DeltaProgram`; the Delta runtime, MIR JIT, REPL, and AOT v4 all consume that same semantic image.
 
 There is no legacy Core execution path. Surface syntax is parsed only to establish declarations and ownership, then lowered to the typed Delta image that defines execution. The ordinary runtime and the MIR backend consume that image; MIR preserves Delta-first semantics and performs runtime `TypeId` dispatch whenever a call tuple is not statically concrete rather than compiling an abstract tuple as a concrete dispatch choice.
 
 ## Types
 
-Built-in nominal types are `Any`, `Never`, `Type`, `I64`, `Bool`, `Unit`, `String`, `Array`, and `Superposition`. Type application uses `of`, never brackets, `::`, unions, or nullable suffixes:
+Built-in nominal types are `Any`, `Never`, `Type`, `I64`, `Bool`, `Unit`, `String`, `Function`, `Array`, and `Superposition`. Type application uses `of`, never brackets, `::`, unions, or nullable suffixes:
 
 ```mitos
 abstract Number
@@ -40,6 +40,8 @@ A single uppercase identifier in a method signature is an implicit method type v
 
 Functions with the same name and arity form one generic function. Each declaration is a method. At a call boundary, argument values reach weak-head normal form, their concrete `TypeId` tuple is formed, and the unique most-specific applicable method is selected.
 
+An optional finite effect declaration appears at the end of a method header, after the optional `of Result` annotation and before `:`. Write `does Effect` for one effect or `does (A, B)` for a nonempty row of effects. Thus the supported header shapes include `name(parameters) does Effect:`, `name(parameters) of Result does Effect:`, and `name(parameters) of Result does (A, B):`. Each row entry is an effect type expression, so a parameterized effect uses the normal `Effect of T` type-application syntax. The source grammar has no notation for an open row tail.
+
 ```mitos
 select(value of I64) of I64:
   value + 1
@@ -54,7 +56,7 @@ main():
 end
 ```
 
-A missing method reports `MethodError` with the concrete tuple. Incomparable maximal candidates report `AmbiguousMethodError` and list their signatures. Method table epochs invalidate cached native specializations, so adding a method in the REPL changes the next dispatch.
+A missing method reports `MethodError` with the concrete tuple. Incomparable maximal candidates report `AmbiguousMethodError` and list their signatures. Method table epochs participate in semantic dispatch, so adding or replacing a method in the REPL changes the next applicable call.
 
 ## Type values and reflection
 
@@ -114,6 +116,8 @@ Operators of the same precedence associate left. Arithmetic requires `I64`; comp
 
 A lambda starts with `do`, has a parenthesized parameter list, and captures its lexical scope:
 
+A lambda places the same optional finite declaration after its optional result annotation and before `:`: `do(parameters) does Effect:`, `do(parameters) of Result does Effect:`, or `do(parameters) of Result does (A, B):`. Parenthesized rows must be nonempty; no open-tail form is accepted.
+
 ```mitos
 twice := do(f, value):
   first := f(value)
@@ -121,7 +125,7 @@ twice := do(f, value):
 end
 ```
 
-The Delta runtime supports closure values. MIR specializes concrete named calls and retains runtime `TypeId` dispatch for dynamically typed calls; it never falls back to a separate surface evaluator.
+The Delta runtime supports closure values. MIR specializes concrete named calls and retains runtime `TypeId` dispatch whenever closure provenance is statically recoverable, including immutable bindings, returned wrappers, constructor fields, and match bindings. A branch-selected or superposed set of distinct effectful closures requires the `DYNAMIC_EFFECT_CLOSURES` capability: `run` and `aot-run` execute it through generic Delta, while `jit` rejects it before MIR emission. This closure capability is independent of the separately unsupported `SUSPENSION` capability described below; dynamic closures are not the only reason a program can be ineligible for MIR. Both routes are explicit required-feature negotiation, not fallback after native failure.
 
 ## Deterministic superposition
 
@@ -188,7 +192,7 @@ main():
 end
 ```
 
-The result is deterministically `42`; the pending `+ 1` continuation is erased. Multi-shot handlers may resume the same continuation more than once. Effect requests preserve source occurrence order across parallel roots. Operations declared on `Console` or `IO` are external host effects: execution requires a compatible registered versioned host helper, and absence or signature mismatch is a deterministic diagnostic rather than an interpreter fallback.
+The result is deterministically `42`; the pending `+ 1` continuation is erased. Multi-shot handlers may resume the same continuation more than once. Effect requests preserve source occurrence order across parallel roots. Operations declared on `Console` or `IO` are external host effects: execution requires a compatible versioned host helper explicitly enrolled for the operation, and absence or signature mismatch is a deterministic diagnostic rather than an interpreter fallback. A ready-only helper returns `HOST_READY` (or `HOST_FAIL`) without retaining execution; its program requires `HOST`, keeps `SUSPENSION` optional, and remains MIR-eligible. The standard `jit` path explicitly enrolls the ready-only `Console.print` helper. If a helper may return `HOST_SUSPEND` and resume later, its manifest must require `SUSPENSION`; direct `jit` then rejects before MIR emission and `aot-run` chooses generic Delta.
 
 The representative programs are [`examples/effects_abort.mitos`](examples/effects_abort.mitos) for one-shot abort/eraser cleanup, [`examples/effects.mitos`](examples/effects.mitos) for multi-shot resumption, and [`examples/effects_parallel.mitos`](examples/effects_parallel.mitos) for parallel effects with source-ordered joins.
 
@@ -196,7 +200,7 @@ The representative programs are [`examples/effects_abort.mitos`](examples/effect
 
 The REPL retains successful type, effect, method, and immutable binding source. Single-line nominal headers such as `abstract Number` and `type I64 is Number` are declarations immediately; they do not wait for an `end`. Annotated bindings such as `x of I64 := 20` persist under the name `x`, and later entries may refer to them. String-valued bindings use the same escaped literal syntax as files.
 
-Entering a method whose name, arity, and parameter signature match a retained method replaces that method in place instead of appending a duplicate. The generic's epoch advances and its bounded native specializations are invalidated. Other methods of the same generic remain installed. Each successful entry reparses and lowers the accumulated source into a new `DeltaProgram`; `:clear` removes declarations, bindings, epochs, and cached native results.
+Entering a method whose name, arity, and parameter signature match a retained method replaces that method in place instead of appending a duplicate. The generic's epoch advances, and semantic dispatch in the next program image observes the replacement. Other methods of the same generic remain installed. Every successful entry reparses the accumulated source and lowers it into a fresh current `DeltaProgram`; any MIR execution is a per-program specialization of that image. `:clear` removes retained declarations, bindings, and epochs.
 
 For example, these are separate successful entries; the second `select` declaration replaces the first and the final call observes the new body:
 
@@ -215,7 +219,7 @@ select(x)
 
 ## AOT artifacts
 
-AOT v3 stores the complete typed Delta image, including types, concrete instance identities, methods, effects, superposition origins and observable replicator metadata, spans, graph nodes, and helper requirements. It records Delta schema v3 and helper ABI 1.2 with the superposition feature bit. Every untrusted section and nested record count is checked against the bytes remaining in its section, its production ceiling, and one cumulative decoding budget before allocation. AOT versions 1 and 2 are rejected cleanly rather than upgraded. AOT execution reconstructs the Delta image and enters the MIR backend; it contains no source AST, legacy Core program, or fallback evaluator.
+AOT v4.0 is a canonical little-endian, manifest-first tagged-record image of Delta schema 4.0. It stores the program `ModuleKey`; every persistent `SymbolKey` and owner; generic/method coherence; resolved effect rows and optional tails; `TypeId`-indexed layout descriptors and copy policies; types, constructors, primitives, effects, graph nodes, superposition origins, observable replicator metadata, spans; and schema/helper required and optional capabilities. Required and optional records are length-delimited and emitted once in ascending tag order. Higher minors load through required-capability negotiation; unknown optional records skip by bounded length, while unknown required, missing, duplicate, misflagged, out-of-order, truncated, overflowing, trailing, or feature-incoherent records fail closed. AOT v1-v3 are rejected. Runtime registries, handles, pointers, callbacks, refcounts, views, live resources, contexts, and resumption tokens are never serialized. After validation, `aot-run` uses MIR exactly when every required manifest bit is in MIR's advertised set; otherwise it deliberately selects generic Delta. The currently named MIR exclusions are `SUSPENSION` and `DYNAMIC_EFFECT_CLOSURES`.
 
 ## Comments
 

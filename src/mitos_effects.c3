@@ -2,6 +2,9 @@ module delta_net_abstract_machine::mitos;
 
 import std::collections::list;
 import std::core::mem;
+import std::io;
+import std::thread;
+import std::atomic::types;
 
 /** Stable identities are local to one program-lifetime EffectRegistry. */
 typedef EffectId = uint;
@@ -12,6 +15,171 @@ const OperationId OPERATION_ID_INVALID = (OperationId)0;
 const usz MITOS_MAX_EFFECTS = 4_096;
 const usz MITOS_MAX_EFFECT_INSTANCES = 16_384;
 const usz MITOS_MAX_EFFECT_INFERENCE_STEPS = 4_194_304;
+const usz MITOS_MAX_EFFECT_INDEX_PROBES = 128;
+
+/**
+ * Canonical allocator-owned resolved row. `required` is sorted, unique, and
+ * excludes EFFECT_ID_INVALID. When present, `tail` is a canonical
+ * SYMBOL_EFFECT_ROW_TAIL key.
+ */
+struct ResolvedEffectRow
+{
+	EffectId[] required;
+	bool has_tail;
+	SymbolKey tail;
+}
+
+fn void effect_row_sift_down(EffectId[] values, usz root, usz count) @private
+{
+	for (;;)
+	{
+		usz child = root * 2 + 1;
+		if (child >= count) return;
+		if (child + 1 < count && values[child] < values[child + 1]) child++;
+		if (values[root] >= values[child]) return;
+		EffectId swap = values[root];
+		values[root] = values[child];
+		values[child] = swap;
+		root = child;
+	}
+}
+
+fn void sort_effect_ids(EffectId[] values) @private
+{
+	usz count = values.len;
+	if (count < 2) return;
+	for (usz parent = count / 2; parent > 0; parent--)
+	{
+		effect_row_sift_down(values, parent - 1, count);
+	}
+	for (usz end = count; end > 1; end--)
+	{
+		EffectId swap = values[0];
+		values[0] = values[end - 1];
+		values[end - 1] = swap;
+		effect_row_sift_down(values, 0, end - 1);
+	}
+}
+
+fn ResolvedEffectRow normalize_effect_row(
+	EffectId[] required,
+	SymbolKey* optional_tail = null,
+	Allocator allocator = mem
+)
+{
+	EffectId[] owned = alloc::new_array(allocator, EffectId, required.len);
+	usz count = 0;
+	foreach (effect : required)
+	{
+		if (effect == EFFECT_ID_INVALID) continue;
+		owned[count++] = effect;
+	}
+	sort_effect_ids(owned[:(sz)count]);
+	usz unique = 0;
+	for (usz index = 0; index < count; index++)
+	{
+		if (unique && owned[index] == owned[unique - 1]) continue;
+		owned[unique++] = owned[index];
+	}
+	ResolvedEffectRow row = { .required = owned[:(sz)unique] };
+	if (optional_tail)
+	{
+		row.has_tail = true;
+		row.tail = clone_symbol_key(optional_tail, allocator);
+	}
+	return row;
+}
+
+fn ResolvedEffectRow clone_resolved_effect_row(
+	ResolvedEffectRow* row,
+	Allocator allocator = mem
+)
+{
+	if (!row) return { };
+	ResolvedEffectRow clone = {
+		.required = alloc::clone_slice(allocator, row.required),
+		.has_tail = row.has_tail,
+	};
+	if (row.has_tail) clone.tail = clone_symbol_key(&row.tail, allocator);
+	return clone;
+}
+
+fn void ResolvedEffectRow.deinit(&self, Allocator allocator)
+{
+	alloc::free(allocator, self.required);
+	if (self.has_tail) self.tail.deinit(allocator);
+	*self = { };
+}
+
+fn bool resolved_effect_row_equal(ResolvedEffectRow* left, ResolvedEffectRow* right)
+{
+	if (left == right) return true;
+	if (!left || !right || left.required.len != right.required.len
+		|| left.has_tail != right.has_tail) return false;
+	foreach (index, effect : left.required)
+		if (effect != right.required[index]) return false;
+	return !left.has_tail || symbol_key_equal(&left.tail, &right.tail);
+}
+
+fn bool resolved_effect_row_contains(ResolvedEffectRow* row, EffectId effect)
+{
+	if (!row || effect == EFFECT_ID_INVALID) return false;
+	foreach (required : row.required)
+	{
+		if (required == effect) return true;
+		if (required > effect) return false;
+	}
+	return false;
+}
+
+fn bool resolved_effect_row_is_canonical(ResolvedEffectRow* row)
+{
+	if (!row || (row.has_tail
+		&& (row.tail.kind != SYMBOL_EFFECT_ROW_TAIL
+			|| !symbol_key_is_canonical(&row.tail)))) return false;
+	EffectId previous = EFFECT_ID_INVALID;
+	foreach (effect : row.required)
+	{
+		if (effect == EFFECT_ID_INVALID || effect <= previous) return false;
+		previous = effect;
+	}
+	return true;
+}
+
+/** True when `actual` is within the capability upper bound `expected`. */
+fn bool resolved_effect_row_satisfies(
+	ResolvedEffectRow* actual,
+	ResolvedEffectRow* expected
+)
+{
+	if (!actual || !expected
+		|| !resolved_effect_row_is_canonical(actual)
+		|| !resolved_effect_row_is_canonical(expected)) return false;
+	if (actual.has_tail && !expected.has_tail) return false;
+	if (actual.has_tail && expected.has_tail
+		&& !symbol_key_equal(&actual.tail, &expected.tail)) return false;
+	if (expected.has_tail && !actual.has_tail) return true;
+	usz expected_index = 0;
+	foreach (effect : actual.required)
+	{
+		while (expected_index < (usz)expected.required.len
+			&& expected.required[(sz)expected_index] < effect) expected_index++;
+		if (expected_index >= (usz)expected.required.len
+			|| expected.required[(sz)expected_index] != effect) return false;
+	}
+	return true;
+}
+
+/** An open tail conservatively admits a request not yet named in `required`. */
+fn bool resolved_effect_row_allows(
+	ResolvedEffectRow* row,
+	EffectId effect
+)
+{
+	return row && (resolved_effect_row_contains(row, effect) || row.has_tail);
+}
+
+
 enum EffectHostPolicy : char
 {
 	EFFECT_HOST_PURE,
@@ -22,6 +190,7 @@ enum EffectHostPolicy : char
 
 struct EffectOperationDescriptor
 {
+	SymbolKey key;
 	OperationId id;
 	EffectId effect;
 	String name;
@@ -35,6 +204,7 @@ struct EffectOperationDescriptor
 
 struct EffectDescriptor
 {
+	SymbolKey key;
 	EffectId id;
 	String name;
 	bool multi;
@@ -45,17 +215,59 @@ struct EffectDescriptor
 
 struct EffectInstance
 {
+	SymbolKey key;
 	EffectId id;
 	EffectId constructor;
 	TypeId[] arguments;
 }
 
+struct EffectRegistryIndexes @private
+{
+	/** Open-addressed module-local effect-name index; entries are descriptor index + 1. */
+	usz[] effect_buckets;
+	/** Open-addressed `(constructor, TypeId[])` index; entries are instance index + 1. */
+	usz[] instance_buckets;
+	/** Sole instance ID per constructor, or `uint::max` when multiple exist. */
+	EffectId[] constructor_instances;
+}
+
+/**
+ * Non-dereferenceable cache capability. Backing addresses remain in the
+ * module-owned slot table and every use revalidates all three coordinates.
+ */
+struct EffectRegistryIndexHandle
+{
+	usz slot;
+	ulong generation;
+	ulong identity;
+}
+
+struct EffectRegistryIndexSlot @private
+{
+	EffectRegistryIndexes indexes;
+	Allocator allocator;
+	char* owner_key;
+	usz owner_key_len;
+	ulong owner_identity;
+	ulong generation;
+	ulong identity;
+	bool active;
+}
+
+const usz MITOS_MAX_EFFECT_INDEX_STATES = 4_096;
+Atomic{ulong} effect_registry_index_guard @private;
+EffectRegistryIndexSlot[MITOS_MAX_EFFECT_INDEX_STATES] effect_registry_index_slots @private;
+
 struct EffectRegistry
 {
+	ModuleKey module_key;
 	Allocator allocator;
 	List{EffectDescriptor} effects;
 	List{EffectInstance} instances;
+	/** Validated runtime-only cache handle; descriptors remain public registry data. */
+	EffectRegistryIndexHandle index_state;
 	OperationId next_operation_id;
+	ulong index_owner;
 	usz max_effects;
 	usz max_instances;
 	ulong epoch;
@@ -71,8 +283,8 @@ struct EffectRegistryBuildResult
 struct MethodEffectInfo
 {
 	usz function_index;
-	EffectId[] inferred;
-	EffectId[] asserted;
+	ResolvedEffectRow inferred;
+	ResolvedEffectRow asserted;
 	bool has_assertion;
 }
 
@@ -80,8 +292,8 @@ struct MethodEffectInfo
 struct LambdaEffectInfo
 {
 	MitosSpan span;
-	EffectId[] inferred;
-	EffectId[] asserted;
+	ResolvedEffectRow inferred;
+	ResolvedEffectRow asserted;
 	bool has_assertion;
 }
 struct EffectAnalysis
@@ -94,18 +306,13 @@ struct EffectAnalysis
 	ulong effect_epoch;
 }
 
-struct EffectInvalidation
-{
-	ulong previous_epoch;
-	ulong current_epoch;
-	EffectId changed_effect;
-}
 
 fn bool EffectRegistryBuildResult.ok(&self) => self.diagnostics.len == 0;
 fn bool EffectAnalysis.ok(&self) => self.diagnostics.len == 0;
 
 fn void EffectOperationDescriptor.deinit(&self, Allocator allocator)
 {
+	self.key.deinit(allocator);
 	alloc::free(allocator, self.name);
 	foreach (pattern : self.parameter_patterns) alloc::free(allocator, pattern);
 	alloc::free(allocator, self.parameter_patterns);
@@ -119,15 +326,22 @@ fn void EffectOperationDescriptor.deinit(&self, Allocator allocator)
 fn void EffectRegistry.deinit(&self)
 {
 	if (!self.allocator) return;
+	effect_registry_clear_indexes(self);
+	self.module_key.deinit(self.allocator);
 	foreach (&effect : self.effects)
 	{
+		effect.key.deinit(self.allocator);
 		alloc::free(self.allocator, effect.name);
 		foreach (parameter : effect.parameters) alloc::free(self.allocator, parameter);
 		alloc::free(self.allocator, effect.parameters);
 		foreach (&operation : effect.operations) operation.deinit(self.allocator);
 		alloc::free(self.allocator, effect.operations);
 	}
-	foreach (&instance : self.instances) alloc::free(self.allocator, instance.arguments);
+	foreach (&instance : self.instances)
+	{
+		instance.key.deinit(self.allocator);
+		alloc::free(self.allocator, instance.arguments);
+	}
 	self.effects.free();
 	self.instances.free();
 	*self = { };
@@ -147,15 +361,15 @@ fn void EffectAnalysis.deinit(&self)
 	if (!self.allocator) return;
 	foreach (&method : self.methods)
 	{
-		alloc::free(self.allocator, method.inferred);
-		alloc::free(self.allocator, method.asserted);
+		method.inferred.deinit(self.allocator);
+		method.asserted.deinit(self.allocator);
 	}
 	alloc::free(self.allocator, self.methods);
 	foreach (&diagnostic : self.diagnostics) diagnostic.deinit();
 	foreach (&lambda : self.lambdas)
 	{
-		alloc::free(self.allocator, lambda.inferred);
-		alloc::free(self.allocator, lambda.asserted);
+		lambda.inferred.deinit(self.allocator);
+		lambda.asserted.deinit(self.allocator);
 	}
 	alloc::free(self.allocator, self.lambdas);
 	alloc::free(self.allocator, self.diagnostics);
@@ -188,11 +402,365 @@ fn EffectDescriptor* effect_descriptor(EffectRegistry* registry, EffectId id)
 	return &registry.effects[(usz)id - 1];
 }
 
+fn void effect_registry_index_lock() @private
+{
+	for (;;)
+	{
+		ulong expected = 0;
+		if (effect_registry_index_guard.compare_exchange(&expected, 1)) return;
+		thread::yield();
+	}
+}
+
+fn void effect_registry_index_unlock() @private
+{
+	effect_registry_index_guard.store(0);
+}
+
+fn bool effect_registry_index_handle_is_set(EffectRegistryIndexHandle handle) @private
+{
+	return handle.slot != 0 || handle.generation != 0 || handle.identity != 0;
+}
+
+fn void effect_registry_free_index_arrays(
+	EffectRegistryIndexes* indexes,
+	Allocator allocator
+) @private
+{
+	alloc::free(allocator, indexes.effect_buckets);
+	alloc::free(allocator, indexes.instance_buckets);
+	alloc::free(allocator, indexes.constructor_instances);
+	*indexes = { };
+}
+
+fn bool effect_registry_slot_is_owned_by(
+	EffectRegistryIndexSlot* slot,
+	EffectRegistry* registry
+) @private
+{
+	return slot.active && registry.index_owner
+		&& slot.owner_identity == registry.index_owner
+		&& slot.owner_key == registry.module_key.canonical.ptr
+		&& slot.owner_key_len == registry.module_key.canonical.len;
+}
+
+fn EffectRegistryIndexes* effect_registry_indexes(EffectRegistry* registry) @private
+{
+	if (!registry || registry.max_effects > MITOS_MAX_EFFECTS
+		|| registry.max_instances > MITOS_MAX_EFFECT_INSTANCES
+		|| (usz)registry.effects.len() > registry.max_effects
+		|| (usz)registry.instances.len() > registry.max_instances)
+	{
+		return null;
+	}
+	EffectRegistryIndexHandle handle = registry.index_state;
+	if (!handle.slot || handle.slot > MITOS_MAX_EFFECT_INDEX_STATES
+		|| !handle.generation || !handle.identity) return null;
+
+	effect_registry_index_lock();
+	EffectRegistryIndexSlot* slot = &effect_registry_index_slots[handle.slot - 1];
+	if (!slot.active || slot.generation != handle.generation
+		|| slot.identity != handle.identity
+		|| !effect_registry_slot_is_owned_by(slot, registry))
+	{
+		effect_registry_index_unlock();
+		return null;
+	}
+	EffectRegistryIndexes* indexes = &slot.indexes;
+	if (indexes.effect_buckets.len != registry.max_effects * 2 + 1
+		|| indexes.instance_buckets.len != registry.max_instances * 2 + 1
+		|| indexes.constructor_instances.len != registry.max_effects + 1)
+	{
+		effect_registry_index_unlock();
+		return null;
+	}
+	effect_registry_index_unlock();
+	return indexes;
+}
+
+fn bool effect_registry_register_indexes(
+	EffectRegistry* registry,
+	EffectRegistryIndexes indexes
+) @private
+{
+	if (!registry.index_owner)
+	{
+		registry.index_owner = new_runtime_identity();
+		if (!registry.index_owner) return false;
+	}
+	ulong identity = new_runtime_identity();
+	if (!identity) return false;
+	effect_registry_index_lock();
+	for (usz index = 0; index < MITOS_MAX_EFFECT_INDEX_STATES; index++)
+	{
+		EffectRegistryIndexSlot* slot = &effect_registry_index_slots[index];
+		if (slot.active) continue;
+		ulong generation = slot.generation == ulong::max ? 1 : slot.generation + 1;
+		*slot = {
+			.indexes = indexes,
+			.allocator = registry.allocator,
+			.owner_key = registry.module_key.canonical.ptr,
+			.owner_key_len = registry.module_key.canonical.len,
+			.owner_identity = registry.index_owner,
+			.generation = generation,
+			.identity = identity,
+			.active = true,
+		};
+		registry.index_state = {
+			.slot = index + 1,
+			.generation = generation,
+			.identity = identity,
+		};
+		effect_registry_index_unlock();
+		return true;
+	}
+	effect_registry_index_unlock();
+	return false;
+}
+
+fn void effect_registry_clear_indexes(EffectRegistry* registry) @private
+{
+	if (!registry) return;
+	EffectRegistryIndexHandle handle = registry.index_state;
+	registry.index_state = { };
+
+	EffectRegistryIndexes released;
+	Allocator allocator;
+	bool found = false;
+	effect_registry_index_lock();
+	EffectRegistryIndexSlot* selected = null;
+	if (handle.slot && handle.slot <= MITOS_MAX_EFFECT_INDEX_STATES
+		&& handle.generation && handle.identity)
+	{
+		EffectRegistryIndexSlot* candidate =
+			&effect_registry_index_slots[handle.slot - 1];
+		if (candidate.generation == handle.generation
+			&& candidate.identity == handle.identity
+			&& effect_registry_slot_is_owned_by(candidate, registry))
+		{
+			selected = candidate;
+		}
+	}
+	if (!selected)
+	{
+		foreach (&candidate : effect_registry_index_slots)
+		{
+			if (effect_registry_slot_is_owned_by(candidate, registry))
+			{
+				selected = candidate;
+				break;
+			}
+		}
+	}
+	if (selected)
+	{
+		released = selected.indexes;
+		allocator = selected.allocator;
+		ulong generation = selected.generation;
+		*selected = { .generation = generation };
+		found = true;
+	}
+	effect_registry_index_unlock();
+	if (found) effect_registry_free_index_arrays(&released, allocator);
+}
+
+fn ulong effect_registry_name_hash(String name) @private
+{
+	ulong hash = 1469598103934665603UL;
+	foreach (character : name)
+	{
+		hash ^= (ulong)character;
+		hash *= 1099511628211UL;
+	}
+	return hash;
+}
+
+fn ulong effect_registry_instance_hash(
+	EffectId constructor,
+	TypeId[] arguments
+) @private
+{
+	ulong hash = 1469598103934665603UL;
+	hash ^= (ulong)constructor;
+	hash *= 1099511628211UL;
+	foreach (argument : arguments)
+	{
+		hash ^= (ulong)argument;
+		hash *= 1099511628211UL;
+	}
+	return hash;
+}
+
+fn bool effect_registry_index_effect(
+	EffectRegistry* registry,
+	EffectRegistryIndexes* indexes,
+	EffectDescriptor* effect
+) @private
+{
+	if (!effect || !effect.id || (usz)effect.id > (usz)registry.effects.len())
+	{
+		return false;
+	}
+	usz bucket_count = indexes.effect_buckets.len;
+	usz bucket = (usz)(effect_registry_name_hash(effect.name) % (ulong)bucket_count);
+	usz probe_limit = bucket_count < MITOS_MAX_EFFECT_INDEX_PROBES
+		? bucket_count : MITOS_MAX_EFFECT_INDEX_PROBES;
+	for (usz probe = 0; probe < probe_limit; probe++)
+	{
+		usz stored = indexes.effect_buckets[bucket];
+		if (!stored)
+		{
+			indexes.effect_buckets[bucket] = (usz)effect.id;
+			return true;
+		}
+		if (stored > (usz)registry.effects.len()) return false;
+		EffectDescriptor* other = &registry.effects[(sz)(stored - 1)];
+		if (other.id != (EffectId)stored || other.name == effect.name) return false;
+		bucket++;
+		if (bucket == bucket_count) bucket = 0;
+	}
+	return false;
+}
+
+fn bool effect_registry_index_instance(
+	EffectRegistry* registry,
+	EffectRegistryIndexes* indexes,
+	EffectInstance* instance,
+	usz ordinal
+) @private
+{
+	if (!instance || !instance.constructor
+		|| (usz)instance.constructor > (usz)registry.effects.len()
+		|| instance.id != (EffectId)((usz)registry.effects.len() + ordinal + 1))
+	{
+		return false;
+	}
+	usz bucket_count = indexes.instance_buckets.len;
+	usz bucket = (usz)(effect_registry_instance_hash(
+		instance.constructor, instance.arguments
+	) % (ulong)bucket_count);
+	usz probe_limit = bucket_count < MITOS_MAX_EFFECT_INDEX_PROBES
+		? bucket_count : MITOS_MAX_EFFECT_INDEX_PROBES;
+	for (usz probe = 0; probe < probe_limit; probe++)
+	{
+		usz stored = indexes.instance_buckets[bucket];
+		if (!stored)
+		{
+			indexes.instance_buckets[bucket] = ordinal + 1;
+			EffectId previous = indexes.constructor_instances[(usz)instance.constructor];
+			indexes.constructor_instances[(usz)instance.constructor] = previous
+				? (EffectId)uint::max : instance.id;
+			return true;
+		}
+		if (stored > (usz)registry.instances.len()) return false;
+		EffectInstance* other = &registry.instances[(sz)(stored - 1)];
+		if (other.id != (EffectId)((usz)registry.effects.len() + stored))
+		{
+			return false;
+		}
+		if (other.constructor == instance.constructor
+			&& type_arguments_equal(other.arguments, instance.arguments)) return false;
+		bucket++;
+		if (bucket == bucket_count) bucket = 0;
+	}
+	return false;
+}
+
+fn bool effect_registry_prepare_indexes(EffectRegistry* registry) @private
+{
+	if (!registry || registry.max_effects > MITOS_MAX_EFFECTS
+		|| registry.max_instances > MITOS_MAX_EFFECT_INSTANCES
+		|| (usz)registry.effects.len() > registry.max_effects
+		|| (usz)registry.instances.len() > registry.max_instances) return false;
+	if (effect_registry_indexes(registry)) return true;
+	if (effect_registry_index_handle_is_set(registry.index_state))
+	{
+		effect_registry_clear_indexes(registry);
+	}
+	EffectRegistryIndexes allocated = {
+		.effect_buckets = alloc::new_array(
+			registry.allocator, usz, (sz)(registry.max_effects * 2 + 1)
+		),
+		.instance_buckets = alloc::new_array(
+			registry.allocator, usz, (sz)(registry.max_instances * 2 + 1)
+		),
+		.constructor_instances = alloc::new_array(
+			registry.allocator, EffectId, (sz)(registry.max_effects + 1)
+		),
+	};
+	foreach (&bucket : allocated.effect_buckets) *bucket = 0;
+	foreach (&bucket : allocated.instance_buckets) *bucket = 0;
+	foreach (&instance : allocated.constructor_instances) *instance = EFFECT_ID_INVALID;
+	if (!effect_registry_register_indexes(registry, allocated))
+	{
+		effect_registry_free_index_arrays(&allocated, registry.allocator);
+		return false;
+	}
+	EffectRegistryIndexes* indexes = effect_registry_indexes(registry);
+	foreach (index, &effect : registry.effects)
+	{
+		if (effect.id != (EffectId)((usz)index + 1)
+			|| !effect_registry_index_effect(registry, indexes, effect))
+		{
+			effect_registry_clear_indexes(registry);
+			return false;
+		}
+	}
+	foreach (index, &instance : registry.instances)
+	{
+		if (!effect_registry_index_instance(registry, indexes, instance, (usz)index))
+		{
+			effect_registry_clear_indexes(registry);
+			return false;
+		}
+	}
+	return true;
+}
+
+fn EffectId effect_index_lookup(
+	EffectRegistry* registry,
+	ModuleKey* owner,
+	String name,
+	usz* insertion_bucket = null
+) @private
+{
+	if (insertion_bucket) *insertion_bucket = usz::max;
+	if (!registry || !owner || !effect_registry_prepare_indexes(registry))
+	{
+		return EFFECT_ID_INVALID;
+	}
+	EffectRegistryIndexes* indexes = effect_registry_indexes(registry);
+	if (!indexes) return EFFECT_ID_INVALID;
+	usz bucket_count = indexes.effect_buckets.len;
+	if (insertion_bucket) *insertion_bucket = bucket_count;
+	if (!module_key_equal(&registry.module_key, owner)) return EFFECT_ID_INVALID;
+	usz bucket = (usz)(effect_registry_name_hash(name) % (ulong)bucket_count);
+	usz probe_limit = bucket_count < MITOS_MAX_EFFECT_INDEX_PROBES
+		? bucket_count : MITOS_MAX_EFFECT_INDEX_PROBES;
+	for (usz probe = 0; probe < probe_limit; probe++)
+	{
+		usz stored = indexes.effect_buckets[bucket];
+		if (!stored)
+		{
+			if (insertion_bucket) *insertion_bucket = bucket;
+			return EFFECT_ID_INVALID;
+		}
+		if (stored > (usz)registry.effects.len()) return EFFECT_ID_INVALID;
+		EffectDescriptor* effect = &registry.effects[(sz)(stored - 1)];
+		if (effect.id != (EffectId)stored) return EFFECT_ID_INVALID;
+		if (effect.name == name) return effect.id;
+		bucket++;
+		if (bucket == bucket_count) bucket = 0;
+	}
+	return EFFECT_ID_INVALID;
+}
+
+
+
 fn EffectId find_effect(EffectRegistry* registry, String name)
 {
 	if (!registry) return EFFECT_ID_INVALID;
-	foreach (&effect : registry.effects) if (effect.name == name) return effect.id;
-	return EFFECT_ID_INVALID;
+	return effect_index_lookup(registry, &registry.module_key, name);
 }
 
 fn EffectOperationDescriptor* find_effect_operation(
@@ -207,12 +775,54 @@ fn EffectOperationDescriptor* find_effect_operation(
 	return null;
 }
 
-fn EffectHostPolicy effect_host_policy(String effect_name)
+
+
+fn String effect_instance_signature(
+	TypeRegistry* types,
+	TypeId[] arguments,
+	Allocator allocator
+) @private
 {
-	if (effect_name == "Console" || effect_name == "IO") return EFFECT_HOST_EXTERNAL;
-	if (effect_name == "State") return EFFECT_HOST_ORDERED;
-	return EFFECT_HOST_PURE;
+	DString output;
+	output.init(allocator);
+	foreach (argument : arguments)
+	{
+		TypeDescriptor* type = type_descriptor(types, argument);
+		append_length_prefixed_component(&output, type.key.owner.canonical);
+		append_length_prefixed_component(&output, type.key.name);
+		append_length_prefixed_component(&output, type.key.canonical_signature);
+	}
+	String result = output.copy_str(allocator);
+	output.free();
+	return result;
 }
+
+
+/** Byte-identical to the parser's canonical full-parent identity encoding. */
+fn String effect_parent_identity_signature(
+	SymbolKey* parent,
+	Allocator allocator
+) @private
+{
+	DString signature;
+	signature.init(allocator);
+	char[32] buffer;
+	append_length_prefixed_component(&signature, parent.owner.canonical);
+	signature.append_char('/');
+	signature.append_string((String)io::bprintf(
+		&buffer, "%d/", (long)parent.kind
+	)!!);
+	append_length_prefixed_component(&signature, parent.name);
+	signature.append_char('/');
+	signature.append_string((String)io::bprintf(
+		&buffer, "%d/", (long)parent.arity
+	)!!);
+	append_length_prefixed_component(&signature, parent.canonical_signature);
+	String result = signature.copy_str(allocator);
+	signature.free();
+	return result;
+}
+
 
 fn EffectRegistryBuildResult build_effect_registry(
 	Program* program,
@@ -222,10 +832,13 @@ fn EffectRegistryBuildResult build_effect_registry(
 	usz max_instances = MITOS_MAX_EFFECT_INSTANCES
 )
 {
+	if (max_effects > MITOS_MAX_EFFECTS) max_effects = MITOS_MAX_EFFECTS;
+	if (max_instances > MITOS_MAX_EFFECT_INSTANCES) max_instances = MITOS_MAX_EFFECT_INSTANCES;
 	EffectRegistryBuildResult result = { .allocator = allocator };
 	result.registry = {
 		.allocator = allocator,
 		.max_effects = max_effects,
+		.module_key = clone_module_key(&program.module_key, allocator),
 		.max_instances = max_instances,
 		.next_operation_id = (OperationId)1,
 		.epoch = 1,
@@ -234,6 +847,17 @@ fn EffectRegistryBuildResult build_effect_registry(
 	result.registry.instances.init(allocator);
 	List{MitosDiagnostic} diagnostics;
 	diagnostics.init(allocator);
+	if (!effect_registry_prepare_indexes(&result.registry))
+	{
+		effects_add_diagnostic(
+			&diagnostics, allocator,
+			"effect registry index slots are exhausted", { }
+		);
+		result.diagnostics = diagnostics.to_array(allocator);
+		diagnostics.free();
+		return result;
+	}
+	EffectRegistryIndexes* indexes = effect_registry_indexes(&result.registry);
 	foreach (&declaration : program.effects)
 	{
 		if ((usz)result.registry.effects.len() >= max_effects)
@@ -241,12 +865,27 @@ fn EffectRegistryBuildResult build_effect_registry(
 			effects_add_diagnostic(&diagnostics, allocator, "effect registry exhausted its bounded capacity", declaration.span);
 			break;
 		}
-		if (find_effect(&result.registry, declaration.name))
+		usz effect_bucket;
+		if (effect_index_lookup(
+			&result.registry, &program.module_key, declaration.name, &effect_bucket
+		))
 		{
 			effects_add_diagnostic(&diagnostics, allocator, "duplicate effect declaration", declaration.span);
 			continue;
 		}
+		if (effect_bucket >= indexes.effect_buckets.len)
+		{
+			effects_add_diagnostic(
+				&diagnostics, allocator,
+				"effect registry index exceeded its bounded collision budget", declaration.span
+			);
+			continue;
+		}
 		EffectDescriptor descriptor = {
+			.key = declaration_symbol_key(
+				&declaration.key, &program.module_key, SYMBOL_EFFECT,
+				declaration.name, declaration.parameters.len, "", allocator
+			),
 			.id = (EffectId)((usz)result.registry.effects.len() + 1),
 			.name = declaration.name.copy(allocator),
 			.multi = declaration.multi,
@@ -266,13 +905,24 @@ fn EffectRegistryBuildResult build_effect_registry(
 				effects_add_diagnostic(&diagnostics, allocator, "duplicate effect operation", operation.span);
 				continue;
 			}
+			String parent_signature = effect_parent_identity_signature(
+				&descriptor.key, allocator
+			);
+			EffectHostPolicy host_policy = declaration.name == "Console" || declaration.name == "IO"
+				? EFFECT_HOST_EXTERNAL
+				: declaration.name == "State" ? EFFECT_HOST_ORDERED : EFFECT_HOST_PURE;
 			EffectOperationDescriptor registered = {
+				.key = declaration_symbol_key(
+					&operation.key, &descriptor.key.owner, SYMBOL_EFFECT_OPERATION,
+					operation.name, operation.parameters.len, parent_signature, allocator
+				),
 				.id = result.registry.next_operation_id++,
 				.effect = descriptor.id,
 				.name = operation.name.copy(allocator),
-				.host_policy = effect_host_policy(declaration.name),
-				.ordered = effect_host_policy(declaration.name) != EFFECT_HOST_PURE,
+				.host_policy = host_policy,
+				.ordered = host_policy != EFFECT_HOST_PURE,
 			};
+			alloc::free(allocator, parent_signature);
 			registered.parameter_patterns = alloc::new_array(allocator, String, operation.parameters.len);
 			registered.parameter_types = alloc::new_array(allocator, TypePattern, operation.parameters.len);
 			foreach (index, parameter : operation.parameters)
@@ -305,21 +955,17 @@ fn EffectRegistryBuildResult build_effect_registry(
 		descriptor.operations = operations.to_array(allocator);
 		operations.free();
 		result.registry.effects.push(descriptor);
+		indexes.effect_buckets[effect_bucket] = (usz)result.registry.effects.len();
 	}
 	result.diagnostics = diagnostics.to_array(allocator);
 	diagnostics.free();
 	return result;
 }
 
-fn bool effect_arguments_equal(TypeId[] left, TypeId[] right) @private
-{
-	if (left.len != right.len) return false;
-	foreach (index, value : left) if (value != right[index]) return false;
-	return true;
-}
 
 fn bool intern_effect(
 	EffectRegistry* registry,
+	TypeRegistry* types,
 	EffectId constructor,
 	TypeId[] arguments,
 	EffectId* result,
@@ -338,22 +984,106 @@ fn bool intern_effect(
 		if (diagnostic) diagnostic.init(registry.allocator, "effect application arity does not match its declaration", span);
 		return false;
 	}
-	foreach (&instance : registry.instances)
+	foreach (argument : arguments)
 	{
-		if (instance.constructor == constructor && effect_arguments_equal(instance.arguments, arguments))
+		if (!type_id_is_valid(types, argument))
 		{
-			*result = instance.id;
-			return true;
+			if (diagnostic) diagnostic.init(
+				registry.allocator, "parametric effect contains an invalid TypeId", span
+			);
+			return false;
 		}
+	}
+	ulong instance_hash = effect_registry_instance_hash(constructor, arguments);
+	if (!effect_registry_prepare_indexes(registry))
+	{
+		if (diagnostic) diagnostic.init(
+			registry.allocator, "effect registry index state is invalid", span
+		);
+		return false;
+	}
+	EffectRegistryIndexes* indexes = effect_registry_indexes(registry);
+	if (!indexes)
+	{
+		if (diagnostic) diagnostic.init(registry.allocator, "effect registry index state is invalid", span);
+		return false;
+	}
+	usz bucket_count = indexes.instance_buckets.len;
+	usz bucket = (usz)(instance_hash % (ulong)bucket_count);
+	usz insertion_bucket = 0;
+	bool has_insertion_bucket = false;
+	usz probe_limit = bucket_count < MITOS_MAX_EFFECT_INDEX_PROBES
+		? bucket_count : MITOS_MAX_EFFECT_INDEX_PROBES;
+	for (usz probe = 0; probe < probe_limit; probe++)
+	{
+		usz stored = indexes.instance_buckets[bucket];
+		if (!stored)
+		{
+			insertion_bucket = bucket;
+			has_insertion_bucket = true;
+			break;
+		}
+		if (stored > (usz)registry.instances.len())
+		{
+			if (diagnostic) diagnostic.init(registry.allocator, "effect registry index state is invalid", span);
+			return false;
+		}
+		EffectInstance* instance = &registry.instances[(sz)(stored - 1)];
+		EffectId expected_id = (EffectId)((usz)registry.effects.len() + stored);
+		if (instance.id != expected_id)
+		{
+			if (diagnostic) diagnostic.init(registry.allocator, "effect registry index state is invalid", span);
+			return false;
+		}
+		if (instance.constructor == constructor && instance.arguments.len == arguments.len)
+		{
+			bool equal = true;
+			foreach (index, argument : arguments)
+			{
+				if (instance.arguments[index] != argument)
+				{
+					equal = false;
+					break;
+				}
+			}
+			if (equal)
+			{
+				*result = instance.id;
+				return true;
+			}
+		}
+		bucket++;
+		if (bucket == bucket_count) bucket = 0;
 	}
 	if ((usz)registry.instances.len() >= registry.max_instances)
 	{
 		if (diagnostic) diagnostic.init(registry.allocator, "effect instance registry exhausted its bounded capacity", span);
 		return false;
 	}
-	EffectId id = (EffectId)(registry.max_effects + (usz)registry.instances.len() + 1);
-	registry.instances.push({ .id = id, .constructor = constructor,
-		.arguments = alloc::clone_slice(registry.allocator, arguments) });
+	if (!has_insertion_bucket)
+	{
+		if (diagnostic) diagnostic.init(
+			registry.allocator, "effect instance index exceeded its bounded collision budget", span
+		);
+		return false;
+	}
+	EffectId id = (EffectId)((usz)registry.effects.len() + (usz)registry.instances.len() + 1);
+	String signature = effect_instance_signature(types, arguments, registry.allocator);
+	SymbolKey key = symbol_key(
+		&descriptor.key.owner, SYMBOL_EFFECT, descriptor.name, arguments.len,
+		signature, registry.allocator
+	);
+	alloc::free(registry.allocator, signature);
+	registry.instances.push({
+		.key = key,
+		.id = id,
+		.constructor = constructor,
+		.arguments = alloc::clone_slice(registry.allocator, arguments),
+	});
+	indexes.instance_buckets[insertion_bucket] = (usz)registry.instances.len();
+	EffectId previous_instance = indexes.constructor_instances[(usz)constructor];
+	indexes.constructor_instances[(usz)constructor] = previous_instance
+		? (EffectId)uint::max : id;
 	registry.epoch++;
 	*result = id;
 	return true;
@@ -361,8 +1091,21 @@ fn bool intern_effect(
 
 fn EffectInstance* effect_instance(EffectRegistry* registry, EffectId id)
 {
-	foreach (&instance : registry.instances) if (instance.id == id) return instance;
-	return null;
+	if (!registry) return null;
+	usz first_instance = (usz)registry.effects.len() + 1;
+	if ((usz)id < first_instance) return null;
+	usz index = (usz)id - first_instance;
+	if (index >= (usz)registry.instances.len()) return null;
+	EffectInstance* instance = &registry.instances[(sz)index];
+	return instance.id == id ? instance : null;
+}
+
+fn SymbolKey* effect_symbol_key(EffectRegistry* registry, EffectId id)
+{
+	EffectDescriptor* descriptor = effect_descriptor(registry, id);
+	if (descriptor) return &descriptor.key;
+	EffectInstance* instance = effect_instance(registry, id);
+	return instance ? &instance.key : null;
 }
 
 fn EffectId effect_constructor_id(EffectRegistry* registry, EffectId id)
@@ -402,15 +1145,34 @@ fn bool resolve_effect_instance(
 	}
 	if (!selected)
 	{
-		foreach (&instance : registry.instances)
+		if (!effect_registry_prepare_indexes(registry))
 		{
-			if (instance.constructor != constructor) continue;
-			if (selected && selected != instance.id)
+			if (diagnostic) diagnostic.init(registry.allocator, "effect registry index state is invalid", span);
+			return false;
+		}
+		EffectRegistryIndexes* indexes = effect_registry_indexes(registry);
+		if (!indexes)
+		{
+			if (diagnostic) diagnostic.init(registry.allocator, "effect registry index state is invalid", span);
+			return false;
+		}
+		selected = indexes.constructor_instances[(usz)constructor];
+		if (selected == (EffectId)uint::max)
+		{
+			if (diagnostic) diagnostic.init(
+				registry.allocator,
+				"effect occurrence requires an explicit concrete effect row", span
+			);
+			return false;
+		}
+		if (selected)
+		{
+			EffectInstance* cached = effect_instance(registry, selected);
+			if (!cached || cached.constructor != constructor)
 			{
-				if (diagnostic) diagnostic.init(registry.allocator, "effect occurrence requires an explicit concrete effect row", span);
+				if (diagnostic) diagnostic.init(registry.allocator, "effect registry index state is invalid", span);
 				return false;
 			}
-			selected = instance.id;
 		}
 	}
 	if (!selected)
@@ -520,7 +1282,7 @@ fn bool resolve_effect_expr(
 		*result = constructor;
 		return true;
 	}
-	return intern_effect(registry, constructor, arguments, result, diagnostic, expression.span);
+	return intern_effect(registry, types, constructor, arguments, result, diagnostic, expression.span);
 }
 
 fn bool row_contains(List{EffectId}* row, EffectId effect) @private
@@ -664,12 +1426,37 @@ fn bool inferred_row_add(
 	return row_add(row, effect);
 }
 
+fn void inferred_row_tail(
+	SymbolKey** tail,
+	SymbolKey* candidate,
+	List{MitosDiagnostic}* diagnostics,
+	Allocator allocator,
+	MitosSpan span
+) @private
+{
+	if (!candidate) return;
+	if (!*tail)
+	{
+		*tail = candidate;
+		return;
+	}
+	if (!symbol_key_equal(*tail, candidate))
+	{
+		effects_add_diagnostic(
+			diagnostics, allocator,
+			"effect inference cannot unify two distinct open row tails", span
+		);
+	}
+}
+
 fn void collect_expression_effects(
 	EffectRegistry* registry,
 	EffectCallIndex* calls,
 	SurfaceExpr* expression,
 	List{EffectId}* row,
 	List{EffectId}[] current_rows,
+	SymbolKey*[] current_tails,
+	SymbolKey** tail,
 	List{MitosDiagnostic}* diagnostics,
 	Allocator allocator,
 	EffectInferenceWork* work,
@@ -681,33 +1468,54 @@ fn void collect_expression_effects(
 	{
 		case SURFACE_VARIABLE:
 		case SURFACE_INTEGER:
+		case SURFACE_STRING:
 		case SURFACE_LAMBDA:
 			return;
 		case SURFACE_APPLICATION:
-			collect_expression_effects(registry, calls, expression.data.application.callee, row, current_rows,
-				diagnostics, allocator, work, depth + 1);
+			collect_expression_effects(
+				registry, calls, expression.data.application.callee, row,
+				current_rows, current_tails, tail, diagnostics, allocator, work, depth + 1
+			);
 			foreach (argument : expression.data.application.arguments)
-				collect_expression_effects(registry, calls, argument, row, current_rows,
-					diagnostics, allocator, work, depth + 1);
-			if (expression.data.application.callee && expression.data.application.callee.kind == SURFACE_VARIABLE)
+				collect_expression_effects(
+					registry, calls, argument, row, current_rows, current_tails,
+					tail, diagnostics, allocator, work, depth + 1
+				);
+			if (expression.data.application.callee
+				&& expression.data.application.callee.kind == SURFACE_VARIABLE)
 			{
-				String name = expression.data.application.callee.data.variable.name;
-				EffectCallGroup* group = effect_call_group(calls, name, expression.data.application.arguments.len);
+				EffectCallGroup* group = effect_call_group(
+					calls, expression.data.application.callee.data.variable.name,
+					expression.data.application.arguments.len
+				);
 				if (group)
 				{
 					(void)effect_charge(work, (usz)group.targets.len());
 					foreach (function_index : group.targets)
+					{
 						foreach (effect : current_rows[function_index])
 							(void)inferred_row_add(row, effect, work);
+						inferred_row_tail(
+							tail, current_tails[function_index], diagnostics,
+							allocator, expression.span
+						);
+					}
 				}
 			}
 			if (expression.data.application.callee
 				&& expression.data.application.callee.kind == SURFACE_LAMBDA)
 			{
+				LambdaExpr* lambda = &expression.data.application.callee.data.lambda;
 				collect_expression_effects(
-					registry, calls, expression.data.application.callee.data.lambda.body,
-					row, current_rows, diagnostics, allocator, work, depth + 1
+					registry, calls, lambda.body, row, current_rows, current_tails,
+					tail, diagnostics, allocator, work, depth + 1
 				);
+				if (lambda.effect_row && lambda.effect_row.has_tail)
+				{
+					inferred_row_tail(
+						tail, &lambda.effect_row.tail, diagnostics, allocator, expression.span
+					);
+				}
 			}
 		case SURFACE_EFFECT_OPERATION:
 			EffectId effect = find_effect(registry, expression.data.effect_operation.effect_name);
@@ -724,46 +1532,72 @@ fn void collect_expression_effects(
 			}
 			else if (operation.parameter_types.len != expression.data.effect_operation.arguments.len)
 			{
-				effects_add_diagnostic(diagnostics, allocator, "effect operation argument count does not match its signature", expression.span);
+				effects_add_diagnostic(
+					diagnostics, allocator,
+					"effect operation argument count does not match its signature", expression.span
+				);
 			}
 			else
 			{
 				(void)inferred_row_add(row, effect, work);
 			}
 			foreach (argument : expression.data.effect_operation.arguments)
-				collect_expression_effects(registry, calls, argument, row, current_rows,
-					diagnostics, allocator, work, depth + 1);
+				collect_expression_effects(
+					registry, calls, argument, row, current_rows, current_tails,
+					tail, diagnostics, allocator, work, depth + 1
+				);
 		case SURFACE_BINARY:
-			collect_expression_effects(registry, calls, expression.data.binary.left, row, current_rows,
-				diagnostics, allocator, work, depth + 1);
-			collect_expression_effects(registry, calls, expression.data.binary.right, row, current_rows,
-				diagnostics, allocator, work, depth + 1);
+			collect_expression_effects(
+				registry, calls, expression.data.binary.left, row, current_rows,
+				current_tails, tail, diagnostics, allocator, work, depth + 1
+			);
+			collect_expression_effects(
+				registry, calls, expression.data.binary.right, row, current_rows,
+				current_tails, tail, diagnostics, allocator, work, depth + 1
+			);
 		case SURFACE_DEFINITION:
-			collect_expression_effects(registry, calls, expression.data.definition.value, row, current_rows,
-				diagnostics, allocator, work, depth + 1);
-			collect_expression_effects(registry, calls, expression.data.definition.body, row, current_rows,
-				diagnostics, allocator, work, depth + 1);
+			collect_expression_effects(
+				registry, calls, expression.data.definition.value, row, current_rows,
+				current_tails, tail, diagnostics, allocator, work, depth + 1
+			);
+			collect_expression_effects(
+				registry, calls, expression.data.definition.body, row, current_rows,
+				current_tails, tail, diagnostics, allocator, work, depth + 1
+			);
 		case SURFACE_MATCH:
-			collect_expression_effects(registry, calls, expression.data.match_expr.scrutinee, row, current_rows,
-				diagnostics, allocator, work, depth + 1);
+			collect_expression_effects(
+				registry, calls, expression.data.match_expr.scrutinee, row, current_rows,
+				current_tails, tail, diagnostics, allocator, work, depth + 1
+			);
 			foreach (&arm : expression.data.match_expr.arms)
-				collect_expression_effects(registry, calls, arm.body, row, current_rows,
-					diagnostics, allocator, work, depth + 1);
+				collect_expression_effects(
+					registry, calls, arm.body, row, current_rows, current_tails,
+					tail, diagnostics, allocator, work, depth + 1
+				);
 		case SURFACE_PARALLEL:
 			foreach (&binding : expression.data.parallel.bindings)
-				collect_expression_effects(registry, calls, binding.value, row, current_rows,
-					diagnostics, allocator, work, depth + 1);
-			collect_expression_effects(registry, calls, expression.data.parallel.result, row, current_rows,
-				diagnostics, allocator, work, depth + 1);
+				collect_expression_effects(
+					registry, calls, binding.value, row, current_rows, current_tails,
+					tail, diagnostics, allocator, work, depth + 1
+				);
+			collect_expression_effects(
+				registry, calls, expression.data.parallel.result, row, current_rows,
+				current_tails, tail, diagnostics, allocator, work, depth + 1
+			);
 		case SURFACE_HANDLER:
 			List{EffectId} handled;
 			handled.init(allocator);
-			collect_expression_effects(registry, calls, expression.data.handler.handled, &handled, current_rows,
-				diagnostics, allocator, work, depth + 1);
+			SymbolKey* handled_tail = null;
+			collect_expression_effects(
+				registry, calls, expression.data.handler.handled, &handled, current_rows,
+				current_tails, &handled_tail, diagnostics, allocator, work, depth + 1
+			);
 			foreach (&clause : expression.data.handler.clauses)
 			{
 				EffectId clause_effect = find_effect(registry, clause.effect_name);
-				EffectOperationDescriptor* clause_operation = find_effect_operation(registry, clause_effect, clause.operation_name);
+				EffectOperationDescriptor* clause_operation = find_effect_operation(
+					registry, clause_effect, clause.operation_name
+				);
 				if (!clause_effect)
 				{
 					effects_add_diagnostic(diagnostics, allocator, "handler clause names an unknown effect", clause.span);
@@ -774,22 +1608,30 @@ fn void collect_expression_effects(
 				}
 				else if (clause_operation.parameter_types.len != clause.parameters.len)
 				{
-					effects_add_diagnostic(diagnostics, allocator, "handler clause parameter count does not match the operation", clause.span);
+					effects_add_diagnostic(
+						diagnostics, allocator,
+						"handler clause parameter count does not match the operation", clause.span
+					);
 				}
-				collect_expression_effects(registry, calls, clause.body, row, current_rows,
-					diagnostics, allocator, work, depth + 1);
+				collect_expression_effects(
+					registry, calls, clause.body, row, current_rows, current_tails,
+					tail, diagnostics, allocator, work, depth + 1
+				);
 			}
 			foreach (&handled_effect : registry.effects)
 			{
 				if (!effect_charge(work, (usz)handled.len() + 1)) break;
 				bool appears = false;
-				foreach (effect : handled)
+				foreach (candidate : handled)
 				{
-					if (effect_constructor_id(registry, effect) == handled_effect.id) appears = true;
+					if (effect_constructor_id(registry, candidate) == handled_effect.id)
+					{
+						appears = true;
+					}
 				}
 				if (!appears) continue;
 				bool complete = true;
-				foreach (&operation : handled_effect.operations)
+				foreach (&candidate_operation : handled_effect.operations)
 				{
 					if (!effect_charge(work, expression.data.handler.clauses.len + 1))
 					{
@@ -799,12 +1641,19 @@ fn void collect_expression_effects(
 					bool found = false;
 					foreach (&clause : expression.data.handler.clauses)
 					{
-						if (clause.effect_name == handled_effect.name && clause.operation_name == operation.name) found = true;
+						if (clause.effect_name == handled_effect.name
+							&& clause.operation_name == candidate_operation.name)
+						{
+							found = true;
+						}
 					}
 					if (!found)
 					{
 						complete = false;
-						effects_add_diagnostic(diagnostics, allocator, "handler is missing an operation clause", expression.span);
+						effects_add_diagnostic(
+							diagnostics, allocator,
+							"handler is missing an operation clause", expression.span
+						);
 					}
 				}
 				if (complete && effect_charge(work, (usz)handled.len() + 1))
@@ -812,13 +1661,18 @@ fn void collect_expression_effects(
 					row_remove_constructor(registry, &handled, handled_effect.id);
 				}
 			}
-			foreach (effect : handled) (void)inferred_row_add(row, effect, work);
+			foreach (candidate : handled) (void)inferred_row_add(row, candidate, work);
 			handled.free();
-			collect_expression_effects(registry, calls, expression.data.handler.return_clause.body, row, current_rows,
-				diagnostics, allocator, work, depth + 1);
+			inferred_row_tail(tail, handled_tail, diagnostics, allocator, expression.span);
+			collect_expression_effects(
+				registry, calls, expression.data.handler.return_clause.body, row,
+				current_rows, current_tails, tail, diagnostics, allocator, work, depth + 1
+			);
 		case SURFACE_RESUME:
-			collect_expression_effects(registry, calls, expression.data.resume.value, row, current_rows,
-				diagnostics, allocator, work, depth + 1);
+			collect_expression_effects(
+				registry, calls, expression.data.resume.value, row, current_rows,
+				current_tails, tail, diagnostics, allocator, work, depth + 1
+			);
 		default:
 	}
 }
@@ -844,8 +1698,13 @@ fn usz count_resumes(SurfaceExpr* expression, usz depth = 0) @private
 			return count_resumes(expression.data.definition.value, depth + 1) + count_resumes(expression.data.definition.body, depth + 1);
 		case SURFACE_MATCH:
 			usz count = count_resumes(expression.data.match_expr.scrutinee, depth + 1);
-			foreach (&arm : expression.data.match_expr.arms) count += count_resumes(arm.body, depth + 1);
-			return count;
+			usz arm_max = 0;
+			foreach (&arm : expression.data.match_expr.arms)
+			{
+				usz arm_count = count_resumes(arm.body, depth + 1);
+				if (arm_count > arm_max) arm_max = arm_count;
+			}
+			return count + arm_max;
 		case SURFACE_PARALLEL:
 			usz count = count_resumes(expression.data.parallel.result, depth + 1);
 			foreach (&binding : expression.data.parallel.bindings) count += count_resumes(binding.value, depth + 1);
@@ -909,17 +1768,26 @@ fn void validate_handler_multiplicity(
 	}
 }
 
-fn bool index_list_contains(List{usz}* values, usz value) @private
+
+fn bool add_reverse_effect_edge(
+	List{usz}* reverse_edges,
+	usz caller,
+	EffectInferenceWork* work
+) @private
 {
-	foreach (existing : *values) if (existing == value) return true;
-	return false;
+	// Functions are visited in source-index order, so equal callers are contiguous.
+	// This preserves sorted reverse edges and makes syntactic-call deduplication O(1).
+	if (reverse_edges.len() && (*reverse_edges)[reverse_edges.len() - 1] == caller) return true;
+	if (!effect_charge(work)) return false;
+	reverse_edges.push(caller);
+	return true;
 }
+
 
 fn void collect_effect_call_edges(
 	EffectCallIndex* calls,
 	SurfaceExpr* expression,
 	usz caller,
-	List{usz}[] callees,
 	List{usz}[] callers,
 	EffectInferenceWork* work,
 	usz depth = 0
@@ -930,9 +1798,9 @@ fn void collect_effect_call_edges(
 	{
 		case SURFACE_LAMBDA: return;
 		case SURFACE_APPLICATION:
-			collect_effect_call_edges(calls, expression.data.application.callee, caller, callees, callers, work, depth + 1);
+			collect_effect_call_edges(calls, expression.data.application.callee, caller, callers, work, depth + 1);
 			foreach (argument : expression.data.application.arguments)
-				collect_effect_call_edges(calls, argument, caller, callees, callers, work, depth + 1);
+				collect_effect_call_edges(calls, argument, caller, callers, work, depth + 1);
 			if (expression.data.application.callee && expression.data.application.callee.kind == SURFACE_VARIABLE)
 			{
 				EffectCallGroup* group = effect_call_group(
@@ -941,80 +1809,37 @@ fn void collect_effect_call_edges(
 				);
 				if (group) foreach (target : group.targets)
 				{
-					if (!index_list_contains(&callees[caller], target)) callees[caller].push(target);
-					if (!index_list_contains(&callers[target], caller)) callers[target].push(caller);
-					(void)effect_charge(work);
+					if (!add_reverse_effect_edge(&callers[target], caller, work)) break;
 				}
 			}
 		case SURFACE_EFFECT_OPERATION:
 			foreach (argument : expression.data.effect_operation.arguments)
-				collect_effect_call_edges(calls, argument, caller, callees, callers, work, depth + 1);
+				collect_effect_call_edges(calls, argument, caller, callers, work, depth + 1);
 		case SURFACE_BINARY:
-			collect_effect_call_edges(calls, expression.data.binary.left, caller, callees, callers, work, depth + 1);
-			collect_effect_call_edges(calls, expression.data.binary.right, caller, callees, callers, work, depth + 1);
+			collect_effect_call_edges(calls, expression.data.binary.left, caller, callers, work, depth + 1);
+			collect_effect_call_edges(calls, expression.data.binary.right, caller, callers, work, depth + 1);
 		case SURFACE_DEFINITION:
-			collect_effect_call_edges(calls, expression.data.definition.value, caller, callees, callers, work, depth + 1);
-			collect_effect_call_edges(calls, expression.data.definition.body, caller, callees, callers, work, depth + 1);
+			collect_effect_call_edges(calls, expression.data.definition.value, caller, callers, work, depth + 1);
+			collect_effect_call_edges(calls, expression.data.definition.body, caller, callers, work, depth + 1);
 		case SURFACE_MATCH:
-			collect_effect_call_edges(calls, expression.data.match_expr.scrutinee, caller, callees, callers, work, depth + 1);
+			collect_effect_call_edges(calls, expression.data.match_expr.scrutinee, caller, callers, work, depth + 1);
 			foreach (&arm : expression.data.match_expr.arms)
-				collect_effect_call_edges(calls, arm.body, caller, callees, callers, work, depth + 1);
+				collect_effect_call_edges(calls, arm.body, caller, callers, work, depth + 1);
 		case SURFACE_PARALLEL:
 			foreach (&binding : expression.data.parallel.bindings)
-				collect_effect_call_edges(calls, binding.value, caller, callees, callers, work, depth + 1);
-			collect_effect_call_edges(calls, expression.data.parallel.result, caller, callees, callers, work, depth + 1);
+				collect_effect_call_edges(calls, binding.value, caller, callers, work, depth + 1);
+			collect_effect_call_edges(calls, expression.data.parallel.result, caller, callers, work, depth + 1);
 		case SURFACE_HANDLER:
-			collect_effect_call_edges(calls, expression.data.handler.handled, caller, callees, callers, work, depth + 1);
+			collect_effect_call_edges(calls, expression.data.handler.handled, caller, callers, work, depth + 1);
 			foreach (&clause : expression.data.handler.clauses)
-				collect_effect_call_edges(calls, clause.body, caller, callees, callers, work, depth + 1);
-			collect_effect_call_edges(calls, expression.data.handler.return_clause.body, caller, callees, callers, work, depth + 1);
+				collect_effect_call_edges(calls, clause.body, caller, callers, work, depth + 1);
+			collect_effect_call_edges(calls, expression.data.handler.return_clause.body, caller, callers, work, depth + 1);
 		case SURFACE_RESUME:
-			collect_effect_call_edges(calls, expression.data.resume.value, caller, callees, callers, work, depth + 1);
+			collect_effect_call_edges(calls, expression.data.resume.value, caller, callers, work, depth + 1);
 		default:
 	}
 }
 
-fn void effect_tarjan_visit(
-	usz vertex,
-	List{usz}[] callees,
-	sz[] indices,
-	usz[] lowlinks,
-	bool[] on_stack,
-	List{usz}* stack,
-	usz* next_index,
-	usz[] components,
-	usz* component_count,
-	EffectInferenceWork* work
-) @private
-{
-	if (!effect_charge(work)) return;
-	indices[vertex] = (sz)*next_index;
-	lowlinks[vertex] = (*next_index)++;
-	stack.push(vertex);
-	on_stack[vertex] = true;
-	foreach (target : callees[vertex])
-	{
-		if (indices[target] < 0)
-		{
-			effect_tarjan_visit(target, callees, indices, lowlinks, on_stack, stack,
-				next_index, components, component_count, work);
-			if (lowlinks[target] < lowlinks[vertex]) lowlinks[vertex] = lowlinks[target];
-		}
-		else if (on_stack[target] && (usz)indices[target] < lowlinks[vertex])
-		{
-			lowlinks[vertex] = (usz)indices[target];
-		}
-	}
-	if (lowlinks[vertex] != (usz)indices[vertex]) return;
-	while (stack.len())
-	{
-		usz member = stack.pop()!!;
-		on_stack[member] = false;
-		components[member] = *component_count;
-		if (member == vertex) break;
-	}
-	(*component_count)++;
-}
 
 fn void collect_lambda_effect_info(
 	EffectRegistry* registry,
@@ -1022,6 +1847,7 @@ fn void collect_lambda_effect_info(
 	EffectCallIndex* calls,
 	SurfaceExpr* expression,
 	List{EffectId}[] rows,
+	SymbolKey*[] row_tails,
 	List{LambdaEffectInfo}* lambdas,
 	List{MitosDiagnostic}* diagnostics,
 	Allocator allocator,
@@ -1036,8 +1862,11 @@ fn void collect_lambda_effect_info(
 		List{EffectId} asserted;
 		inferred.init(allocator);
 		asserted.init(allocator);
-		collect_expression_effects(registry, calls, expression.data.lambda.body, &inferred, rows,
-			diagnostics, allocator, work, depth + 1);
+		SymbolKey* inferred_tail = null;
+		collect_expression_effects(
+			registry, calls, expression.data.lambda.body, &inferred, rows,
+			row_tails, &inferred_tail, diagnostics, allocator, work, depth + 1
+		);
 		if (expression.data.lambda.effect_row)
 		{
 			foreach (effect_expr : expression.data.lambda.effect_row.effects)
@@ -1058,76 +1887,131 @@ fn void collect_lambda_effect_info(
 				bool declared = false;
 				foreach (asserted_effect : asserted)
 				{
-					if (effect_constructor_id(registry, asserted_effect) == effect_constructor_id(registry, *effect))
+					if (effect_constructor_id(registry, asserted_effect)
+						== effect_constructor_id(registry, *effect))
 					{
 						declared = true;
-						if (asserted_effect != effect_constructor_id(registry, asserted_effect)) *effect = asserted_effect;
+						if (asserted_effect != effect_constructor_id(registry, asserted_effect))
+						{
+							*effect = asserted_effect;
+						}
 					}
 				}
-				if (!declared)
+				if (!declared && !expression.data.lambda.effect_row.has_tail)
 				{
-					effects_add_diagnostic(diagnostics, allocator,
-						"lambda 'does' row omits an inferred transitive effect", expression.data.lambda.effect_row.span);
+					effects_add_diagnostic(
+						diagnostics, allocator,
+						"lambda 'does' row omits an inferred transitive effect",
+						expression.data.lambda.effect_row.span
+					);
 				}
 			}
 		}
+		EffectId[] inferred_ids = inferred.to_array(allocator);
+		EffectId[] asserted_ids = asserted.to_array(allocator);
+		SymbolKey* asserted_tail = expression.data.lambda.effect_row
+			&& expression.data.lambda.effect_row.has_tail
+			? &expression.data.lambda.effect_row.tail : null;
+		if (expression.data.lambda.effect_row && inferred_tail
+			&& (!asserted_tail || !symbol_key_equal(inferred_tail, asserted_tail)))
+		{
+			effects_add_diagnostic(
+				diagnostics, allocator,
+				"lambda 'does' row tail does not unify with its inferred open effect tail",
+				expression.data.lambda.effect_row.span
+			);
+		}
 		lambdas.push({
 			.span = expression.span,
-			.inferred = inferred.to_array(allocator),
-			.asserted = asserted.to_array(allocator),
+			.inferred = normalize_effect_row(inferred_ids, inferred_tail, allocator),
+			.asserted = normalize_effect_row(asserted_ids, asserted_tail, allocator),
 			.has_assertion = expression.data.lambda.effect_row != null,
 		});
+		alloc::free(allocator, inferred_ids);
+		alloc::free(allocator, asserted_ids);
 		inferred.free();
 		asserted.free();
-		collect_lambda_effect_info(registry, types, calls, expression.data.lambda.body, rows,
-			lambdas, diagnostics, allocator, work, depth + 1);
+		collect_lambda_effect_info(
+			registry, types, calls, expression.data.lambda.body, rows, row_tails,
+			lambdas, diagnostics, allocator, work, depth + 1
+		);
 		return;
 	}
 	switch (expression.kind)
 	{
 		case SURFACE_APPLICATION:
-			collect_lambda_effect_info(registry, types, calls, expression.data.application.callee, rows,
-				lambdas, diagnostics, allocator, work, depth + 1);
+			collect_lambda_effect_info(
+				registry, types, calls, expression.data.application.callee, rows, row_tails,
+				lambdas, diagnostics, allocator, work, depth + 1
+			);
 			foreach (argument : expression.data.application.arguments)
-				collect_lambda_effect_info(registry, types, calls, argument, rows,
-					lambdas, diagnostics, allocator, work, depth + 1);
+				collect_lambda_effect_info(
+					registry, types, calls, argument, rows, row_tails,
+					lambdas, diagnostics, allocator, work, depth + 1
+				);
 		case SURFACE_EFFECT_OPERATION:
 			foreach (argument : expression.data.effect_operation.arguments)
-				collect_lambda_effect_info(registry, types, calls, argument, rows,
-					lambdas, diagnostics, allocator, work, depth + 1);
+				collect_lambda_effect_info(
+					registry, types, calls, argument, rows, row_tails,
+					lambdas, diagnostics, allocator, work, depth + 1
+				);
 		case SURFACE_BINARY:
-			collect_lambda_effect_info(registry, types, calls, expression.data.binary.left, rows,
-				lambdas, diagnostics, allocator, work, depth + 1);
-			collect_lambda_effect_info(registry, types, calls, expression.data.binary.right, rows,
-				lambdas, diagnostics, allocator, work, depth + 1);
+			collect_lambda_effect_info(
+				registry, types, calls, expression.data.binary.left, rows, row_tails,
+				lambdas, diagnostics, allocator, work, depth + 1
+			);
+			collect_lambda_effect_info(
+				registry, types, calls, expression.data.binary.right, rows, row_tails,
+				lambdas, diagnostics, allocator, work, depth + 1
+			);
 		case SURFACE_DEFINITION:
-			collect_lambda_effect_info(registry, types, calls, expression.data.definition.value, rows,
-				lambdas, diagnostics, allocator, work, depth + 1);
-			collect_lambda_effect_info(registry, types, calls, expression.data.definition.body, rows,
-				lambdas, diagnostics, allocator, work, depth + 1);
+			collect_lambda_effect_info(
+				registry, types, calls, expression.data.definition.value, rows, row_tails,
+				lambdas, diagnostics, allocator, work, depth + 1
+			);
+			collect_lambda_effect_info(
+				registry, types, calls, expression.data.definition.body, rows, row_tails,
+				lambdas, diagnostics, allocator, work, depth + 1
+			);
 		case SURFACE_MATCH:
-			collect_lambda_effect_info(registry, types, calls, expression.data.match_expr.scrutinee, rows,
-				lambdas, diagnostics, allocator, work, depth + 1);
+			collect_lambda_effect_info(
+				registry, types, calls, expression.data.match_expr.scrutinee, rows, row_tails,
+				lambdas, diagnostics, allocator, work, depth + 1
+			);
 			foreach (&arm : expression.data.match_expr.arms)
-				collect_lambda_effect_info(registry, types, calls, arm.body, rows,
-					lambdas, diagnostics, allocator, work, depth + 1);
+				collect_lambda_effect_info(
+					registry, types, calls, arm.body, rows, row_tails,
+					lambdas, diagnostics, allocator, work, depth + 1
+				);
 		case SURFACE_PARALLEL:
 			foreach (&binding : expression.data.parallel.bindings)
-				collect_lambda_effect_info(registry, types, calls, binding.value, rows,
-					lambdas, diagnostics, allocator, work, depth + 1);
-			collect_lambda_effect_info(registry, types, calls, expression.data.parallel.result, rows,
-				lambdas, diagnostics, allocator, work, depth + 1);
+				collect_lambda_effect_info(
+					registry, types, calls, binding.value, rows, row_tails,
+					lambdas, diagnostics, allocator, work, depth + 1
+				);
+			collect_lambda_effect_info(
+				registry, types, calls, expression.data.parallel.result, rows, row_tails,
+				lambdas, diagnostics, allocator, work, depth + 1
+			);
 		case SURFACE_HANDLER:
-			collect_lambda_effect_info(registry, types, calls, expression.data.handler.handled, rows,
-				lambdas, diagnostics, allocator, work, depth + 1);
+			collect_lambda_effect_info(
+				registry, types, calls, expression.data.handler.handled, rows, row_tails,
+				lambdas, diagnostics, allocator, work, depth + 1
+			);
 			foreach (&clause : expression.data.handler.clauses)
-				collect_lambda_effect_info(registry, types, calls, clause.body, rows,
-					lambdas, diagnostics, allocator, work, depth + 1);
-			collect_lambda_effect_info(registry, types, calls, expression.data.handler.return_clause.body, rows,
-				lambdas, diagnostics, allocator, work, depth + 1);
+				collect_lambda_effect_info(
+					registry, types, calls, clause.body, rows, row_tails,
+					lambdas, diagnostics, allocator, work, depth + 1
+				);
+			collect_lambda_effect_info(
+				registry, types, calls, expression.data.handler.return_clause.body, rows, row_tails,
+				lambdas, diagnostics, allocator, work, depth + 1
+			);
 		case SURFACE_RESUME:
-			collect_lambda_effect_info(registry, types, calls, expression.data.resume.value, rows,
-				lambdas, diagnostics, allocator, work, depth + 1);
+			collect_lambda_effect_info(
+				registry, types, calls, expression.data.resume.value, rows, row_tails,
+				lambdas, diagnostics, allocator, work, depth + 1
+			);
 		default:
 	}
 }
@@ -1147,32 +2031,25 @@ fn EffectAnalysis infer_effect_rows(
 	EffectCallIndex calls = build_effect_call_index(program, allocator);
 	defer calls.deinit();
 	List{EffectId}[] rows = alloc::new_array(allocator, List{EffectId}, program.functions.len);
-	List{usz}[] callees = alloc::new_array(allocator, List{usz}, program.functions.len);
 	List{usz}[] callers = alloc::new_array(allocator, List{usz}, program.functions.len);
-	foreach (&row : rows) row.init(allocator);
-	foreach (&edges : callees) edges.init(allocator);
-	foreach (&edges : callers) edges.init(allocator);
-	foreach (function_index, &function : program.functions)
-		collect_effect_call_edges(&calls, function.body, (usz)function_index, callees, callers, &work);
-
-	sz[] indices = alloc::new_array(allocator, sz, program.functions.len);
-	usz[] lowlinks = alloc::new_array(allocator, usz, program.functions.len);
-	bool[] on_stack = alloc::new_array(allocator, bool, program.functions.len);
-	usz[] components = alloc::new_array(allocator, usz, program.functions.len);
-	foreach (&index : indices) *index = -1;
-	List{usz} stack;
-	stack.init(allocator);
-	usz next_index = 0;
-	usz component_count = 0;
+	SymbolKey*[] inferred_tails = alloc::new_array(
+		allocator, SymbolKey*, program.functions.len
+	);
+	SymbolKey*[] propagated_tails = alloc::new_array(
+		allocator, SymbolKey*, program.functions.len
+	);
 	foreach (function_index, &function : program.functions)
 	{
-		if (indices[function_index] < 0)
+		if (function.effect_row && function.effect_row.has_tail)
 		{
-			effect_tarjan_visit((usz)function_index, callees, indices, lowlinks, on_stack, &stack,
-				&next_index, components, &component_count, &work);
+			propagated_tails[function_index] = &function.effect_row.tail;
 		}
 	}
-	stack.free();
+	foreach (&row : rows) row.init(allocator);
+	foreach (&edges : callers) edges.init(allocator);
+	foreach (function_index, &function : program.functions)
+		collect_effect_call_edges(&calls, function.body, (usz)function_index, callers, &work);
+
 
 	List{usz} queue;
 	queue.init(allocator);
@@ -1189,33 +2066,49 @@ fn EffectAnalysis infer_effect_rows(
 		queued[function_index] = false;
 		List{EffectId} collected;
 		collected.init(allocator);
-		collect_expression_effects(registry, &calls, program.functions[function_index].body, &collected,
-			rows, &diagnostics, allocator, &work, 0);
+		SymbolKey* collected_tail = null;
+		collect_expression_effects(
+			registry, &calls, program.functions[function_index].body, &collected,
+			rows, propagated_tails, &collected_tail, &diagnostics, allocator, &work, 0
+		);
 		bool changed = false;
 		foreach (effect : collected)
 			if (inferred_row_add(&rows[function_index], effect, &work)) changed = true;
 		collected.free();
+		if (collected_tail && !inferred_tails[function_index])
+		{
+			inferred_tails[function_index] = collected_tail;
+			if (!(program.functions[function_index].effect_row
+				&& program.functions[function_index].effect_row.has_tail))
+			{
+				propagated_tails[function_index] = collected_tail;
+			}
+			changed = true;
+		}
+		else if (collected_tail && inferred_tails[function_index]
+			&& !symbol_key_equal(inferred_tails[function_index], collected_tail))
+		{
+			effects_add_diagnostic(
+				&diagnostics, allocator,
+				"effect inference cannot unify transitive open row tails",
+				program.functions[function_index].span
+			);
+		}
 		if (!changed) continue;
 		foreach (caller : callers[function_index])
 		{
+			if (!effect_charge(&work)) break;
 			if (!queued[caller]) { queue.push(caller); queued[caller] = true; }
-		}
-		if (!effect_charge(&work, components.len)) break;
-		foreach (peer_index, component : components)
-		{
-			if (component == components[function_index] && !queued[peer_index])
-			{
-				queue.push((usz)peer_index);
-				queued[peer_index] = true;
-			}
 		}
 	}
 	queue.free();
 	List{LambdaEffectInfo} lambdas;
 	lambdas.init(allocator);
 	foreach (&function : program.functions)
-		collect_lambda_effect_info(registry, types, &calls, function.body, rows, &lambdas,
-			&diagnostics, allocator, &work);
+		collect_lambda_effect_info(
+			registry, types, &calls, function.body, rows, propagated_tails,
+			&lambdas, &diagnostics, allocator, &work
+		);
 	analysis.lambdas = lambdas.to_array(allocator);
 	lambdas.free();
 	analysis.inference_steps = work.used;
@@ -1258,22 +2151,44 @@ fn EffectAnalysis infer_effect_rows(
 						if (asserted_effect != effect_constructor_id(registry, asserted_effect)) *inferred = asserted_effect;
 					}
 				}
-				if (!declared)
+				if (!declared && !function.effect_row.has_tail)
 				{
-					effects_add_diagnostic(&diagnostics, allocator, "explicit 'does' row omits an inferred transitive effect", function.effect_row.span);
+					effects_add_diagnostic(
+						&diagnostics, allocator,
+						"explicit 'does' row omits an inferred transitive effect",
+						function.effect_row.span
+					);
 				}
 			}
 		}
+		EffectId[] inferred_ids = rows[(usz)function_index].to_array(allocator);
+		EffectId[] asserted_ids = asserted.to_array(allocator);
+		SymbolKey* asserted_tail = function.effect_row && function.effect_row.has_tail
+			? &function.effect_row.tail : null;
+		if (function.effect_row && inferred_tails[function_index]
+			&& (!asserted_tail
+				|| !symbol_key_equal(inferred_tails[function_index], asserted_tail)))
+		{
+			effects_add_diagnostic(
+				&diagnostics, allocator,
+				"explicit 'does' row tail does not unify with its inferred open effect tail",
+				function.effect_row.span
+			);
+		}
 		analysis.methods[(usz)function_index] = {
 			.function_index = (usz)function_index,
-			.inferred = rows[(usz)function_index].to_array(allocator),
-			.asserted = asserted.to_array(allocator),
+			.inferred = normalize_effect_row(
+				inferred_ids, inferred_tails[function_index], allocator
+			),
+			.asserted = normalize_effect_row(asserted_ids, asserted_tail, allocator),
 			.has_assertion = function.effect_row != null,
 		};
+		alloc::free(allocator, inferred_ids);
+		alloc::free(allocator, asserted_ids);
 		asserted.free();
 		if (function.name == "main")
 		{
-			bool unhandled = false;
+			bool unhandled = inferred_tails[function_index] != null;
 			foreach (effect : rows[(usz)function_index])
 			{
 				EffectDescriptor* descriptor = effect_descriptor(registry, effect_constructor_id(registry, effect));
@@ -1289,15 +2204,11 @@ fn EffectAnalysis infer_effect_rows(
 		validate_handler_multiplicity(registry, function.body, &diagnostics, allocator);
 	}
 	foreach (&row : rows) row.free();
-	foreach (&edges : callees) edges.free();
 	foreach (&edges : callers) edges.free();
 	alloc::free(allocator, rows);
-	alloc::free(allocator, callees);
 	alloc::free(allocator, callers);
-	alloc::free(allocator, indices);
-	alloc::free(allocator, lowlinks);
-	alloc::free(allocator, on_stack);
-	alloc::free(allocator, components);
+	alloc::free(allocator, inferred_tails);
+	alloc::free(allocator, propagated_tails);
 	alloc::free(allocator, queued);
 	analysis.diagnostics = diagnostics.to_array(allocator);
 	analysis.effect_epoch = registry.epoch;
@@ -1305,25 +2216,3 @@ fn EffectAnalysis infer_effect_rows(
 	return analysis;
 }
 
-fn bool validate_effect_row_assertion(EffectRegistry* registry, MethodEffectInfo* info, EffectId actual)
-{
-	if (!info.has_assertion) return true;
-	foreach (declared : info.asserted)
-	{
-		if (declared == actual || effect_constructor_id(registry, declared) == effect_constructor_id(registry, actual))
-		{
-			return true;
-		}
-	}
-	return false;
-}
-fn EffectInvalidation bump_effect_epoch(EffectRegistry* registry, EffectId changed_effect)
-{
-	EffectInvalidation invalidation = {
-		.previous_epoch = registry.epoch,
-		.changed_effect = changed_effect,
-	};
-	registry.epoch++;
-	invalidation.current_epoch = registry.epoch;
-	return invalidation;
-}

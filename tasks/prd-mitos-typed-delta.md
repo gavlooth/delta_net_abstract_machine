@@ -9,27 +9,61 @@ Phases one and two established typed multiple dispatch and algebraic effects. Ph
 
 Mitos remains dynamically typed: names are immutable bindings, while every runtime value has a concrete nominal `TypeId`. Type annotations are optional and use the word `of`. Generic functions dispatch over all argument types, including each concrete lifted alternative.
 
+## Core-Lock Phase: Shared v4 IR/ABI Schemas
+
+This phase precedes subsystem implementation. It locks exactly these five seams:
+
+1. **Canonical identity.** `ModuleKey` and `SymbolKey` are allocator-owned structural records with clone/deinit/equality helpers. Core, default, and REPL module keys are reserved. Program and named declarations own canonical keys; display names remain separate, and a hash is never sufficient for identity.
+2. **Resolved effect rows.** One owned `ResolvedEffectRow` contains sorted unique required `EffectId`s plus an optional canonical `SymbolKey` tail. Normalize/clone/deinit/equality/membership are shared contracts; the source AST continues to own its parsed `EffectRow`.
+3. **Persistent data layouts.** `LayoutDescriptor` records layout kind, copy policy, explicit sized/unsized state, size, nonzero power-of-two alignment, stride, element `TypeId`, and stable key, with no runtime address. Built-in `TypeId`s 1 through 10 and their deterministic layouts are fixed.
+4. **Persistence and helper ABI.** `DeltaProgram` uses schema 4.0, helper ABI 2.0, tagged records, and a program-owned required/optional feature manifest. Named bits cover typed values, effects, parallelism, host calls, superposition, identity keys, effect rows, layouts, suspension, tagged records, and dynamic effectful closures. Effect/handler/resume/abort tags remain 32/33/34/35. MIR advertises every known feature except `SUSPENSION` and `DYNAMIC_EFFECT_CLOSURES`. Direct `jit` rejects either required bit before MIR emission; after artifact validation, `aot-run` uses the same predicate and selects generic Delta whenever any required bit is outside MIR's advertised set.
+5. **Host suspension boundary.** Persistent data describes suspension capability only. A ready-only external helper returns `HOST_READY` (or `HOST_FAIL`), requires `HOST` while leaving `SUSPENSION` optional, and remains MIR-eligible when its exact versioned operation slot is explicitly enrolled. A helper that may retain execution and return `HOST_SUSPEND` makes `SUSPENSION` required and therefore routes to generic Delta. Opaque suspension tokens, execution contexts, allocators, callbacks, pointers, retain counts, and host handles are runtime-only and must never be serialized.
+
+**Dependency order:** canonical identity → resolved effect rows → persistent data layouts → persistence/helper ABI → host suspension boundary. Downstream parser, lowering, runtime, net, MIR, AOT, REPL, and CLI work starts only after these contracts are fixed.
+
+**Explicit library deferrals:** module/import syntax, collection APIs, scheduler types, FFI syntax, Vulkan types, traits, unions, macros, library implementations, and new core agents are outside this phase. No placeholder library surface or compatibility shim is introduced.
+
+**Security and resource invariants:**
+
+- Every owned string/slice/key/row/layout has one documented allocator owner and a matching clone/deinit path; persisted records contain no raw runtime pointer or token.
+- Decoders must bound counts and byte lengths before allocation, reject overflow and overlapping required/optional bits, reject unknown required features, and skip unknown optional tagged records by validated length.
+- Layout alignment is nonzero and power-of-two; sized arithmetic is checked before allocation; abstract/unsized layouts are explicit and unallocatable.
+- Effect rows are canonical sorted unique sets; symbol identity is compared structurally; helper tags and existing enum ordinals are append-only and stable.
+- Suspension tokens are runtime-bound, single-consumption capabilities; stale, duplicate, cross-runtime, and persisted-token use is rejected before resumption.
+
+**Verification acceptance criteria:**
+
+- [ ] Structural inspection finds all five schemas and their ownership helpers in the shared core files, with no deferred library surface or new core agent.
+- [ ] Built-in `TypeId`s remain exactly 1–10; effect/handler/resume/abort tags remain exactly 32–35; pre-existing enum ordinals are unchanged.
+- [ ] Canonical-row examples normalize to sorted unique IDs and preserve or clone the optional structural tail key.
+- [ ] Every built-in layout passes the alignment/sized invariant and carries a stable key without a runtime address.
+- [ ] A schema-4.0/helper-2.0 manifest distinguishes required from optional named features, rejects overlap/unknown required bits, and contains no host suspension token.
+- [ ] Programs with branch-selected or superposed distinct effectful closures require `DYNAMIC_EFFECT_CLOSURES`; `run` and `aot-run` execute them through generic Delta, while `jit` rejects before MIR emission with a capability diagnostic.
+- [ ] Ready-only external host operations require `HOST`, keep `SUSPENSION` optional, and remain MIR-eligible through explicit exact-slot helper enrollment; a manifest that truly requires `SUSPENSION` is rejected by direct `jit` before emission and routed to generic Delta by `aot-run`.
+- [ ] Ownership review accounts for success, clone, partial-construction failure, and deinit paths without leaks or double frees.
+
 ## 2. Goals
 
 - Add nominal abstract, concrete-final, and parametric runtime types.
 - Use one low-punctuation `of` syntax for annotations and type application.
 - Add optional typed fields, parameters, results, bindings, and constructor payloads.
 - Add generic functions and deterministic multiple dispatch over all arguments.
-- Keep method tables open in the REPL with epoch-based specialization invalidation.
+- Keep method tables open in the REPL, with method epochs participating in semantic dispatch so updates affect the next applicable call.
 - Expose minimal reflection through `typeOf(value)` and first-class `Type of T` values.
 - Introduce serializable typed `DeltaProgram`/`NetImage` as the only executable semantic IR.
 - Make `run`, `jit`, `repl`, `aot`, and `aot-run` consume the same Delta semantics.
 - Replace direct `SurfaceExpr -> MirProgram` lowering with `DeltaProgram -> MIR` specialization.
-- Evolve the source-free artifact contract to AOT v3 over Delta schema v3; versions 1 and 2 are rejected rather than upgraded.
+- Evolve the source-free artifact contract to canonical AOT v4.0 over Delta schema 4.0; AOT v1-v3 and prior Delta schemas are rejected rather than upgraded.
 - Preserve stable-slot allocation, eraser reclamation, Delta phase ordering, explicit parallel roots, and observable replicator boundaries.
 - Add first-class deterministic superposition without adding a `SUP` core agent.
 
 ## 3. Quality Gates
 
-These commands must pass for every user story. No tests are added or run.
+These commands must pass for every user story. Core-lock behavior is additionally defended by permanent identity/effect-row, storage ownership, suspension isolation, and net-invariant tests.
 
 ```sh
 c3c build mitos
+c3c test
 ./build/mitos check examples/native_math.mitos
 ./build/mitos run examples/parallel_match.mitos --threads 2
 ./build/mitos jit examples/native_math.mitos
@@ -49,7 +83,7 @@ Expected observable results:
 - The native arithmetic/parallel `run`, `jit`, and `aot-run` paths print `42`.
 - Superposition `run`, `jit`, and `aot-run` each print `[Pair(2, 11), Pair(2, 21), Pair(4, 12), Pair(4, 22)]`.
 - REPL prints `20` and then `42`.
-- No command silently falls back to another backend.
+- `jit` never silently falls back to another backend. It rejects before MIR emission when the required-feature manifest contains a capability MIR does not advertise. `aot-run` uses that same predicate to deliberately select generic Delta; the currently named MIR exclusions are `SUSPENSION` and `DYNAMIC_EFFECT_CLOSURES`.
 - The superposition commands are active quality gates, not illustrative snippets.
 
 ## 4. Locked Surface Syntax
@@ -163,7 +197,7 @@ Angle brackets, square-bracket generic arguments, `::`, `<:`, `where`, and impli
 - [ ] Store the registry in program-lifetime arena memory, outside ordinary net reclamation.
 
 ### US-004: Intern parametric type instances
-**Description:** As the runtime, I want canonical parametric type instances so that equivalent applications share one TypeId and dispatch cache key.
+**Description:** As the runtime, I want canonical parametric type instances so that equivalent applications share one TypeId and dispatch identity.
 
 **Acceptance Criteria:**
 - [ ] Intern `(type constructor, type/value parameter tuple)` into one stable TypeId.
@@ -275,15 +309,14 @@ Angle brackets, square-bracket generic arguments, `::`, `<:`, `where`, and impli
 - [ ] MIR does not merely emit one call to the generic Delta runtime.
 - [ ] `run` and `jit` produce identical values/errors for the typed dispatch example.
 
-### US-015: Add MIR method-instance specialization caching
-**Description:** As a JIT user, I want concrete method tuples specialized once so that dynamic dispatch becomes efficient without changing semantics.
+### US-015: Specialize each Delta program in MIR
+**Description:** As a JIT user, I want concrete calls specialized from the current lowered program so that MIR improves execution without changing semantics.
 
 **Acceptance Criteria:**
-- [ ] Cache key is `(generic function, method, concrete argument TypeId tuple, method epoch)`.
+- [ ] Each MIR context specializes one `DeltaProgram`; a later successful REPL entry reparses and lowers the retained source before MIR specializes the new current image.
 - [ ] Compile the selected Delta method body, not the source AST method.
-- [ ] Eliminate redundant dispatch and type assertions inside valid specializations.
+- [ ] Eliminate redundant dispatch and type assertions where the current program proves a concrete call tuple.
 - [ ] Unbox stable primitive layouts where ABI and escape rules permit.
-- [ ] Bound cache size and release invalidated native code explicitly.
 
 ### US-016: Support open method tables in the REPL
 **Description:** As a REPL user, I want to add methods interactively and have later calls use them immediately.
@@ -291,21 +324,23 @@ Angle brackets, square-bracket generic arguments, `::`, `<:`, `where`, and impli
 **Acceptance Criteria:**
 - [ ] REPL retains type and method declarations in addition to immutable bindings.
 - [ ] Adding or replacing a method increments only that generic function's epoch.
-- [ ] Specializations for the affected generic are invalidated; unrelated generics remain cached.
+- [ ] Method epochs participate in semantic dispatch, and every successful entry reparses and lowers the retained source into the current `DeltaProgram`.
 - [ ] The next call sees the newest unique most-specific method.
 - [ ] `typeOf(value)` returns a first-class `Type of T` value in the REPL.
 - [ ] No Julia-style world-age restriction is introduced.
 
-### US-017: Persist typed DeltaProgram v3 in AOT v3
-**Description:** As an AOT user, I want artifacts to preserve Mitos's Delta paradigm, type/method semantics, effects, and observable superpositions rather than backend-specific MIR instructions.
+### US-017: Persist typed DeltaProgram schema 4.0 in AOT v4
+**Description:** As an AOT user, I want artifacts to preserve Mitos's Delta paradigm, type/method semantics, effects, layouts, and observable superpositions rather than backend-specific MIR instructions.
 
 **Acceptance Criteria:**
-- [ ] Serialize Delta schema v3 in an AOT v3 canonical endian-defined format.
-- [ ] Include the type graph, parametric instances, generic functions, method signatures, constructor layouts, primitive IDs, agent/wire image, parallel roots, effect metadata, source origins, and observable replicator metadata.
-- [ ] Record helper ABI 1.2 and its superposition feature bit.
-- [ ] `aot-run` validates all counts, offsets, TypeIds, method references, ports, wires, origins, observable markers, and ABI fields before allocation.
+- [ ] Serialize Delta schema 4.0 in canonical little-endian AOT v4 with major/minor/header-length/artifact-length header fields and a required manifest as the first tagged record.
+- [ ] Emit deterministic ascending singleton records with explicit REQUIRED or OPTIONAL flags and checked `u64` payload lengths.
+- [ ] Persist the program `ModuleKey`, every persistent `SymbolKey` and owner, method identity/coherence, resolved effect rows and optional tails, `TypeId`-indexed layouts and copy policies, type/effect/graph/superposition metadata, and schema/helper required and optional capabilities.
+- [ ] Accept higher compatible minors when every required feature and record is supported; skip unknown optional records exactly by bounded length; reject unknown required, missing, duplicate, misflagged, out-of-order, feature-incoherent, truncated, overflowing, and trailing records.
+- [ ] Prove structural lengths, counts, and allocation budgets before allocating decoded collections; validate semantic identities, owners, TypeIds, method/local-ID mappings, rows, layouts, ports, wires, origins, observable markers, and ABI fields after reconstruction but before execution.
+- [ ] Never serialize runtime registries, storage handles, pointers, callbacks, refcounts, views, live resources, execution contexts, suspension tokens, or resumption tokens.
 - [ ] `aot-run` invokes generic or MIR-specialized Delta execution without parsing or lowering source.
-- [ ] AOT versions 1 and 2 fail with an explicit unsupported-version diagnostic; no compatibility loader upgrades them.
+- [ ] AOT versions 1, 2, and 3 fail with an explicit unsupported-version diagnostic; no compatibility loader upgrades them.
 
 ### US-018: Add minimal type reflection
 **Description:** As a programmer, I want to inspect a value's type without exposing the entire runtime registry.
@@ -330,10 +365,10 @@ Angle brackets, square-bracket generic arguments, `::`, `<:`, `where`, and impli
 **Description:** As a maintainer, I want one current architecture so future changes cannot accidentally target obsolete backends.
 
 **Acceptance Criteria:**
-- [ ] Remove direct surface MIR runtime helpers, old specialization structures, and AOT v1/v2 constants and files.
+- [ ] Remove direct surface MIR runtime helpers and pre-v4 AOT constants and files.
 - [ ] Production search finds no direct `SurfaceExpr` dependency in the MIR backend.
-- [ ] Documentation and examples describe Delta-first JIT, typed AOT v3, open methods, `of` syntax, and deterministic superposition only.
-- [ ] Existing `.mita` v1 and v2 artifacts fail with an explicit unsupported-version diagnostic.
+- [ ] Documentation and examples describe Delta-first JIT, typed AOT v4, open methods, `of` syntax, and deterministic superposition only.
+- [ ] Existing AOT v1-v3 artifacts fail with an explicit unsupported-version diagnostic.
 
 ### US-021: Add typed dispatch examples and complete CLI smoke
 **Description:** As a user, I want concrete examples proving generic Delta execution, MIR specialization, REPL method updates, and typed AOT artifacts.
@@ -343,7 +378,7 @@ Angle brackets, square-bracket generic arguments, `::`, `<:`, `where`, and impli
 - [ ] `check` accepts the example.
 - [ ] Delta `run` and MIR `jit` print the same result.
 - [ ] REPL can add a more-specific method and observe it on the next call.
-- [ ] AOT v3 creation and `aot-run` print the same result.
+- [ ] AOT v4 creation and `aot-run` print the same result.
 - [ ] No tests are added or run.
 
 ## 6. Functional Requirements
@@ -367,8 +402,8 @@ Angle brackets, square-bracket generic arguments, `::`, `<:`, `where`, and impli
 - FR-17: Parallel argument demands and explicit parallel roots must use the fixed Delta worker scheduler.
 - FR-18: Type metadata must live in program-lifetime arenas; ordinary values remain eraser-reclaimed stable slots.
 - FR-19: `typeOf` and `Type of T` are the only initial public reflection facilities.
-- FR-20: AOT v3 must serialize Delta schema v3 and reject artifact versions 1 and 2.
-- FR-21: All parsers/loaders/registries/caches must retain existing bounded-resource behavior.
+- FR-20: AOT v4 must serialize Delta schema 4.0 through manifest-first feature-negotiated records and reject artifact versions 1 through 3.
+- FR-21: All parsers, loaders, and registries must retain existing bounded-resource behavior; structural safety precedes allocation and semantic/reference validation precedes execution.
 - FR-22: No backend may silently fall back to another backend.
 - FR-23: `superpose` must be nonempty, eager, source ordered, and homogeneous by concrete runtime TypeId after nested flattening.
 - FR-24: `superpose` must produce `Superposition of T`; `collapse` must require that type strictly and produce an ordered `Array of T`.
@@ -382,7 +417,7 @@ Angle brackets, square-bracket generic arguments, `::`, `<:`, `where`, and impli
 - FR-32: No core `SUP` agent may be introduced.
 - FR-33: Uncollapsed superpositions must format as `superpose(a, b)` and collapsed arrays as `[a, b]`.
 - FR-34: Existing effect tags 32 through 35 and all prior enum ordinals must remain stable.
-- FR-35: Helper ABI 1.2 must advertise superposition with feature bit `0x10`.
+- FR-35: Helper ABI 2.0 must advertise superposition with the named `DELTA_FEATURE_SUPERPOSITION` bit.
 - FR-36: The `Superposition` type constructor must retain reserved built-in TypeId 10.
 
 ## 7. Non-Goals
@@ -396,7 +431,7 @@ Angle brackets, square-bracket generic arguments, `::`, `<:`, `where`, and impli
 - Native object/executable emission from MIR v1.
 - GPU execution or a second JIT backend.
 - Compatibility loading for AOT v1 or v2 artifacts.
-- Adding or running tests.
+- Tests that do not defend an observable contract.
 
 ## 8. Technical Architecture
 
@@ -409,7 +444,7 @@ Mitos source
   -> typed DeltaProgram / NetImage
        -> generic Delta execution (`run`)
        -> MIR-specialized Delta execution (`jit`, REPL)
-       -> serialized DeltaProgram v3 (`aot`)
+       -> serialized DeltaProgram schema 4.0 (`aot`)
 ```
 
 ### 8.2 Runtime metadata
@@ -456,7 +491,7 @@ EFFECT_OP / HANDLER / RESUME   reserved phase-two algebraic-effect forms
 
 ### 8.4 MIR specialization boundary
 
-MIR receives DeltaProgram plus optional concrete method-instance keys. Generated code owns:
+MIR receives one current `DeltaProgram` and produces a specialization scoped to that program image. Generated code owns:
 
 - program-specific net materialization;
 - Delta phase-one and phase-two loops;
@@ -472,7 +507,7 @@ Dynamic nodes and stable slots remain runtime data because rewrites create and r
 
 Algebraic effects are the locked phase-two control model. They fit Delta execution because a captured continuation is already a graph root: zero resumptions attach an eraser, one resumption is a direct wire, and multiple resumptions use a replicator rather than copying a stack.
 
-The typed foundation reserves stable effect/opcode ID ranges, an effect-registry section in DeltaProgram/AOT v3, versioned runtime-helper slots, and practical-agent tags so effects and superposition share one artifact and helper contract.
+The typed foundation reserves stable effect/opcode ID ranges, an effect record in DeltaProgram/AOT v4, versioned runtime-helper slots, and practical-agent tags so effects and superposition share one artifact and helper contract.
 
 ### 9.1 Locked effect syntax
 
@@ -593,17 +628,18 @@ External effects such as console or filesystem operations terminate at registere
 - [ ] Statically known handlers remove generic handler lookup.
 - [ ] Closed handler clauses may inline into specialized method instances.
 - [ ] One-shot resume may lower to a direct native continuation edge.
-- [ ] External effects call versioned runtime-helper slots with exact ABI signatures.
+- [ ] External effects call versioned runtime-helper slots with exact ABI signatures, and every ready-only helper is explicitly enrolled for its operation.
+- [ ] Ready-only host operations return `HOST_READY` or `HOST_FAIL`, require `HOST` while keeping `SUSPENSION` optional and MIR-eligible; operations that may return `HOST_SUSPEND` require `SUSPENSION`, so direct `jit` rejects before emission and `aot-run` selects generic Delta.
 
 ### US-029: Persist effects in REPL and AOT
 **Description:** As an interactive/AOT user, I want effects to survive the same program-image lifecycle as types and methods.
 
 **Acceptance Criteria:**
 - [ ] REPL persists effect declarations and handler methods.
-- [ ] Effect changes increment an effect epoch and invalidate affected MIR specializations.
+- [ ] Effect changes are reflected when the next successful entry reparses and lowers the retained source into the current `DeltaProgram`.
 - [ ] AOT DeltaProgram artifacts serialize effect registry, operation signatures, rows, handlers, and helper requirements.
 - [ ] AOT loading rejects missing/incompatible host handlers before execution.
-- [ ] AOT v3 artifacts with an empty effect registry remain valid for programs that declare no effects.
+- [ ] AOT v4 artifacts with an empty effect registry remain valid for programs that declare no effects.
 
 ### US-030: Add algebraic-effect examples and smoke
 **Description:** As a user, I want examples proving one-shot, aborting, multi-shot, parallel, MIR, REPL, and AOT effect behavior.
@@ -618,10 +654,11 @@ External effects such as console or filesystem operations terminate at registere
 ### 9.3 Effect persistence requirements
 
 - Keep effect and operation ID namespaces stable in DeltaProgram.
-- Serialize the effect registry in AOT v3.
-- Version the MIR/native runtime-helper table independently from artifact layout.
+- Serialize the effect registry in AOT v4.
+- Version the MIR/native runtime-helper table independently from artifact layout, and explicitly enroll every ready-only helper in its exact operation slot.
+- Keep `SUSPENSION` optional for ready-only host operations that return `HOST_READY` or `HOST_FAIL`; require it only when the helper contract may retain execution and return `HOST_SUSPEND`.
 - Keep practical-agent tags for EFFECT_OP, HANDLER, RESUME, and ABORT stable.
-- Keep continuation roots generation-bearing and serializable.
+- Serialize only static handler roots and requirements; live continuation/resumption tokens remain runtime-only.
 
 ### 9.4 Phase-two non-goals
 
@@ -711,11 +748,11 @@ The canonical result is `[Pair(2, 11), Pair(2, 21), Pair(4, 12), Pair(4, 22)]`. 
 **Description:** As a backend user, I want run, native execution, and artifacts to implement one superposition contract.
 
 **Acceptance Criteria:**
-- [ ] Delta schema version is 3 and serializes superposition nodes, stable origins, and observable replicator fields.
+- [ ] Delta schema version is 4.0 and serializes superposition nodes, stable origins, and observable replicator fields as tagged records.
 - [ ] MIR preserves correlation, Cartesian order, nested flattening, lifting, and source-ordered observations from the Delta image.
-- [ ] Runtime helper ABI 1.2 publishes feature bit `0x10` and validates it before superposition execution.
-- [ ] AOT version 3 persists all required Delta and helper metadata.
-- [ ] AOT versions 1 and 2 are rejected cleanly without partial upgrade or execution.
+- [ ] Runtime helper ABI 2.0 publishes `DELTA_FEATURE_SUPERPOSITION` and validates the required/optional manifest before superposition execution.
+- [ ] AOT version 4 persists all required Delta/helper metadata and negotiates additive optional capabilities.
+- [ ] AOT versions 1 through 3 are rejected cleanly without partial upgrade or execution.
 - [ ] `run`, `jit`, and `aot-run` produce byte-identical canonical results for the same program.
 
 ### US-037: Publish the deterministic example and active smoke
@@ -737,7 +774,78 @@ The canonical result is `[Pair(2, 11), Pair(2, 21), Pair(4, 12), Pair(4, 22)]`. 
 - Probabilistic, weighted, fair-search, or breadth-first choice policies.
 - Compatibility loading for AOT v1 or v2.
 
-## 11. Implementation Order
+## 11. Post-Core Phase Four: Effect-Mediated State and Affine Mutation
+
+This is a planned library/runtime-adapter phase, not a new core-lock seam. Mitos keeps immutable bindings and fields. Logical state is expressed through algebraic effects; actual in-place mutation is exposed only through an opaque affine resource backed by the existing layout, storage, generation, eraser, and runtime-local registry contracts.
+
+### 11.1 Locked direction
+
+- Do not add assignment, mutable fields, ambient references, or a generally shared mutable `Box`.
+- Retain `:=` exclusively for immutable definitions.
+- Use the existing parametric `State of S` effect for logical state. Its standard handler threads immutable state through resumptions and defines branch, abort, and return behavior without requiring mutable language values.
+- Reserve `Box of T`, if it is ever introduced, for immutable allocation/indirection. Name mutable identity explicitly `Cell of T` or `BufferBuilder of T`.
+- Make `Cell of T` an opaque library-level affine resource with runtime-local identity and a generation-bearing storage handle. It is never a raw address, serializable live handle, constructor field with implicit copy semantics, or new core agent.
+- Mediate creation, reads, writes, and freezing through a declared effect so effect rows expose stateful behavior and handler boundaries define ordering and lifetime.
+
+Proposed library surface:
+
+```mitos
+effect Cells of T:
+  create(initial of T) of Cell of T
+  read(cell of Cell of T) of T
+  write(cell of Cell of T, value of T) of Unit
+  freeze(cell of Cell of T) of T
+end
+```
+
+`freeze` consumes the affine capability, invalidates its generation, and returns an immutable value. Replication of a live cell is rejected. A caller must explicitly freeze it, request an independent snapshot, or opt into a separately specified synchronized shared resource.
+
+### US-038: Publish a pure State handler
+
+**Description:** As a Mitos programmer, I want ordinary logical state without ambient mutation so state remains visible in effect rows and deterministic across handlers.
+
+**Acceptance Criteria:**
+- [ ] Provide a standard `State of S` handler example implementing `get` and `put` by threading immutable handler state.
+- [ ] Return both the computation result and final state through an immutable nominal value.
+- [ ] Nested state handlers obey nearest lexical handler selection.
+- [ ] A one-shot operation clause that aborts discards the continuation's uncommitted state.
+- [ ] Multi-shot resumption starts each resumed path from an explicit state snapshot and preserves source resume order.
+- [ ] Generic Delta, MIR where supported, REPL, and AOT-run agree on result and final state.
+
+### US-039: Add an opaque affine Cell adapter
+
+**Description:** As a library or host-adapter author, I want bounded in-place updates for buffers, FFI, and performance-sensitive local algorithms without introducing general shared mutation.
+
+**Acceptance Criteria:**
+- [ ] Define opaque `Cell of T` identity separately from immutable `Box of T` semantics.
+- [ ] Back every cell with a runtime-local generation-bearing handle and `COPY_AFFINE`; persist only its static type/layout/helper requirements.
+- [ ] Implement effect-mediated `create`, `read`, `write`, and consuming `freeze` operations with checked type, runtime, generation, bounds, and lifecycle validation.
+- [ ] Reject stale, frozen, cross-runtime, cross-program, or double-released cells before access.
+- [ ] Erasers, handler exit, abort, cancellation, and partial construction release cell storage exactly once.
+- [ ] Reject implicit replication through constructors, superposition, parallel capture, or multi-shot continuation capture unless an explicit snapshot/freeze/synchronized-sharing policy applies.
+- [ ] Generic Delta and every advertised backend agree on successful results and deterministic rejection diagnostics.
+
+### US-040: Prove branch and concurrency policy before sugar
+
+**Description:** As a language designer, I want mutation behavior under replication to be explicit before considering convenient surface syntax.
+
+**Acceptance Criteria:**
+- [ ] Demonstrate branch-local `State` behavior under superposition and multi-shot effects.
+- [ ] Demonstrate that two distinct state handlers do not alias.
+- [ ] Demonstrate deterministic rejection of an affine cell shared across simultaneous parallel roots.
+- [ ] Keep synchronized `SharedCell`/`AtomicCell`, transaction, lock, and scheduler policy as separate libraries or host effects.
+- [ ] Do not add `var`, reassignment with `=`, mutable fields, or mutation operators in this phase.
+- [ ] Any future mutation sugar must lower to the effect API and must not change the meaning of `:=`.
+
+### 11.2 Phase-four non-goals
+
+- A mutable-by-default object model.
+- Implicit aliasing or copy-on-write for affine resources.
+- Serializing live cells, storage handles, host addresses, locks, or callbacks.
+- Treating effect implementation state as justification for ambient language mutation.
+- Silently choosing alias, snapshot, or synchronization semantics at a replicator.
+
+## 12. Implementation Order
 
 1. Type grammar and owned AST.
 2. Type registry and parametric interning.
@@ -745,31 +853,37 @@ The canonical result is `[Pair(2, 11), Pair(2, 21), Pair(4, 12), Pair(4, 22)]`. 
 4. Typed DeltaProgram format and source lowering.
 5. Practical typed Delta agents and dispatch.
 6. Generic typed Delta execution.
-7. DeltaProgram-to-MIR specialization and cache.
+7. Per-program `DeltaProgram`-to-MIR specialization.
 8. REPL open-method epochs and minimal reflection.
-9. Delta/AOT v3 artifacts with clean v1/v2 rejection.
+9. Delta schema 4.0 in AOT v4 artifacts with clean prior-schema and v1-v3 rejection.
 10. Remove direct surface MIR and legacy AOT paths.
 11. Typed examples, documentation, and complete CLI smoke.
 12. Algebraic effects US-022 through US-030.
 13. Deterministic superposition US-031 through US-037.
+14. Pure `State of S` standard handler and deterministic branch examples.
+15. Opaque affine `Cell of T` adapter over the locked storage/runtime seams.
+16. Mutation ergonomics only after state, lifecycle, replication, and parallel policy gates pass.
 
 Each step must leave `c3c build mitos` and the active CLI quality-gate smoke passing.
 
-## 12. Success Metrics
+## 13. Success Metrics
 
 - One typed dispatch program returns the same value under `run`, `jit`, REPL, and `aot-run`.
 - Adding a more-specific method in the REPL changes the next applicable call without restarting.
 - `typeOf` returns a stable, correctly formatted first-class type value.
 - MIR production modules contain no direct `SurfaceExpr` lowering.
-- AOT v3 artifacts contain no MirProgram instruction section and invoke no source parser/lowerer.
-- AOT versions 1 and 2 fail cleanly before reconstruction.
+- AOT v4 artifacts contain no MirProgram instruction section and invoke no source parser/lowerer.
+- AOT versions 1 through 3 fail cleanly before reconstruction.
 - Existing untyped arithmetic and parallel examples continue to produce `42`.
-- No tracing GC, backend fallback, alternate JIT, compatibility type syntax, `SUP` core agent, or tests are introduced.
+- No tracing GC, backend fallback, alternate JIT, compatibility type syntax, or `SUP` core agent is introduced.
 - One-shot and multi-shot effect examples agree under Delta and MIR execution.
 - The superposition example returns the stated correlated Cartesian array under `run`, `jit`, and `aot-run`.
-- Helper ABI 1.2 and feature bit `0x10` gate every superposition-capable native path.
+- Helper ABI 2.0 and `DELTA_FEATURE_SUPERPOSITION` gate every superposition-capable native path.
+- A pure State example returns the same result and final state under every advertised backend.
+- Affine cells reject stale, cross-runtime, frozen, replicated, and multiply consumed handles deterministically.
+- No mutable binding, mutable field, implicit shared box, new core agent, or serialized live resource is introduced.
 
-## 13. Open Questions
+## 14. Open Questions
 
-None. Phase-one types/dispatch, phase-two algebraic effects, phase-three deterministic superposition, syntax, ordering, backend boundary, AOT v3, non-goals, and quality gates are locked.
+The typed/effect/superposition core and its v4 backend contract remain locked. The planned post-core mutation phase must resolve two questions before implementation: the most economical surface form for passing immutable state through handlers, and whether one-shot closure capture of an affine cell is permitted or all continuation capture requires an explicit resource policy. Library packaging, dependency resolution, synchronized shared cells, and cross-artifact linking remain deferred.
 [/PRD]
