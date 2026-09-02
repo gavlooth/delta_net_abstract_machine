@@ -906,6 +906,72 @@ fn void unequal_replicators_commute_when_endpoint_order_is_reversed() @test
 	run_unequal_replicator_case(false);
 }
 
+
+fn void oversized_different_coordinate_replicator_expansion_rejects_atomically() @test
+{
+	// 1_414² Cartesian cells have a logical footprint of 10_004_050,
+	// just beyond DELTA_MAX_EVALUATION_STEPS, while the fixture stays small.
+	const sz ARITY = 1_414;
+	Net net;
+	net.init();
+	defer net.free();
+
+	NetRef earlier = add_replicator(&net, 4, ARITY);
+	NetRef later = add_replicator(&net, 1, ARITY, PARENT);
+	Replicator* earlier_value =
+		&net.nodes.get_ref(earlier).agent.replicator;
+	Replicator* later_value =
+		&net.nodes.get_ref(later).agent.replicator;
+	earlier_value.observable = true;
+	earlier_value.origin = 101;
+	later_value.observable = true;
+	later_value.origin = 202;
+	NetRef earlier_principal = earlier_value.principal;
+	NetRef later_principal = later_value.principal;
+	connect(&net, earlier_principal, later_principal);
+	NetRef principal_wire = net.ports.get_ref(earlier_principal).wire_id;
+
+	Replicator earlier_snapshot = *earlier_value;
+	Replicator later_snapshot = *later_value;
+	Port earlier_port = *net.ports.get_ref(earlier_principal);
+	Port later_port = *net.ports.get_ref(later_principal);
+	Wire wire = *net.wires.get_ref(principal_wire);
+	usz node_count = net.nodes.len();
+	usz port_count = net.ports.len();
+	usz wire_count = net.wires.len();
+
+	assert(!delta_net_abstract_machine::interact(&net, principal_wire));
+	assert(net.nodes.len() == node_count);
+	assert(net.ports.len() == port_count);
+	assert(net.wires.len() == wire_count);
+	assert(net.nodes.contains_ref(earlier));
+	assert(net.nodes.contains_ref(later));
+	Replicator* retained_earlier =
+		&net.nodes.get_ref(earlier).agent.replicator;
+	Replicator* retained_later =
+		&net.nodes.get_ref(later).agent.replicator;
+	assert(retained_earlier.principal == earlier_snapshot.principal);
+	assert(retained_earlier.auxiliaries.ptr
+		== earlier_snapshot.auxiliaries.ptr);
+	assert(retained_earlier.auxiliaries.len
+		== earlier_snapshot.auxiliaries.len);
+	assert(retained_earlier.origin == earlier_snapshot.origin);
+	assert(retained_earlier.delta_level == earlier_snapshot.delta_level);
+	assert(retained_earlier.status == earlier_snapshot.status);
+	assert(retained_earlier.observable == earlier_snapshot.observable);
+	assert(retained_later.principal == later_snapshot.principal);
+	assert(retained_later.auxiliaries.ptr == later_snapshot.auxiliaries.ptr);
+	assert(retained_later.auxiliaries.len
+		== later_snapshot.auxiliaries.len);
+	assert(retained_later.origin == later_snapshot.origin);
+	assert(retained_later.delta_level == later_snapshot.delta_level);
+	assert(retained_later.status == later_snapshot.status);
+	assert(retained_later.observable == later_snapshot.observable);
+	assert_port_preserved(&net, earlier_principal, earlier_port);
+	assert_port_preserved(&net, later_principal, later_port);
+	assert_wire_preserved(&net, principal_wire, wire);
+}
+
 fn void net_validator_accepts_a_fully_wired_fan_and_boundaries() @test
 {
 	Net net;
@@ -2416,7 +2482,7 @@ fn void deeply_nested_observable_readback_preserves_depth_first_order() @test
 	}
 }
 
-fn void ordered_commit_tombstones_compact_without_reordering_live_prefix() @test
+fn void retained_ordered_commit_tombstones_validate_and_compact_without_reordering_live_prefix() @test
 {
 	const usz CONTINUATION_COUNT = 8;
 	const ulong EFFECT_EPOCH = 47;
@@ -2499,6 +2565,7 @@ fn void ordered_commit_tombstones_compact_without_reordering_live_prefix() @test
 	assert(!net.nodes.contains_ref(second_resources[0]));
 	assert(net.effects.commits.len == CONTINUATION_COUNT);
 	assert(net.effects.committed == 2);
+	assert(delta_net_abstract_machine::validate_net(&net));
 
 	NetRef second_retired_wire = net.ports.get_ref(
 		net.nodes.get_ref(handlers[3]).agent.practical.principal

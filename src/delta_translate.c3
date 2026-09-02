@@ -128,6 +128,28 @@ fn bool delta_charge_materialization(
 	return true;
 }
 
+const usz DELTA_MAX_MATERIALIZATION_BYTES = 64 * 1024 * 1024;
+
+fn bool delta_charge_materialization_bytes(
+	usz* bytes,
+	usz amount,
+	DeltaDiagnostic* diagnostic,
+	Allocator allocator
+) @private
+{
+	if (amount > DELTA_MAX_MATERIALIZATION_BYTES
+		|| *bytes > DELTA_MAX_MATERIALIZATION_BYTES - amount)
+	{
+		diagnostic.init(
+			allocator,
+			"DeltaProgram graph exceeds the total materialization byte limit"
+		);
+		return false;
+	}
+	*bytes += amount;
+	return true;
+}
+
 fn bool delta_charge_continuation(
 	usz* work,
 	bool multi,
@@ -267,6 +289,7 @@ fn bool delta_materialize_node(
 	usz root_source_order,
 	usz* occurrence_counter,
 	usz* materialization_work,
+	usz* materialization_bytes,
 	List{DeltaMaterializedEffect}* effect_occurrences,
 	usz depth,
 	DeltaDiagnostic* diagnostic,
@@ -385,6 +408,7 @@ fn bool delta_materialize_node(
 				root_source_order,
 				occurrence_counter,
 				materialization_work,
+				materialization_bytes,
 				effect_occurrences,
 				depth + 1,
 				diagnostic,
@@ -413,6 +437,9 @@ fn bool delta_materialize_node(
 	(void)connect(net, destination, practical_principal);
  if (source.kind == DELTA_STRING)
  {
+  if (!delta_charge_materialization_bytes(
+   materialization_bytes, source.string_value.len, diagnostic, allocator
+  )) return false;
   practical = net.nodes.get_ref(practical_ref);
   practical.agent.practical.text = source.string_value.copy(mem);
   practical.agent.practical.owns_text = true;
@@ -455,6 +482,7 @@ fn bool delta_materialize_node(
 			source_order,
 			occurrence_counter,
 			materialization_work,
+			materialization_bytes,
 			source.kind == DELTA_HANDLER
 				? (index == 0 ? &handled_effects : effect_occurrences)
 				: effect_occurrences,
@@ -488,6 +516,7 @@ fn bool delta_materialize_node(
 			source_order,
 			occurrence_counter,
 			materialization_work,
+			materialization_bytes,
 			source.kind == DELTA_HANDLER ? null : effect_occurrences,
 			depth + 1,
 			diagnostic,
@@ -703,9 +732,11 @@ fn void delta_build_effect_commit_queue(Net* net)
 
 
 /** Materialize one immutable DeltaProgram root into generation-bearing slots. */
-fn DeltaTranslationResult translate_delta_program(
+fn DeltaTranslationResult translate_delta_program_with_budget(
 	mitos::DeltaProgram* program,
 	mitos::DeltaNodeId root,
+	usz* materialization_work,
+	usz* materialization_bytes,
 	Allocator allocator = mem
 )
 {
@@ -729,7 +760,6 @@ fn DeltaTranslationResult translate_delta_program(
   if (boundary.root == root) { root_source_order = boundary.source_order; break; }
  }
  usz occurrence_counter = 0;
- usz materialization_work = 0;
  DeltaDiagnostic diagnostic;
  if (!delta_materialize_node(
   program,
@@ -738,7 +768,8 @@ fn DeltaTranslationResult translate_delta_program(
   destination,
   root_source_order,
   &occurrence_counter,
-  &materialization_work,
+  materialization_work,
+  materialization_bytes,
   null,
   0,
   &diagnostic,
@@ -756,4 +787,17 @@ fn DeltaTranslationResult translate_delta_program(
 		result.diagnostics[0].init(allocator, "materialized DeltaProgram failed stable-slot validation");
 	}
 	return result;
+}
+
+fn DeltaTranslationResult translate_delta_program(
+	mitos::DeltaProgram* program,
+	mitos::DeltaNodeId root,
+	Allocator allocator = mem
+)
+{
+	usz materialization_work = 0;
+	usz materialization_bytes = 0;
+	return translate_delta_program_with_budget(
+		program, root, &materialization_work, &materialization_bytes, allocator
+	);
 }

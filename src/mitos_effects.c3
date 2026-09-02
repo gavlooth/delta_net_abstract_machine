@@ -860,6 +860,17 @@ fn EffectRegistryBuildResult build_effect_registry(
 	EffectRegistryIndexes* indexes = effect_registry_indexes(&result.registry);
 	foreach (&declaration : program.effects)
 	{
+		if (!symbol_key_matches_declaration(
+			&declaration.key, &program.module_key, SYMBOL_EFFECT,
+			declaration.name, declaration.parameters.len, ""
+		))
+		{
+			effects_add_diagnostic(
+				&diagnostics, allocator,
+				"effect declaration has an invalid canonical identity", declaration.span
+			);
+			continue;
+		}
 		if ((usz)result.registry.effects.len() >= max_effects)
 		{
 			effects_add_diagnostic(&diagnostics, allocator, "effect registry exhausted its bounded capacity", declaration.span);
@@ -882,10 +893,7 @@ fn EffectRegistryBuildResult build_effect_registry(
 			continue;
 		}
 		EffectDescriptor descriptor = {
-			.key = declaration_symbol_key(
-				&declaration.key, &program.module_key, SYMBOL_EFFECT,
-				declaration.name, declaration.parameters.len, "", allocator
-			),
+			.key = clone_symbol_key(&declaration.key, allocator),
 			.id = (EffectId)((usz)result.registry.effects.len() + 1),
 			.name = declaration.name.copy(allocator),
 			.multi = declaration.multi,
@@ -908,14 +916,23 @@ fn EffectRegistryBuildResult build_effect_registry(
 			String parent_signature = effect_parent_identity_signature(
 				&descriptor.key, allocator
 			);
+			if (!symbol_key_matches_declaration(
+				&operation.key, &descriptor.key.owner, SYMBOL_EFFECT_OPERATION,
+				operation.name, operation.parameters.len, parent_signature
+			))
+			{
+				alloc::free(allocator, parent_signature);
+				effects_add_diagnostic(
+					&diagnostics, allocator,
+					"effect operation has an invalid canonical identity", operation.span
+				);
+				continue;
+			}
 			EffectHostPolicy host_policy = declaration.name == "Console" || declaration.name == "IO"
 				? EFFECT_HOST_EXTERNAL
 				: declaration.name == "State" ? EFFECT_HOST_ORDERED : EFFECT_HOST_PURE;
 			EffectOperationDescriptor registered = {
-				.key = declaration_symbol_key(
-					&operation.key, &descriptor.key.owner, SYMBOL_EFFECT_OPERATION,
-					operation.name, operation.parameters.len, parent_signature, allocator
-				),
+				.key = clone_symbol_key(&operation.key, allocator),
 				.id = result.registry.next_operation_id++,
 				.effect = descriptor.id,
 				.name = operation.name.copy(allocator),
@@ -1310,14 +1327,14 @@ fn void row_remove_constructor(EffectRegistry* registry, List{EffectId}* row, Ef
 
 struct EffectCallGroup
 {
-	String name;
-	usz arity;
+	SymbolKey* key;
 	List{usz} targets;
 }
 
 struct EffectCallIndex
 {
 	Allocator allocator;
+	ModuleKey* caller_module;
 	List{EffectCallGroup} groups;
 	sz[] buckets;
 }
@@ -1329,9 +1346,18 @@ struct EffectInferenceWork
 	bool exhausted;
 }
 
-fn ulong effect_call_hash(String name, usz arity) @private
+fn ulong effect_call_hash(ModuleKey* owner, String name, usz arity) @private
 {
-	ulong hash = 1469598103934665603UL ^ (ulong)arity;
+	ulong hash = 1469598103934665603UL;
+	foreach (byte : owner.canonical)
+	{
+		hash ^= (ulong)byte;
+		hash *= 1099511628211UL;
+	}
+	hash ^= (ulong)SymbolKind.SYMBOL_GENERIC;
+	hash *= 1099511628211UL;
+	hash ^= (ulong)arity;
+	hash *= 1099511628211UL;
 	foreach (byte : name)
 	{
 		hash ^= (ulong)byte;
@@ -1349,15 +1375,17 @@ fn usz effect_index_capacity(usz count) @private
 
 fn EffectCallGroup* effect_call_group(EffectCallIndex* index, String name, usz arity) @private
 {
-	if (!index.buckets.len) return null;
+	if (!index.buckets.len || !index.caller_module) return null;
 	usz mask = index.buckets.len - 1;
-	usz slot = (usz)effect_call_hash(name, arity) & mask;
+	usz slot = (usz)effect_call_hash(index.caller_module, name, arity) & mask;
 	for (usz probe = 0; probe < index.buckets.len; probe++)
 	{
 		sz group_index = index.buckets[slot];
 		if (group_index < 0) return null;
 		EffectCallGroup* group = &index.groups[group_index];
-		if (group.name == name && group.arity == arity) return group;
+		if (symbol_key_matches_declaration(
+			group.key, index.caller_module, SYMBOL_GENERIC, name, arity, ""
+		)) return group;
 		slot = (slot + 1) & mask;
 	}
 	return null;
@@ -1371,22 +1399,44 @@ fn void EffectCallIndex.deinit(&self)
 	*self = { };
 }
 
-fn EffectCallIndex build_effect_call_index(Program* program, Allocator allocator) @private
+fn EffectCallIndex build_effect_call_index(
+	Program* program,
+	List{MitosDiagnostic}* diagnostics,
+	Allocator allocator
+) @private
 {
-	EffectCallIndex index = { .allocator = allocator };
+	EffectCallIndex index = {
+		.allocator = allocator,
+		.caller_module = &program.module_key,
+	};
 	index.groups.init(allocator);
-	index.buckets = alloc::new_array(allocator, sz, (sz)effect_index_capacity(program.functions.len));
+	index.buckets = alloc::new_array(
+		allocator, sz, (sz)effect_index_capacity(program.functions.len)
+	);
 	foreach (&bucket : index.buckets) *bucket = -1;
 	usz mask = index.buckets.len - 1;
 	foreach (function_index, &function : program.functions)
 	{
-		usz slot = (usz)effect_call_hash(function.name, function.parameters.len) & mask;
+		if (!symbol_key_matches_declaration(
+			&function.generic_key, &function.generic_key.owner, SYMBOL_GENERIC,
+			function.name, function.parameters.len, ""
+		))
+		{
+			effects_add_diagnostic(
+				diagnostics, allocator,
+				"effect inference requires a canonical generic identity", function.span
+			);
+			continue;
+		}
+		usz slot = (usz)effect_call_hash(
+			&function.generic_key.owner, function.generic_key.name, function.generic_key.arity
+		) & mask;
 		for (usz probe = 0; probe < index.buckets.len; probe++)
 		{
 			sz group_index = index.buckets[slot];
 			if (group_index < 0)
 			{
-				EffectCallGroup group = { .name = function.name, .arity = function.parameters.len };
+				EffectCallGroup group = { .key = &function.generic_key };
 				group.targets.init(allocator);
 				group.targets.push((usz)function_index);
 				index.groups.push(group);
@@ -1394,7 +1444,7 @@ fn EffectCallIndex build_effect_call_index(Program* program, Allocator allocator
 				break;
 			}
 			EffectCallGroup* group = &index.groups[group_index];
-			if (group.name == function.name && group.arity == function.parameters.len)
+			if (symbol_key_equal(group.key, &function.generic_key))
 			{
 				group.targets.push((usz)function_index);
 				break;
@@ -2028,7 +2078,7 @@ fn EffectAnalysis infer_effect_rows(
 	List{MitosDiagnostic} diagnostics;
 	diagnostics.init(allocator);
 	EffectInferenceWork work = { .max = max_steps };
-	EffectCallIndex calls = build_effect_call_index(program, allocator);
+	EffectCallIndex calls = build_effect_call_index(program, &diagnostics, allocator);
 	defer calls.deinit();
 	List{EffectId}[] rows = alloc::new_array(allocator, List{EffectId}, program.functions.len);
 	List{usz}[] callers = alloc::new_array(allocator, List{usz}, program.functions.len);

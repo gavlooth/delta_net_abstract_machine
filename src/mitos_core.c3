@@ -176,20 +176,18 @@ fn bool symbol_key_is_canonical(SymbolKey* key)
 	return key && key.owner.canonical.len > 0 && key.name.len > 0;
 }
 
-fn SymbolKey declaration_symbol_key(
-	SymbolKey* declared,
-	ModuleKey* program_module,
+fn bool symbol_key_matches_declaration(
+	SymbolKey* key,
+	ModuleKey* owner,
 	SymbolKind kind,
 	String name,
 	usz arity,
-	String canonical_signature,
-	Allocator allocator = mem
+	String canonical_signature
 )
 {
-	if (symbol_key_is_canonical(declared)) return clone_symbol_key(declared, allocator);
-	ModuleKey fallback = { .canonical = MITOS_DEFAULT_MODULE_CANONICAL };
-	ModuleKey* owner = program_module && program_module.canonical.len ? program_module : &fallback;
-	return symbol_key(owner, kind, name, arity, canonical_signature, allocator);
+	return symbol_key_is_canonical(key) && module_key_equal(&key.owner, owner)
+		&& key.kind == kind && key.name == name && key.arity == (uint)arity
+		&& key.canonical_signature == canonical_signature;
 }
 
 fn void SymbolKey.deinit(&self, Allocator allocator)
@@ -802,41 +800,9 @@ fn void Program.deinit(&self)
 	*self = { };
 }
 
-fn bool type_expr_equal(TypeExpr* left, TypeExpr* right)
-{
-	if (left == right) return true;
-	if (!left || !right || left.kind != right.kind || left.name != right.name
-		|| left.arguments.len != right.arguments.len) return false;
-	foreach (index, &argument : left.arguments)
-	{
-		if (!type_expr_equal(argument.value, right.arguments[index].value)) return false;
-	}
-	return true;
-}
-
-
 fn bool method_signature_equal(FunctionDecl* left, FunctionDecl* right) @private
 {
-	if (symbol_key_is_canonical(&left.key) && symbol_key_is_canonical(&right.key))
-	{
-		return symbol_key_equal(&left.key, &right.key);
-	}
-	if (symbol_key_is_canonical(&left.generic_key)
-		&& symbol_key_is_canonical(&right.generic_key)
-		&& !symbol_key_equal(&left.generic_key, &right.generic_key)) return false;
-	if (left.name != right.name || left.parameters.len != right.parameters.len) return false;
-	foreach (index, parameter : left.parameters)
-	{
-		TypeExpr* left_type = index < left.parameter_annotations.len
-			? left.parameter_annotations[index].value : null;
-		TypeExpr* right_type = index < right.parameter_annotations.len
-			? right.parameter_annotations[index].value : null;
-		if (left_type || right_type)
-		{
-			if (!left_type || !right_type || !type_expr_equal(left_type, right_type)) return false;
-		}
-	}
-	return true;
+	return symbol_key_equal(&left.key, &right.key);
 }
 
 const usz MITOS_MAX_VALIDATION_DIAGNOSTICS = 256;
@@ -937,17 +903,7 @@ fn ulong validation_hash_symbol_key(SymbolKey* key) @private
 
 fn ulong validation_method_hash(FunctionDecl* function) @private
 {
-	if (symbol_key_is_canonical(&function.key)) return validation_hash_symbol_key(&function.key);
-	ulong hash = validation_hash_string(function.name);
-	hash ^= (ulong)function.parameters.len;
-	hash *= 1099511628211UL;
-	foreach (&annotation : function.parameter_annotations)
-	{
-		TypeExpr* type = annotation.value;
-		hash ^= type ? validation_hash_string(type.name) : 0;
-		hash *= 1099511628211UL;
-	}
-	return hash;
+	return validation_hash_symbol_key(&function.key);
 }
 
 fn void ValidationMethodIndex.init(&self, Program* program, Allocator allocator)
@@ -994,15 +950,72 @@ struct ConstructorRef
 	bool found;
 }
 
-fn ConstructorRef find_constructor(Program* program, String name) @private
+struct ValidationConstructorIndex
 {
+	Allocator allocator;
+	Program* program;
+	ConstructorRef[] buckets;
+}
+
+fn void ValidationConstructorIndex.init(
+	&self,
+	Program* program,
+	Allocator allocator,
+	usz constructor_count
+)
+{
+	self.allocator = allocator;
+	self.program = program;
+	self.buckets = alloc::new_array(
+		allocator, ConstructorRef, (sz)validation_index_capacity(constructor_count)
+	);
+	foreach (&entry : self.buckets) *entry = { };
+	usz mask = self.buckets.len - 1;
 	foreach (enum_index, &enum_decl : program.enums)
 	{
 		foreach (variant_index, &variant : enum_decl.variants)
 		{
-			if (variant.name
-				== name) return { .enum_index = (sz)enum_index, .variant_index = (sz)variant_index, .found = true };
+			usz slot = (usz)validation_hash_string(variant.name) & mask;
+			for (usz probe = 0; probe < self.buckets.len; probe++)
+			{
+				ConstructorRef* entry = &self.buckets[slot];
+				if (!entry.found)
+				{
+					*entry = {
+						.enum_index = (sz)enum_index,
+						.variant_index = (sz)variant_index,
+						.found = true,
+					};
+					break;
+				}
+				VariantDecl* indexed = &program.enums[(usz)entry.enum_index]
+					.variants[(usz)entry.variant_index];
+				if (indexed.name == variant.name) break;
+				slot = (slot + 1) & mask;
+			}
 		}
+	}
+}
+
+fn void ValidationConstructorIndex.deinit(&self)
+{
+	alloc::free(self.allocator, self.buckets);
+	*self = { };
+}
+
+fn ConstructorRef ValidationConstructorIndex.find(&self, String name)
+{
+	if (!self.buckets.len || !name.len) return { };
+	usz mask = self.buckets.len - 1;
+	usz slot = (usz)validation_hash_string(name) & mask;
+	for (usz probe = 0; probe < self.buckets.len; probe++)
+	{
+		ConstructorRef entry = self.buckets[slot];
+		if (!entry.found) return { };
+		VariantDecl* variant = &self.program.enums[(usz)entry.enum_index]
+			.variants[(usz)entry.variant_index];
+		if (variant.name == name) return entry;
+		slot = (slot + 1) & mask;
 	}
 	return { };
 }
@@ -1030,6 +1043,7 @@ fn void add_validation_error(
 
 fn void validate_application(
 	Program* program,
+	ValidationConstructorIndex* constructors,
 	SurfaceExpr* expression,
 	List{MitosDiagnostic}* diagnostics,
 	Allocator allocator
@@ -1052,7 +1066,7 @@ fn void validate_application(
 				diagnostics, allocator, "collapse expects exactly one argument", expression.span
 			);
 		}
-		ConstructorRef reference = find_constructor(program, application.callee.data.variable.name);
+		ConstructorRef reference = constructors.find(application.callee.data.variable.name);
 		if (reference.found)
 		{
 			constructor_call = true;
@@ -1068,20 +1082,29 @@ fn void validate_application(
 			}
 		}
 	}
-	if (!constructor_call) validate_expression(program, application.callee, diagnostics, allocator);
-	foreach (argument : application.arguments) validate_expression(program, argument, diagnostics, allocator);
+	if (!constructor_call)
+	{
+		validate_expression(program, constructors, application.callee, diagnostics, allocator);
+	}
+	foreach (argument : application.arguments)
+		validate_expression(program, constructors, argument, diagnostics, allocator);
 }
 
 fn void validate_match(
 	Program* program,
+	ValidationConstructorIndex* constructors,
 	SurfaceExpr* expression,
 	List{MitosDiagnostic}* diagnostics,
 	Allocator allocator
 ) @private
 {
-	validate_expression(program, expression.data.match_expr.scrutinee, diagnostics, allocator);
+	validate_expression(
+		program, constructors, expression.data.match_expr.scrutinee, diagnostics, allocator
+	);
 	sz matched_enum = -1;
 	bool wildcard   =  false;
+	ValidationNameIndex explicit_constructors;
+	explicit_constructors.init(allocator, expression.data.match_expr.arms.len);
 	foreach (arm_index, &arm : expression.data.match_expr.arms)
 	{
 		if (arm.pattern.kind == PATTERN_WILDCARD)
@@ -1122,7 +1145,7 @@ fn void validate_match(
 					}
 				}
 			}
-			ConstructorRef reference = find_constructor(program, arm.pattern.constructor);
+			ConstructorRef reference = constructors.find(arm.pattern.constructor);
 			if (!reference.found)
 			{
 				add_validation_error(diagnostics, allocator, "unknown constructor in match pattern", arm.pattern.span);
@@ -1130,6 +1153,13 @@ fn void validate_match(
 			else
 			{
 				VariantDecl* variant = &program.enums[(usz)reference.enum_index].variants[(usz)reference.variant_index];
+				if (!explicit_constructors.insert(arm.pattern.constructor))
+				{
+					add_validation_error(
+						diagnostics, allocator,
+						"duplicate constructor arm in match", arm.pattern.span
+					);
+				}
 				if (arm.pattern.bindings.len != variant.parameters.len)
 				{
 					add_validation_error(
@@ -1154,7 +1184,7 @@ fn void validate_match(
 				}
 			}
 		}
-		validate_expression(program, arm.body, diagnostics, allocator);
+		validate_expression(program, constructors, arm.body, diagnostics, allocator);
 	}
 	if (matched_enum < 0)
 	{
@@ -1164,35 +1194,24 @@ fn void validate_match(
 			"match needs a constructor arm to identify its enum",
 			expression.span
 		);
+		explicit_constructors.deinit();
 		return;
 	}
 	EnumDecl* enum_decl = &program.enums[(usz)matched_enum];
 	foreach (&variant : enum_decl.variants)
 	{
-		bool covered      = wildcard;
-		bool explicit_arm = false;
-		foreach (&arm : expression.data.match_expr.arms)
-		{
-			if (arm.pattern.kind != PATTERN_CONSTRUCTOR || arm.pattern.constructor != variant.name) continue;
-			if (explicit_arm) add_validation_error(
-				diagnostics,
-				allocator,
-				"duplicate constructor arm in match",
-				arm.pattern.span
-			);
-			explicit_arm = true;
-			covered = true;
-		}
-		if (!covered)
+		if (!wildcard && !explicit_constructors.contains(variant.name))
 		{
 			add_validation_error(diagnostics, allocator, "non-exhaustive match", expression.span);
 			break;
 		}
 	}
+	explicit_constructors.deinit();
 }
 
 fn void validate_expression(
 	Program* program,
+	ValidationConstructorIndex* constructors,
 	SurfaceExpr* expression,
 	List{MitosDiagnostic}* diagnostics,
 	Allocator allocator
@@ -1202,7 +1221,7 @@ fn void validate_expression(
 	switch (expression.kind)
 	{
 		case SURFACE_VARIABLE:
-			ConstructorRef reference = find_constructor(program, expression.data.variable.name);
+			ConstructorRef reference = constructors.find(expression.data.variable.name);
 			if (reference.found
 				&& program.enums[(usz)reference.enum_index].variants[(usz)reference.variant_index].parameters.len != 0)
 			{
@@ -1236,17 +1255,23 @@ fn void validate_expression(
 				break;
 			}
 		case SURFACE_LAMBDA:
-			validate_expression(program, expression.data.lambda.body, diagnostics, allocator);
+			validate_expression(
+				program, constructors, expression.data.lambda.body, diagnostics, allocator
+			);
 		case SURFACE_APPLICATION:
-			validate_application(program, expression, diagnostics, allocator);
+			validate_application(program, constructors, expression, diagnostics, allocator);
 		case SURFACE_EFFECT_OPERATION:
 			foreach (argument : expression.data.effect_operation.arguments)
 			{
-				validate_expression(program, argument, diagnostics, allocator);
+				validate_expression(program, constructors, argument, diagnostics, allocator);
 			}
 		case SURFACE_BINARY:
-			validate_expression(program, expression.data.binary.left, diagnostics, allocator);
-			validate_expression(program, expression.data.binary.right, diagnostics, allocator);
+			validate_expression(
+				program, constructors, expression.data.binary.left, diagnostics, allocator
+			);
+			validate_expression(
+				program, constructors, expression.data.binary.right, diagnostics, allocator
+			);
 		case SURFACE_DEFINITION:
 			for (
 				SurfaceExpr* nested = expression.data.definition.body;
@@ -1264,10 +1289,14 @@ fn void validate_expression(
 					);
 				}
 			}
-			validate_expression(program, expression.data.definition.value, diagnostics, allocator);
-			validate_expression(program, expression.data.definition.body, diagnostics, allocator);
+			validate_expression(
+				program, constructors, expression.data.definition.value, diagnostics, allocator
+			);
+			validate_expression(
+				program, constructors, expression.data.definition.body, diagnostics, allocator
+			);
 		case SURFACE_MATCH:
-			validate_match(program, expression, diagnostics, allocator);
+			validate_match(program, constructors, expression, diagnostics, allocator);
 		case SURFACE_PARALLEL:
 			if (expression.data.parallel.bindings.len < 2)
 			{
@@ -1292,11 +1321,15 @@ fn void validate_expression(
 						);
 					}
 				}
-				validate_expression(program, binding.value, diagnostics, allocator);
+				validate_expression(program, constructors, binding.value, diagnostics, allocator);
 			}
-			validate_expression(program, expression.data.parallel.result, diagnostics, allocator);
+			validate_expression(
+				program, constructors, expression.data.parallel.result, diagnostics, allocator
+			);
 		case SURFACE_HANDLER:
-			validate_expression(program, expression.data.handler.handled, diagnostics, allocator);
+			validate_expression(
+				program, constructors, expression.data.handler.handled, diagnostics, allocator
+			);
 			foreach (clause_index, &clause : expression.data.handler.clauses)
 			{
 				for (sz previous_index = 0; previous_index < clause_index; previous_index++)
@@ -1308,7 +1341,7 @@ fn void validate_expression(
 						add_validation_error(diagnostics, allocator, "duplicate handler operation clause", clause.span);
 					}
 				}
-				validate_expression(program, clause.body, diagnostics, allocator);
+				validate_expression(program, constructors, clause.body, diagnostics, allocator);
 			}
 			if (!expression.data.handler.return_clause.body)
 			{
@@ -1316,10 +1349,15 @@ fn void validate_expression(
 			}
 			else
 			{
-				validate_expression(program, expression.data.handler.return_clause.body, diagnostics, allocator);
+				validate_expression(
+					program, constructors,
+					expression.data.handler.return_clause.body, diagnostics, allocator
+				);
 			}
 		case SURFACE_RESUME:
-			validate_expression(program, expression.data.resume.value, diagnostics, allocator);
+			validate_expression(
+				program, constructors, expression.data.resume.value, diagnostics, allocator
+			);
 		default:
 	}
 }
@@ -1329,7 +1367,7 @@ fn MitosDiagnostic[] validate_program(Program* program, Allocator allocator = me
 	List{MitosDiagnostic} diagnostics;
 	diagnostics.init(allocator);
 	bool found_main = false;
-	usz constructor_count;
+	usz constructor_count = 0;
 	foreach (&enum_decl : program.enums) constructor_count += enum_decl.variants.len;
 
 	ValidationNameIndex enum_names;
@@ -1337,14 +1375,26 @@ fn MitosDiagnostic[] validate_program(Program* program, Allocator allocator = me
 	ValidationNameIndex type_names;
 	ValidationNameIndex effect_names;
 	ValidationMethodIndex method_signatures;
+	ValidationConstructorIndex constructors;
 	enum_names.init(allocator, program.enums.len);
 	constructor_names.init(allocator, constructor_count);
 	type_names.init(allocator, program.types.len);
 	effect_names.init(allocator, program.effects.len);
 	method_signatures.init(program, allocator);
+	constructors.init(program, allocator, constructor_count);
 
 	foreach (&enum_decl : program.enums)
 	{
+		if (!symbol_key_matches_declaration(
+			&enum_decl.key, &program.module_key, SYMBOL_ENUM,
+			enum_decl.name, enum_decl.parameters.len, ""
+		))
+		{
+			add_validation_error(
+				&diagnostics, allocator,
+				"enum declaration has an invalid canonical identity", enum_decl.span
+			);
+		}
 		if (!enum_names.insert(enum_decl.name))
 		{
 			add_validation_error(&diagnostics, allocator, "duplicate enum declaration", enum_decl.span);
@@ -1362,6 +1412,17 @@ fn MitosDiagnostic[] validate_program(Program* program, Allocator allocator = me
 		variant_names.init(allocator, enum_decl.variants.len);
 		foreach (&variant : enum_decl.variants)
 		{
+			if (!variant.key.canonical_signature.len
+				|| !symbol_key_matches_declaration(
+					&variant.key, &program.module_key, SYMBOL_VARIANT,
+					variant.name, variant.parameters.len, variant.key.canonical_signature
+				))
+			{
+				add_validation_error(
+					&diagnostics, allocator,
+					"constructor declaration has an invalid canonical identity", variant.span
+				);
+			}
 			if (!variant_names.insert(variant.name))
 			{
 				add_validation_error(&diagnostics, allocator, "duplicate enum variant", variant.span);
@@ -1390,6 +1451,16 @@ fn MitosDiagnostic[] validate_program(Program* program, Allocator allocator = me
 
 	foreach (&type_decl : program.types)
 	{
+		if (!symbol_key_matches_declaration(
+			&type_decl.key, &program.module_key, SYMBOL_TYPE,
+			type_decl.name, type_decl.parameters.len, ""
+		))
+		{
+			add_validation_error(
+				&diagnostics, allocator,
+				"type declaration has an invalid canonical identity", type_decl.span
+			);
+		}
 		if (!type_names.insert(type_decl.name))
 		{
 			add_validation_error(&diagnostics, allocator, "duplicate type declaration", type_decl.span);
@@ -1425,6 +1496,16 @@ fn MitosDiagnostic[] validate_program(Program* program, Allocator allocator = me
 
 	foreach (&effect : program.effects)
 	{
+		if (!symbol_key_matches_declaration(
+			&effect.key, &program.module_key, SYMBOL_EFFECT,
+			effect.name, effect.parameters.len, ""
+		))
+		{
+			add_validation_error(
+				&diagnostics, allocator,
+				"effect declaration has an invalid canonical identity", effect.span
+			);
+		}
 		if (!effect_names.insert(effect.name))
 		{
 			add_validation_error(&diagnostics, allocator, "duplicate effect declaration", effect.span);
@@ -1433,6 +1514,17 @@ fn MitosDiagnostic[] validate_program(Program* program, Allocator allocator = me
 		operation_names.init(allocator, effect.operations.len);
 		foreach (&operation : effect.operations)
 		{
+			if (!operation.key.canonical_signature.len
+				|| !symbol_key_matches_declaration(
+					&operation.key, &effect.key.owner, SYMBOL_EFFECT_OPERATION,
+					operation.name, operation.parameters.len, operation.key.canonical_signature
+				))
+			{
+				add_validation_error(
+					&diagnostics, allocator,
+					"effect operation has an invalid canonical identity", operation.span
+				);
+			}
 			if (!operation_names.insert(operation.name))
 			{
 				add_validation_error(&diagnostics, allocator, "duplicate effect operation", operation.span);
@@ -1452,6 +1544,20 @@ fn MitosDiagnostic[] validate_program(Program* program, Allocator allocator = me
 
 	foreach (function_index, &function : program.functions)
 	{
+		if (!symbol_key_matches_declaration(
+			&function.generic_key, &function.generic_key.owner, SYMBOL_GENERIC,
+			function.name, function.parameters.len, ""
+		) || !function.key.canonical_signature.len
+			|| !symbol_key_matches_declaration(
+				&function.key, &function.key.owner, SYMBOL_METHOD,
+				function.name, function.parameters.len, function.key.canonical_signature
+			))
+		{
+			add_validation_error(
+				&diagnostics, allocator,
+				"function declaration has an invalid canonical identity", function.span
+			);
+		}
 		if (!method_signatures.insert((usz)function_index))
 		{
 			add_validation_error(&diagnostics, allocator, "duplicate method signature", function.span);
@@ -1499,7 +1605,7 @@ fn MitosDiagnostic[] validate_program(Program* program, Allocator allocator = me
 				add_validation_error(&diagnostics, allocator, "main must have no parameters", function.span);
 			}
 		}
-		validate_expression(program, function.body, &diagnostics, allocator);
+		validate_expression(program, &constructors, function.body, &diagnostics, allocator);
 	}
 	if (!found_main)
 	{
@@ -1508,6 +1614,7 @@ fn MitosDiagnostic[] validate_program(Program* program, Allocator allocator = me
 	}
 
 	method_signatures.deinit();
+	constructors.deinit();
 	effect_names.deinit();
 	type_names.deinit();
 	constructor_names.deinit();

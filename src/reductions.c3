@@ -196,7 +196,70 @@ net.wires.erase(old_principal_wire);
 
 
 
-fn void replicator_replicator_reduction(Net* net, NetRef first_id,
+fn bool replicator_footprint_multiply(
+ usz left,
+ usz right,
+ usz* result
+) @private
+{
+ if (left && right > usz::max / left) return false;
+ *result = left * right;
+ return true;
+}
+
+fn bool replicator_footprint_add(
+ usz left,
+ usz right,
+ usz* result
+) @private
+{
+ if (right > usz::max - left) return false;
+ *result = left + right;
+ return true;
+}
+
+// Each Cartesian cell creates two auxiliary references, two ports, and one
+// wire. The remaining units cover copied templates, row descriptors, and new
+// replicator nodes. Charging the complete logical footprint against the
+// evaluator's existing work bound prevents a single interaction from
+// materializing more records than a whole bounded evaluation may process.
+fn bool replicator_cartesian_expansion_fits(
+ sz higher_count,
+ sz lower_count
+) @private
+{
+ if (higher_count < 0 || lower_count < 0) return false;
+ usz higher = (usz)higher_count;
+ usz lower = (usz)lower_count;
+ usz product;
+ usz footprint;
+ usz component;
+ if (!replicator_footprint_multiply(higher, lower, &product)
+  || !replicator_footprint_multiply(product, 5, &footprint)
+  || !replicator_footprint_multiply(higher, 2, &component)
+  || !replicator_footprint_add(footprint, component, &footprint)
+  || !replicator_footprint_multiply(lower, 3, &component)
+  || !replicator_footprint_add(footprint, component, &footprint)
+  || footprint > mitos::DELTA_MAX_EVALUATION_STEPS) return false;
+
+ // Preflight every direct allocation as well as the aggregate work charge.
+ usz allocation_bytes = 0;
+ if (!replicator_footprint_multiply(higher, (usz)Port::size, &component)
+  || !replicator_footprint_add(allocation_bytes, component, &allocation_bytes)
+  || !replicator_footprint_multiply(lower, (usz)Port::size, &component)
+  || !replicator_footprint_add(allocation_bytes, component, &allocation_bytes)
+  || !replicator_footprint_multiply(
+   lower, (usz)usz::size * 2, &component
+  )
+  || !replicator_footprint_add(allocation_bytes, component, &allocation_bytes)
+  || !replicator_footprint_multiply(product, (usz)NetRef::size, &component)
+  || !replicator_footprint_add(allocation_bytes, component, &allocation_bytes)
+  || !replicator_footprint_add(allocation_bytes, component, &allocation_bytes)
+  || allocation_bytes > (usz)sz::max) return false;
+ return true;
+}
+
+fn bool replicator_replicator_reduction(Net* net, NetRef first_id,
 NetRef second_id)
 {
  Node* first = net.nodes.get_ref(first_id);
@@ -257,9 +320,8 @@ net.ports.erase(second_auxiliary);
 net.wires.erase(second_wire);
 }
 
-(void)erase_redex(net, first_id, second_id, principal_wire,
-first_principal, second_principal);
-return;
+return erase_redex(net, first_id, second_id, principal_wire,
+ first_principal, second_principal);
 }
 
 // Earlier source origins remain outer coordinates, yielding lexicographic
@@ -286,6 +348,10 @@ ulong higher_origin = first_is_higher ? first_origin : second_origin;
 ulong lower_origin = first_is_higher ? second_origin : first_origin;
 sz higher_count = higher_auxiliaries.len;
 sz lower_count = lower_auxiliaries.len;
+if (!replicator_cartesian_expansion_fits(higher_count, lower_count))
+{
+ return false;
+}
 
 Port[] higher_templates = mem::alloc_array(Port, higher_count);
 Port[] lower_templates = mem::alloc_array(Port, lower_count);
@@ -361,8 +427,8 @@ NetRef higher_auxiliary = higher_rows[lower_idx][higher_idx];
 }
 }
 
-(void)erase_redex(net, higher_id, lower_id, principal_wire,
-higher_principal, lower_principal);
+return erase_redex(net, higher_id, lower_id, principal_wire,
+ higher_principal, lower_principal);
 }
 
 fn void replicator_eraser_reduction(Net* net, NetRef replicator_id,
@@ -1175,8 +1241,7 @@ fn bool practical_interact(
  }
  if (type_a == REPLICATOR && type_b == REPLICATOR)
  {
-  replicator_replicator_reduction(net, node_a_id, node_b_id);
-  return true;
+  return replicator_replicator_reduction(net, node_a_id, node_b_id);
  }
  if (is_practical_agent_type(type_a) && is_practical_agent_type(type_b))
  {

@@ -1374,6 +1374,8 @@ fn LoweredValue materialize_runtime_value(
 		lowerer.fail("MIR lazy closure capture is recursively materialized");
 		return { };
 	}
+	// Provenance slices are shallow-shared across control-flow paths. Child
+	// materializations stay local so their registers cannot escape a branch.
 	value.lazy.materializing = true;
 	if (value.closure_node)
 	{
@@ -1446,7 +1448,6 @@ fn LoweredValue materialize_runtime_value(
 		{
 			field = materialize_runtime_value(lowerer, field, depth + 1);
 			if (lowerer.failed || field.pending_effect) return { };
-			value.fields[index] = field;
 			fields[index] = field.register;
 			lifted = lifted || superposition_element_type(
 				lowerer, field.type_id, null
@@ -1516,7 +1517,6 @@ fn LoweredValue materialize_runtime_value(
 				);
 				leave_materialization_scope(lowerer);
 				if (lowerer.failed || alternative.pending_effect) return { };
-				value.alternatives[branch_index] = alternative;
 				emit(lowerer, {
 					.opcode = MOVE,
 					.destination = matched,
@@ -1560,7 +1560,6 @@ fn LoweredValue materialize_runtime_value(
 					lowerer, alternative, depth + 1
 				);
 				if (lowerer.failed || alternative.pending_effect) return { };
-				value.alternatives[index] = alternative;
 				alternatives[index] = alternative.register;
 			}
 			uint superposition = new_register(lowerer);

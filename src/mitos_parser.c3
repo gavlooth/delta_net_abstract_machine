@@ -2336,17 +2336,6 @@ fn String mitos_method_identity_signature(
 	return result;
 }
 
-fn void mitos_append_parent_key_component(
-	DString* signature,
-	String component
-) @private
-{
-	char[32] buffer;
-	signature.append_string((String)io::bprintf(
-		&buffer, "%d:", (long)component.len
-	)!!);
-	signature.append_string(component);
-}
 
 fn String mitos_parent_identity_signature(
 	SymbolKey* parent,
@@ -2356,17 +2345,17 @@ fn String mitos_parent_identity_signature(
 	DString signature;
 	signature.init(allocator);
 	char[32] buffer;
-	mitos_append_parent_key_component(&signature, parent.owner.canonical);
+	mitos_append_identity_component(&signature, parent.owner.canonical);
 	signature.append_char('/');
 	signature.append_string((String)io::bprintf(
 		&buffer, "%d/", (long)parent.kind
 	)!!);
-	mitos_append_parent_key_component(&signature, parent.name);
+	mitos_append_identity_component(&signature, parent.name);
 	signature.append_char('/');
 	signature.append_string((String)io::bprintf(
 		&buffer, "%d/", (long)parent.arity
 	)!!);
-	mitos_append_parent_key_component(&signature, parent.canonical_signature);
+	mitos_append_identity_component(&signature, parent.canonical_signature);
 	String result = signature.copy_str(allocator);
 	signature.free();
 	return result;

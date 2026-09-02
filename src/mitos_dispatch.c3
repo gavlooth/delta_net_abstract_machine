@@ -24,13 +24,6 @@ struct MethodTypePattern
 	MethodTypePattern[] arguments;
 	MitosSpan span;
 }
-struct PatternVariableOccurrence
-{
-	String variable;
-	ulong position;
-	usz variable_ordinal;
-	MethodTypePattern* pattern;
-}
 
 struct MethodDescriptor
 {
@@ -42,8 +35,6 @@ struct MethodDescriptor
 	MethodTypePattern result;
 	String[] type_variables;
 	usz source_order;
-	PatternVariableOccurrence[] relation_positions;
-	bool relations_ready;
 	MitosSpan span;
 }
 
@@ -146,7 +137,6 @@ fn void MethodDescriptor.deinit(&self, Allocator allocator)
 	alloc::free(allocator, self.parameters);
 	self.result.deinit(allocator);
 	foreach (variable : self.type_variables) alloc::free(allocator, variable);
-	alloc::free(allocator, self.relation_positions);
 	alloc::free(allocator, self.type_variables);
 	*self = { };
 }
@@ -440,20 +430,6 @@ fn GenericFunction* find_generic_by_key(
 	return null;
 }
 
-fn GenericFunction* find_generic(GenericFunctionTable* table, String name, usz arity, usz* index = null) @private
-{
-	foreach (generic_index, &generic : table.generics)
-	{
-		if (generic.name == name && generic.arity == arity
-			&& (!table.module_key.canonical.len
-				|| module_key_equal(&generic.key.owner, &table.module_key)))
-		{
-			if (index) *index = (usz)generic_index;
-			return generic;
-		}
-	}
-	return null;
-}
 fn bool method_pattern_contains_variable(MethodTypePattern* pattern, String name) @private
 {
 	if (pattern.kind == METHOD_PATTERN_VARIABLE) return pattern.name == name;
@@ -475,6 +451,21 @@ fn bool build_method_descriptor(
 ) @private
 {
 	FunctionDecl* function = &program.functions[function_index];
+	if (!symbol_key_matches_declaration(
+		&function.generic_key, &function.generic_key.owner, SYMBOL_GENERIC,
+		function.name, function.parameters.len, ""
+	) || !symbol_key_is_canonical(&function.key)
+		|| function.key.kind != SYMBOL_METHOD
+		|| function.key.name != function.name
+		|| function.key.arity != (uint)function.parameters.len)
+	{
+		dispatch_add_diagnostic(
+			diagnostics, allocator,
+			"method declaration requires canonical method and generic identities",
+			function.span
+		);
+		return false;
+	}
 	List{String} variables;
 	variables.init(allocator);
 	MethodTypePattern[] parameters = alloc::new_array(allocator, MethodTypePattern, function.parameters.len);
@@ -522,19 +513,29 @@ fn bool build_method_descriptor(
 	String signature = canonical_method_signature(
 		registry, parameters, owned_variables, allocator
 	);
-	ModuleKey* method_owner = symbol_key_is_canonical(&function.key)
-		? &function.key.owner : &program.module_key;
-	SymbolKey generic_key = declaration_symbol_key(
-		&function.generic_key, &program.module_key, SYMBOL_GENERIC,
-		function.name, function.parameters.len, "", allocator
-	);
+	if (!symbol_key_matches_declaration(
+		&function.key, &function.key.owner, SYMBOL_METHOD,
+		function.name, function.parameters.len, signature
+	))
+	{
+		dispatch_add_diagnostic(
+			diagnostics, allocator,
+			"method declaration identity does not match its canonical type signature",
+			function.span
+		);
+		alloc::free(allocator, signature);
+		foreach (&parameter : parameters) parameter.deinit(allocator);
+		alloc::free(allocator, parameters);
+		result_pattern.deinit(allocator);
+		foreach (variable : owned_variables) alloc::free(allocator, variable);
+		alloc::free(allocator, owned_variables);
+		variables.free();
+		return false;
+	}
 	*method = {
-		.key = symbol_key(
-			method_owner, SYMBOL_METHOD, function.name,
-			function.parameters.len, signature, allocator
-		),
-		.generic_key = clone_symbol_key(&generic_key, allocator),
-		.owner = clone_module_key(method_owner, allocator),
+		.key = clone_symbol_key(&function.key, allocator),
+		.generic_key = clone_symbol_key(&function.generic_key, allocator),
+		.owner = clone_module_key(&function.key.owner, allocator),
 		.function_index = function_index,
 		.parameters = parameters,
 		.result = result_pattern,
@@ -542,11 +543,7 @@ fn bool build_method_descriptor(
 		.source_order = function_index,
 		.span = function.span,
 	};
-	prepare_method_relations(method, allocator);
-	generic_key.deinit(allocator);
 	alloc::free(allocator, signature);
-	function.key.deinit(program.allocator);
-	function.key = clone_symbol_key(&method.key, program.allocator);
 	variables.free();
 	return true;
 }
@@ -993,12 +990,19 @@ fn GenericFunctionBuildResult build_generic_function_table(
 				"generic function name collides with a constructor", function.span
 			);
 		}
-		SymbolKey generic_key = declaration_symbol_key(
-			&function.generic_key, &program.module_key, SYMBOL_GENERIC,
-			function.name, function.parameters.len, "", allocator
-		);
+		if (!symbol_key_matches_declaration(
+			&function.generic_key, &function.generic_key.owner, SYMBOL_GENERIC,
+			function.name, function.parameters.len, ""
+		))
+		{
+			dispatch_add_diagnostic(
+				&diagnostics, allocator,
+				"method declaration requires a canonical generic identity", function.span
+			);
+			continue;
+		}
 		sz indexed_generic = dispatch_generic_index_lookup(
-			&result.table, generic_slots, &generic_key
+			&result.table, generic_slots, &function.generic_key
 		);
 		usz generic_index;
 		GenericFunction* generic;
@@ -1006,13 +1010,12 @@ fn GenericFunctionBuildResult build_generic_function_table(
 		{
 			if ((usz)result.table.generics.len() >= max_generics)
 			{
-				generic_key.deinit(allocator);
 				dispatch_add_diagnostic(&diagnostics, allocator, "generic function table exhausted its bounded capacity", function.span);
 				break;
 			}
 			GenericFunction created = {
-				.key = clone_symbol_key(&generic_key, allocator),
-				.owner = clone_module_key(&generic_key.owner, allocator),
+				.key = clone_symbol_key(&function.generic_key, allocator),
+				.owner = clone_module_key(&function.generic_key.owner, allocator),
 				.name = function.name.copy(allocator),
 				.arity = function.parameters.len,
 				.epoch = 1,
@@ -1029,7 +1032,6 @@ fn GenericFunctionBuildResult build_generic_function_table(
 			generic_index = (usz)indexed_generic;
 		}
 		generic = &result.table.generics[(sz)generic_index];
-		generic_key.deinit(allocator);
 		MethodDescriptor method;
 		if (!build_method_descriptor(
 			program, (usz)function_index, registry, &method, &diagnostics, allocator
@@ -1162,105 +1164,84 @@ fn bool method_applicable(
 	return true;
 }
 
-fn void collect_pattern_variables(
-	MethodTypePattern* pattern,
-	List{PatternVariableOccurrence}* occurrences,
-	ulong parameter_prefix,
-	usz* local_position
+fn bool method_patterns_force_equal(
+	MethodDescriptor* method,
+	TypeRegistry* registry,
+	MethodTypePattern* left,
+	MethodTypePattern* right,
+	usz depth = 0
 ) @private
 {
-	ulong position = parameter_prefix | (ulong)(*local_position)++;
-	occurrences.push({
-		.variable = pattern.kind == METHOD_PATTERN_VARIABLE ? pattern.name : "",
-		.position = position,
-		.pattern = pattern,
-	});
-	foreach (&argument : pattern.arguments)
-		collect_pattern_variables(argument, occurrences, parameter_prefix, local_position);
-}
-
-
-fn bool ground_pattern_is_final(TypeRegistry* registry, MethodTypePattern* pattern) @private
-{
-	if (pattern.kind == METHOD_PATTERN_EXACT)
+	if (!left || !right || depth >= MITOS_MAX_TYPE_FORMAT_DEPTH) return false;
+	if (left.kind == METHOD_PATTERN_VARIABLE && right.kind == METHOD_PATTERN_VARIABLE)
 	{
-		TypeDescriptor* descriptor = type_descriptor(registry, pattern.type_id);
+		usz left_ordinal = method_variable_ordinal(method.type_variables, left.name);
+		return left_ordinal != usz::max
+			&& left_ordinal == method_variable_ordinal(method.type_variables, right.name);
+	}
+	if (left.kind == METHOD_PATTERN_EXACT && right.kind == METHOD_PATTERN_EXACT)
+	{
+		if (left.type_id != right.type_id) return false;
+		TypeDescriptor* descriptor = type_descriptor(registry, left.type_id);
 		return descriptor && descriptor.kind == TYPE_DESCRIPTOR_CONCRETE
 			&& descriptor.id != TYPE_ID_FUNCTION && descriptor.arity == 0;
 	}
-	if (pattern.kind != METHOD_PATTERN_APPLICATION) return false;
-	TypeDescriptor* descriptor = type_descriptor(registry, pattern.type_id);
+	if (left.kind != METHOD_PATTERN_APPLICATION
+		|| right.kind != METHOD_PATTERN_APPLICATION
+		|| left.type_id != right.type_id
+		|| left.arguments.len != right.arguments.len) return false;
+	TypeDescriptor* descriptor = type_descriptor(registry, left.type_id);
 	if (!descriptor || descriptor.kind != TYPE_DESCRIPTOR_CONCRETE) return false;
-	foreach (&argument : pattern.arguments)
-		if (!ground_pattern_is_final(registry, argument)) return false;
+	foreach (index, &argument : left.arguments)
+	{
+		if (!method_patterns_force_equal(
+			method, registry, argument, &right.arguments[index], depth + 1
+		)) return false;
+	}
 	return true;
 }
-fn void prepare_method_relations(
-	MethodDescriptor* method,
-	Allocator allocator
+
+fn bool collect_required_variable_relations(
+	MethodDescriptor* required,
+	MethodDescriptor* available,
+	TypeRegistry* registry,
+	MethodTypePattern* required_pattern,
+	MethodTypePattern* available_pattern,
+	MethodTypePattern*[] first_terms,
+	usz depth = 0
 ) @private
 {
-	if (method.relations_ready) return;
-	List{PatternVariableOccurrence} occurrences;
-	occurrences.init(allocator);
-	foreach (index, &parameter : method.parameters)
+	if (!required_pattern || !available_pattern
+		|| depth >= MITOS_MAX_TYPE_FORMAT_DEPTH) return false;
+	if (required_pattern.kind == METHOD_PATTERN_VARIABLE)
 	{
-		usz local_position = 0;
-		collect_pattern_variables(
-			parameter, &occurrences, (ulong)index << 32, &local_position
+		usz ordinal = method_variable_ordinal(
+			required.type_variables, required_pattern.name
+		);
+		if (ordinal >= first_terms.len) return false;
+		if (!first_terms[ordinal])
+		{
+			first_terms[ordinal] = available_pattern;
+			return true;
+		}
+		return method_patterns_force_equal(
+			available, registry, first_terms[ordinal], available_pattern
 		);
 	}
-	foreach (&occurrence : occurrences)
+	if (required_pattern.kind != METHOD_PATTERN_APPLICATION) return true;
+	if (available_pattern.kind != METHOD_PATTERN_APPLICATION
+		|| required_pattern.arguments.len != available_pattern.arguments.len)
 	{
-		occurrence.variable_ordinal = occurrence.variable.len
-			? method_variable_ordinal(method.type_variables, occurrence.variable)
-			: usz::max;
+		return false;
 	}
-	method.relation_positions = occurrences.to_array(allocator);
-	method.relations_ready = true;
-	occurrences.free();
-}
-
-fn PatternVariableOccurrence* method_relation_position(
-	MethodDescriptor* method,
-	ulong position
-) @private
-{
-	usz lower = 0;
-	usz upper = method.relation_positions.len;
-	while (lower < upper)
+	foreach (index, &argument : required_pattern.arguments)
 	{
-		usz middle = lower + (upper - lower) / 2;
-		ulong candidate = method.relation_positions[middle].position;
-		if (candidate < position)
-		{
-			lower = middle + 1;
-		}
-		else
-		{
-			upper = middle;
-		}
+		if (!collect_required_variable_relations(
+			required, available, registry, argument,
+			&available_pattern.arguments[index], first_terms, depth + 1
+		)) return false;
 	}
-	if (lower >= method.relation_positions.len
-		|| method.relation_positions[lower].position != position) return null;
-	return &method.relation_positions[lower];
-}
-
-fn bool method_positions_force_equal(
-	MethodDescriptor* method,
-	TypeRegistry* registry,
-	ulong left_position,
-	ulong right_position
-) @private
-{
-	PatternVariableOccurrence* left = method_relation_position(method, left_position);
-	PatternVariableOccurrence* right = method_relation_position(method, right_position);
-	if (!left || !right) return false;
-	if (left.variable_ordinal != usz::max
-		&& left.variable_ordinal == right.variable_ordinal) return true;
-	return ground_pattern_is_final(registry, left.pattern)
-		&& ground_pattern_is_final(registry, right.pattern)
-		&& method_pattern_equal(left.pattern, right.pattern);
+	return true;
 }
 
 fn bool method_variable_relations_satisfied(
@@ -1269,20 +1250,14 @@ fn bool method_variable_relations_satisfied(
 	TypeRegistry* registry
 ) @private
 {
-	ulong[MITOS_MAX_METHOD_VARIABLES] first_positions;
-	foreach (&position : first_positions) *position = ulong::max;
-	foreach (&occurrence : required.relation_positions)
+	if (required.parameters.len != available.parameters.len) return false;
+	MethodTypePattern*[MITOS_MAX_METHOD_VARIABLES] first_terms;
+	foreach (&term : first_terms) *term = null;
+	foreach (index, &parameter : required.parameters)
 	{
-		if (occurrence.variable_ordinal == usz::max) continue;
-		if (occurrence.variable_ordinal >= MITOS_MAX_METHOD_VARIABLES) return false;
-		ulong* first = &first_positions[occurrence.variable_ordinal];
-		if (*first == ulong::max)
-		{
-			*first = occurrence.position;
-			continue;
-		}
-		if (!method_positions_force_equal(
-			available, registry, *first, occurrence.position
+		if (!collect_required_variable_relations(
+			required, available, registry, parameter,
+			&available.parameters[index], first_terms[..]
 		)) return false;
 	}
 	return true;
@@ -1296,8 +1271,6 @@ fn bool tuple_relations_at_least_as_specific(
 	bool* strict
 ) @private
 {
-	prepare_method_relations(candidate, registry.allocator);
-	prepare_method_relations(other, registry.allocator);
 	if (!method_variable_relations_satisfied(other, candidate, registry)) return false;
 	if (!method_variable_relations_satisfied(candidate, other, registry)) *strict = true;
 	return true;
@@ -1427,9 +1400,9 @@ fn DispatchResult dispatch_method(
 {
 	DispatchResult result = { .allocator = allocator };
 	usz generic_index;
-	GenericFunction* generic = canonical_generic
-		? find_generic_by_key(table, canonical_generic, &generic_index)
-		: find_generic(table, name, actual.len, &generic_index);
+	GenericFunction* generic = find_generic_by_key(
+		table, canonical_generic, &generic_index
+	);
 	if (!generic)
 	{
 		DString message;

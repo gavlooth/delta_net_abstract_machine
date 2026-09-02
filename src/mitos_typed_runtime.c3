@@ -60,7 +60,10 @@ struct TypedDeltaSubstitution
  TypedDeltaValue* value;
  usz source_order;
  usz occurrence_order;
+ ulong lineage;
+ ulong replay_lineage;
 }
+
 
 struct TypedDeltaExternalResult
 {
@@ -73,6 +76,7 @@ struct TypedDeltaExternalLane
 {
  usz source_order;
  List{TypedDeltaExternalResult} results;
+ ulong replay_lineage;
 }
 
 struct TypedDeltaHandlerScope
@@ -96,6 +100,8 @@ struct TypedDeltaHandlerActivation
  mitos::TypeId operation_result_type;
  usz effect_source_order;
  usz effect_occurrence_order;
+ ulong effect_replay_lineage;
+ ulong replay_root_lineage;
 	bool multi;
 	bool aborted;
 }
@@ -122,6 +128,7 @@ struct TypedDeltaValue
  mitos::EffectId effect_instance;
  usz effect_source_order;
  usz effect_occurrence_order;
+ ulong effect_replay_lineage;
  mitos::TypeId effect_result_type;
  bool effect_host_suspended;
 }
@@ -155,18 +162,17 @@ struct TypedDeltaRequestView
  usz source_order;
  usz occurrence_order;
  TypedDeltaHostValue[] arguments;
+ String[] owned_argument_strings;
 }
 
 fn void TypedDeltaRequestView.deinit(&self)
 {
  if (!self.allocator) return;
- foreach (&argument : self.arguments)
+ foreach (string : self.owned_argument_strings)
  {
-  if (argument.kind == HOST_VALUE_STRING)
-  {
-   alloc::free(self.allocator, argument.string);
-  }
+  alloc::free(self.allocator, string);
  }
+ alloc::free(self.allocator, self.owned_argument_strings);
  alloc::free(self.allocator, self.arguments);
  *self = { };
 }
@@ -215,6 +221,7 @@ const usz TYPED_DELTA_MAX_PARALLEL_ROOTS = 256;
 const usz TYPED_DELTA_MAX_ENVIRONMENTS = 1_000_000;
 const usz TYPED_DELTA_MAX_OWNED_BYTES = 64 * 1024 * 1024;
 const usz TYPED_DELTA_MAX_FORMAT_BYTES = 1024 * 1024;
+const usz TYPED_DELTA_MAX_HOST_DIAGNOSTIC_BYTES = 64 * 1024;
 
 struct TypedDeltaRetainedAllocation @private
 {
@@ -1156,6 +1163,8 @@ struct TypedDeltaContext
  usz parallel_source_order;
  usz current_occurrence_order;
  TypedDeltaSubstitution* substitution;
+ ulong replay_lineage;
+ ulong next_replay_lineage;
  TypedDeltaContext* external_owner;
  TypedDeltaHandlerScope* handler_scope;
  usz external_lane_index;
@@ -1416,6 +1425,7 @@ fn TypedDeltaValue* typed_delta_effect_request(
   .effect_instance = effect_instance,
   .effect_source_order = context.parallel_source_order,
   .effect_occurrence_order = occurrence_order,
+  .effect_replay_lineage = context.replay_lineage,
   .effect_result_type = result_type,
  });
 }
@@ -2267,18 +2277,15 @@ fn TypedDeltaHostHandlerEntry* typed_delta_host_handler(
 }
 
 
-fn void typed_delta_free_host_arguments(
+
+fn void typed_delta_free_host_call_arguments(
  Allocator allocator,
- TypedDeltaHostValue[] arguments
+ TypedDeltaHostValue[] arguments,
+ String[] owned_strings
 ) @private
 {
- foreach (&argument : arguments)
- {
-  if (argument.kind == HOST_VALUE_STRING)
-  {
-   alloc::free(allocator, argument.string);
-  }
- }
+ foreach (string : owned_strings) alloc::free(allocator, string);
+ alloc::free(allocator, owned_strings);
  alloc::free(allocator, arguments);
 }
 
@@ -2297,6 +2304,7 @@ fn TypedDeltaHostDisposition typed_delta_invoke_external(
   typed_delta_fail(context, "escaped effect is not an external host operation");
   return HOST_FAIL;
  }
+ usz string_count = 0;
  foreach (argument : request.effect_arguments)
  {
   if (argument.kind == TYPED_VALUE_ARRAY
@@ -2305,6 +2313,7 @@ fn TypedDeltaHostDisposition typed_delta_invoke_external(
    typed_delta_fail(context, "external effect host helpers do not accept aggregate values");
    return HOST_FAIL;
   }
+  if (argument.kind == TYPED_VALUE_STRING) string_count++;
  }
  TypedDeltaHostHandlerEntry* matched = typed_delta_host_handler(
   context, request.effect_operation
@@ -2320,19 +2329,38 @@ fn TypedDeltaHostDisposition typed_delta_invoke_external(
   typed_delta_fail(context, "external effect helper registration arity does not match the operation");
   return HOST_FAIL;
  }
- usz argument_bytes =
-  request.effect_arguments.len * (usz)TypedDeltaHostValue::size;
- if (!typed_delta_charge(context, argument_bytes)) return HOST_FAIL;
+ usz argument_count = request.effect_arguments.len;
+ if (argument_count > usz::max / (usz)TypedDeltaHostValue::size
+  || string_count > usz::max / (usz)String::size)
+ {
+  typed_delta_fail(context, "external effect host argument view exceeds its resource bound");
+  return HOST_FAIL;
+ }
+ usz argument_bytes = argument_count * (usz)TypedDeltaHostValue::size;
+ usz cleanup_bytes = string_count * (usz)String::size;
+ if (cleanup_bytes > usz::max - argument_bytes
+  || !typed_delta_charge(context, argument_bytes + cleanup_bytes)) return HOST_FAIL;
  TypedDeltaHostValue[] arguments = alloc::new_array(
-  context.allocator, TypedDeltaHostValue, (sz)request.effect_arguments.len
+  context.allocator, TypedDeltaHostValue, (sz)argument_count
+ );
+ String[] owned_strings = alloc::new_array(
+  context.allocator, String, (sz)string_count
  );
  foreach (&argument : arguments) *argument = { };
- defer typed_delta_free_host_arguments(context.allocator, arguments);
+ foreach (&string : owned_strings) *string = { };
+ defer typed_delta_free_host_call_arguments(
+  context.allocator, arguments, owned_strings
+ );
+ usz owned_string_index = 0;
  foreach (index, argument : request.effect_arguments)
  {
   if (!typed_delta_host_view(context, argument, &arguments[index]))
   {
    return HOST_FAIL;
+  }
+  if (arguments[index].kind == HOST_VALUE_STRING)
+  {
+   owned_strings[owned_string_index++] = arguments[index].string;
   }
  }
  TypedDeltaHostCall call = {
@@ -2348,11 +2376,23 @@ fn TypedDeltaHostDisposition typed_delta_invoke_external(
  if (disposition == HOST_SUSPEND) return HOST_SUSPEND;
  if (disposition != HOST_READY)
  {
-  typed_delta_fail(
-   context,
-   call.diagnostic.len
-    ? call.diagnostic : "external effect host handler failed the operation"
-  );
+  String failure = "external effect host handler failed the operation";
+  if (call.diagnostic.len)
+  {
+   if (!call.diagnostic.ptr)
+   {
+    failure = "external effect host handler returned a malformed failure diagnostic";
+   }
+   else if (call.diagnostic.len > TYPED_DELTA_MAX_HOST_DIAGNOSTIC_BYTES)
+   {
+    failure = "external effect host handler failure diagnostic exceeds its byte limit";
+   }
+   else
+   {
+    failure = call.diagnostic;
+   }
+  }
+  typed_delta_fail(context, failure);
   return HOST_FAIL;
  }
  TypedDeltaValue* result = typed_delta_from_host(context, call.result);
@@ -2632,6 +2672,7 @@ fn TypedDeltaValue* typed_delta_match_value(
 fn TypedDeltaExternalLane* typed_delta_external_lane(
  TypedDeltaContext* context,
  usz source_order,
+ ulong replay_lineage,
  bool create
 ) @private
 {
@@ -2642,11 +2683,13 @@ fn TypedDeltaExternalLane* typed_delta_external_lane(
  {
   TypedDeltaExternalLane* cached =
    &owner.external_lanes[(sz)context.external_lane_index];
-  if (cached.source_order == source_order) return cached;
+  if (cached.source_order == source_order
+   && cached.replay_lineage == replay_lineage) return cached;
  }
  foreach (index, &lane : owner.external_lanes)
  {
-  if (lane.source_order != source_order) continue;
+  if (lane.source_order != source_order
+   || lane.replay_lineage != replay_lineage) continue;
   context.external_lane_index = (usz)index;
   context.external_lane_cached = true;
   return lane;
@@ -2655,7 +2698,10 @@ fn TypedDeltaExternalLane* typed_delta_external_lane(
  if (!typed_delta_charge(
   owner, (usz)TypedDeltaExternalLane::size + (usz)usz::size
  )) return null;
- TypedDeltaExternalLane lane = { .source_order = source_order };
+ TypedDeltaExternalLane lane = {
+  .source_order = source_order,
+  .replay_lineage = replay_lineage,
+ };
  Allocator control_allocator = owner.owned_program
   ? (Allocator)&owner.program_allocator : owner.allocator;
  lane.results.init(control_allocator);
@@ -2669,6 +2715,7 @@ fn TypedDeltaExternalResult* typed_delta_external_slot(
  TypedDeltaContext* context,
  usz source_order,
  mitos::DeltaNodeId hole,
+ ulong replay_lineage,
  usz occurrence_order,
  bool create,
  bool* created = null
@@ -2676,7 +2723,7 @@ fn TypedDeltaExternalResult* typed_delta_external_slot(
 {
  if (created) *created = false;
  TypedDeltaExternalLane* lane = typed_delta_external_lane(
-  context, source_order, create
+  context, source_order, replay_lineage, create
  );
  if (!lane) return null;
  usz low = 0;
@@ -2769,8 +2816,10 @@ fn TypedDeltaValue* typed_delta_effect_values(
 	{
 		if (substitution.hole == node_id
 			&& substitution.source_order == context.parallel_source_order
-			&& substitution.occurrence_order == occurrence_order)
+			&& substitution.occurrence_order == occurrence_order
+			&& substitution.lineage == context.replay_lineage)
 		{
+			context.replay_lineage = substitution.replay_lineage;
 			return substitution.value;
 		}
 	}
@@ -2785,7 +2834,8 @@ fn TypedDeltaValue* typed_delta_effect_values(
  if (external_work)
  {
   TypedDeltaExternalResult* replay = typed_delta_external_slot(
-   context, context.parallel_source_order, node_id, occurrence_order, false
+   context, context.parallel_source_order, node_id, context.replay_lineage,
+   occurrence_order, false
   );
   if (context.failed) return null;
   if (replay)
@@ -2818,8 +2868,8 @@ fn TypedDeltaValue* typed_delta_effect_values(
  if (context.worker_active || !external_work) return request;
  bool created;
  TypedDeltaExternalResult* slot = typed_delta_external_slot(
-  context, context.parallel_source_order, node_id, occurrence_order,
-  true, &created
+  context, context.parallel_source_order, node_id, context.replay_lineage,
+  occurrence_order, true, &created
  );
  if (!slot || !created) return null;
  TypedDeltaValue* ready_result;
@@ -3462,6 +3512,7 @@ fn TypedDeltaValue* typed_delta_handle_request(
 	mitos::DeltaNode* node,
 	TypedDeltaEnvironment environment,
 	TypedDeltaValue* request,
+	ulong replay_root_lineage,
 	usz depth
 ) @private
 {
@@ -3526,6 +3577,8 @@ fn TypedDeltaValue* typed_delta_handle_request(
 		),
 		.effect_source_order = request.effect_source_order,
 		.effect_occurrence_order = request.effect_occurrence_order,
+		.effect_replay_lineage = request.effect_replay_lineage,
+		.replay_root_lineage = replay_root_lineage,
 		.multi = selected.multi,
 	};
 	context.activation = &activation;
@@ -3557,6 +3610,7 @@ fn TypedDeltaValue* typed_delta_handler(
 	}
  mitos::DeltaHandlerDescriptor* handler =
   &context.program.effects.handlers[node.descriptor];
+ ulong replay_root_lineage = context.replay_lineage;
  TypedDeltaHandlerScope scope = {
   .parent = context.handler_scope,
   .handler = handler,
@@ -3570,7 +3624,7 @@ fn TypedDeltaValue* typed_delta_handler(
 	if (typed_delta_is_effect(handled))
 	{
 		return typed_delta_handle_request(
-   context, node, environment, handled, depth + 1
+   context, node, environment, handled, replay_root_lineage, depth + 1
   );
 	}
 	TypedDeltaHandlerActivation activation = {
@@ -3580,6 +3634,7 @@ fn TypedDeltaValue* typed_delta_handler(
 		.handler_node = (mitos::DeltaNodeId)node.stable_id,
 		.handled_root = node.inputs[0],
 		.generation = context.program.effects.epoch,
+		.replay_root_lineage = replay_root_lineage,
 	};
 	return typed_delta_handler_return(context, &activation, handled, depth + 1);
 }
@@ -3592,26 +3647,44 @@ fn TypedDeltaValue* typed_delta_resume_graph(
 	usz depth
 ) @private
 {
+	if (!context.next_replay_lineage
+		|| context.next_replay_lineage == ulong::max)
+	{
+		typed_delta_fail(context, "continuation replay lineage exceeds its resource bound");
+		return null;
+	}
+	ulong branch_lineage = context.next_replay_lineage++;
 	TypedDeltaSubstitution substitution = {
 		.parent = context.substitution,
 		.hole = activation.hole,
 		.value = resumed,
 		.source_order = activation.effect_source_order,
 		.occurrence_order = activation.effect_occurrence_order,
+		.lineage = activation.effect_replay_lineage,
+		.replay_lineage = branch_lineage,
 	};
  usz previous_occurrence = context.current_occurrence_order;
  usz previous_source_order = context.parallel_source_order;
+ ulong previous_lineage = context.replay_lineage;
  context.current_occurrence_order = 0;
  context.parallel_source_order = activation.effect_source_order;
+ context.replay_lineage = activation.replay_root_lineage;
 	context.substitution = &substitution;
+ TypedDeltaHandlerScope replay_scope = {
+  .parent = context.handler_scope,
+  .handler = activation.handler,
+ };
+ context.handler_scope = &replay_scope;
 	TypedDeltaValue* continued = typed_delta_evaluate(
 		context, activation.handled_root, activation.environment, depth + 1
 	);
+ context.handler_scope = replay_scope.parent;
 	if (context.failed)
 	{
 		context.substitution = substitution.parent;
   context.current_occurrence_order = previous_occurrence;
   context.parallel_source_order = previous_source_order;
+  context.replay_lineage = previous_lineage;
 		return null;
 	}
 	TypedDeltaValue* result;
@@ -3624,10 +3697,12 @@ fn TypedDeltaValue* typed_delta_resume_graph(
 			context.substitution = substitution.parent;
    context.current_occurrence_order = previous_occurrence;
    context.parallel_source_order = previous_source_order;
+   context.replay_lineage = previous_lineage;
 			return null;
 		}
 		result = typed_delta_handle_request(
-			context, handler_node, activation.environment, continued, depth + 1
+			context, handler_node, activation.environment, continued,
+			activation.replay_root_lineage, depth + 1
 		);
 	}
 	else
@@ -3636,6 +3711,7 @@ fn TypedDeltaValue* typed_delta_resume_graph(
 	}
  context.current_occurrence_order = previous_occurrence;
  context.parallel_source_order = previous_source_order;
+ context.replay_lineage = previous_lineage;
 	context.substitution = substitution.parent;
 	return result;
 }
@@ -3668,6 +3744,7 @@ fn void typed_delta_context_init(
   .max_owned_bytes = TYPED_DELTA_MAX_OWNED_BYTES,
   .max_values = TYPED_DELTA_MAX_VALUES,
   .max_environments = TYPED_DELTA_MAX_ENVIRONMENTS,
+  .next_replay_lineage = 1,
   .external_owner = context,
  };
  Allocator control_allocator = allocator;
@@ -4098,9 +4175,11 @@ fn TypedDeltaValue* typed_delta_evaluate(
 		{
 			if (substitution.hole == node_id
 				&& substitution.source_order == context.parallel_source_order
-				&& substitution.occurrence_order == context.current_occurrence_order)
+				&& substitution.occurrence_order == context.current_occurrence_order
+				&& substitution.lineage == context.replay_lineage)
 			{
 				context.current_occurrence_order++;
+				context.replay_lineage = substitution.replay_lineage;
 				return substitution.value;
 			}
 		}
@@ -4935,11 +5014,15 @@ fn void typed_delta_context_free(TypedDeltaContext* context) @private
 fn bool typed_delta_materialize_root(
 	mitos::DeltaProgram* program,
 	mitos::DeltaNodeId root,
+	usz* materialization_work,
+	usz* materialization_bytes,
 	Allocator allocator,
 	DeltaDiagnostic* diagnostic
 ) @private
 {
-	DeltaTranslationResult materialized = translate_delta_program(program, root, allocator);
+	DeltaTranslationResult materialized = translate_delta_program_with_budget(
+		program, root, materialization_work, materialization_bytes, allocator
+	);
 	if (!materialized.ok())
 	{
 		diagnostic.init(
@@ -4967,6 +5050,57 @@ fn bool typed_delta_materialize_root(
 	return true;
 }
 
+fn bool typed_delta_preflight_roots(
+ mitos::DeltaProgram* program,
+ Allocator allocator,
+ usz* root_count,
+ DeltaDiagnostic* diagnostic
+) @private
+{
+ *root_count = 0;
+ if (program.image.nodes.len == usz::max
+  || program.image.nodes.len + 1 > DELTA_MAX_MATERIALIZATION_BYTES)
+ {
+  diagnostic.init(allocator, "DeltaProgram root preflight exceeds its resource bound");
+  return false;
+ }
+ usz seen_bytes = program.image.nodes.len + 1;
+ char[] seen = alloc::new_array(
+  allocator, char, (sz)seen_bytes
+ );
+ defer alloc::free(allocator, seen);
+ foreach (&entry : seen) *entry = 0;
+ usz materialization_work = 0;
+ usz materialization_bytes = seen_bytes;
+ mitos::DeltaNodeId root = program.entry;
+ if ((usz)root <= program.image.nodes.len) seen[(usz)root] = 1;
+ (*root_count)++;
+ if (!typed_delta_materialize_root(
+  program,
+  root,
+  &materialization_work,
+  &materialization_bytes,
+  allocator,
+  diagnostic
+ )) return false;
+ foreach (&method : program.method_roots)
+ {
+  root = method.root;
+  if ((usz)root <= program.image.nodes.len && seen[(usz)root]) continue;
+  if ((usz)root <= program.image.nodes.len) seen[(usz)root] = 1;
+  (*root_count)++;
+  if (!typed_delta_materialize_root(
+   program,
+   root,
+   &materialization_work,
+   &materialization_bytes,
+   allocator,
+   diagnostic
+  )) return false;
+ }
+ return true;
+}
+
 fn bool typed_delta_copy_request(
  TypedDeltaContext* context,
  TypedDeltaValue* request,
@@ -4986,31 +5120,49 @@ fn bool typed_delta_copy_request(
   .occurrence_order = request.effect_occurrence_order,
  };
  usz request_bytes = 0;
- if (request.effect_arguments.len
-  > TYPED_DELTA_MAX_OWNED_BYTES / (usz)TypedDeltaHostValue::size)
+ usz argument_count = request.effect_arguments.len;
+ usz string_count = 0;
+ foreach (argument : request.effect_arguments)
+  if (argument.kind == TYPED_VALUE_STRING) string_count++;
+ if (argument_count > usz::max / (usz)TypedDeltaHostValue::size
+  || string_count > usz::max / (usz)String::size)
  {
   typed_delta_fail(context, "external effect request view exceeds its resource bound");
   return false;
  }
- usz argument_bytes =
-  request.effect_arguments.len * (usz)TypedDeltaHostValue::size;
- if (!typed_delta_request_charge(context, &request_bytes, argument_bytes))
+ usz argument_bytes = argument_count * (usz)TypedDeltaHostValue::size;
+ usz cleanup_bytes = string_count * (usz)String::size;
+ if (!typed_delta_request_charge(context, &request_bytes, argument_bytes)
+  || !typed_delta_request_charge(context, &request_bytes, cleanup_bytes))
  {
   return false;
  }
  view.arguments = alloc::new_array(
-  context.allocator, TypedDeltaHostValue, (sz)request.effect_arguments.len
+  context.allocator, TypedDeltaHostValue, (sz)argument_count
+ );
+ view.owned_argument_strings = alloc::new_array(
+  context.allocator, String, (sz)string_count
  );
  foreach (&argument : view.arguments) *argument = { };
+ foreach (&string : view.owned_argument_strings) *string = { };
+ usz owned_string_index = 0;
  foreach (index, argument : request.effect_arguments)
  {
   if (!typed_delta_host_view(
    context, argument, &view.arguments[index], &request_bytes
   ))
   {
-   typed_delta_free_host_arguments(context.allocator, view.arguments);
+   typed_delta_free_host_call_arguments(
+    context.allocator, view.arguments, view.owned_argument_strings
+   );
    view.arguments = { };
+   view.owned_argument_strings = { };
    return false;
+  }
+  if (view.arguments[index].kind == HOST_VALUE_STRING)
+  {
+   view.owned_argument_strings[owned_string_index++] =
+    view.arguments[index].string;
   }
  }
  return true;
@@ -5027,6 +5179,7 @@ fn bool typed_delta_complete_external(
   context,
   request.effect_source_order,
   request.effect_node,
+  request.effect_replay_lineage,
   request.effect_occurrence_order,
   false
  );
@@ -5330,6 +5483,8 @@ fn TypedDeltaExecutionResult resume_typed_delta_suspension(
   alloc::free(allocator, suspension);
   return result;
  }
+ context.replay_lineage = 0;
+ context.next_replay_lineage = 1;
  int worker_count = max_workers;
  if (worker_count <= 0)
  {
@@ -5379,26 +5534,15 @@ fn TypedDeltaExecutionResult run_typed_delta_program(
   );
  }
  DeltaDiagnostic materialization_error;
- if (!typed_delta_materialize_root(
-  program, program.entry, allocator, &materialization_error
+ usz preflight_root_count;
+ if (!typed_delta_preflight_roots(
+  program, allocator, &preflight_root_count, &materialization_error
  ))
  {
   result.status = TYPED_DELTA_FAILED;
   result.diagnostics = alloc::new_array(allocator, DeltaDiagnostic, 1);
   result.diagnostics[0] = materialization_error;
   return result;
- }
- foreach (&method : program.method_roots)
- {
-  if (!typed_delta_materialize_root(
-   program, method.root, allocator, &materialization_error
-  ))
-  {
-   result.status = TYPED_DELTA_FAILED;
-   result.diagnostics = alloc::new_array(allocator, DeltaDiagnostic, 1);
-   result.diagnostics[0] = materialization_error;
-   return result;
-  }
  }
  TypedDeltaHostSnapshotEntry[] host_entries;
  usz missing_host_operation;
@@ -5509,7 +5653,7 @@ fn TypedDeltaExecutionResult run_typed_delta_program(
  if (!context.failed)
  {
   context.parallel_source_order = typed_delta_entry_source_order(context.program);
-  context.stats.phase_one_roots = 1 + context.program.method_roots.len;
+  context.stats.phase_one_roots = preflight_root_count;
  }
  TypedDeltaValue* value = context.failed ? null : typed_delta_evaluate(
   context, context.program.entry, { }, 0

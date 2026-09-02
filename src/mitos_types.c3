@@ -1397,6 +1397,17 @@ fn bool intern_function_type(
 				return false;
 			}
 		}
+		if (effects.has_tail
+			&& (effects.tail.kind != SYMBOL_EFFECT_ROW_TAIL
+				|| !symbol_key_is_canonical(&effects.tail)))
+		{
+			if (diagnostic) diagnostic.init(
+				registry.allocator,
+				"function signature contains a noncanonical effect-row tail",
+				span
+			);
+			return false;
+		}
 	}
 	ResolvedEffectRow canonical_effects = effects
 		? normalize_effect_row(
@@ -2196,6 +2207,17 @@ fn TypeRegistryBuildResult build_type_registry(
 	foreach (&accepted : accepted_types) *accepted = false;
 	foreach (type_index, &type_decl : program.types)
 	{
+		if (!symbol_key_matches_declaration(
+			&type_decl.key, &program.module_key, SYMBOL_TYPE,
+			type_decl.name, type_decl.parameters.len, ""
+		))
+		{
+			types_add_diagnostic(
+				&diagnostics, allocator,
+				"type declaration has an invalid canonical identity", type_decl.span
+			);
+			continue;
+		}
 
 		TypeId existing = find_type_by_key(&result.registry, &type_decl.key);
 		TypeId reserved = find_type(&result.registry, type_decl.name);
@@ -2237,10 +2259,7 @@ fn TypeRegistryBuildResult build_type_registry(
 
 		String[] parameters = alloc::new_array(allocator, String, type_decl.parameters.len);
 		foreach (index, &parameter : type_decl.parameters) parameters[index] = parameter.name.copy(allocator);
-		SymbolKey key = declaration_symbol_key(
-			&type_decl.key, &program.module_key, SYMBOL_TYPE,
-			type_decl.name, type_decl.parameters.len, "", allocator
-		);
+		SymbolKey key = clone_symbol_key(&type_decl.key, allocator);
 		LayoutDescriptor layout = {
 			.kind = LAYOUT_UNSIZED,
 			.copy_policy = type_decl.kind == TYPE_DECL_ABSTRACT ? COPY_BORROWED : COPY_AFFINE,
@@ -2266,6 +2285,17 @@ fn TypeRegistryBuildResult build_type_registry(
 	}
 	foreach (&enum_decl : program.enums)
 	{
+		if (!symbol_key_matches_declaration(
+			&enum_decl.key, &program.module_key, SYMBOL_ENUM,
+			enum_decl.name, enum_decl.parameters.len, ""
+		))
+		{
+			types_add_diagnostic(
+				&diagnostics, allocator,
+				"enum declaration has an invalid canonical identity", enum_decl.span
+			);
+			continue;
+		}
 		if (find_type_in_module(&result.registry, &program.module_key, enum_decl.name))
 		{
 			types_add_diagnostic(&diagnostics, allocator, "duplicate or reserved enum type name", enum_decl.span);
@@ -2279,10 +2309,7 @@ fn TypeRegistryBuildResult build_type_registry(
 
 		String[] parameters = alloc::new_array(allocator, String, enum_decl.parameters.len);
 		foreach (index, &parameter : enum_decl.parameters) parameters[index] = parameter.name.copy(allocator);
-		SymbolKey key = declaration_symbol_key(
-			&enum_decl.key, &program.module_key, SYMBOL_ENUM,
-			enum_decl.name, enum_decl.parameters.len, "", allocator
-		);
+		SymbolKey key = clone_symbol_key(&enum_decl.key, allocator);
 		LayoutDescriptor layout = {
 			.kind = LAYOUT_UNSIZED,
 			.copy_policy = COPY_AFFINE,

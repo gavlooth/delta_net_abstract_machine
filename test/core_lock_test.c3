@@ -232,6 +232,71 @@ fn MirHostDisposition count_mir_host_calls(MirHostCall* call, void* context)
 	return HOST_READY;
 }
 
+struct ReplayHostContext
+{
+	long[4] arguments;
+	usz calls;
+}
+
+
+fn TypedDeltaHostDisposition record_replay_host_call(
+	TypedDeltaHostCall* call,
+	void* context
+)
+{
+	assert(call != null && context != null);
+	assert(call.arguments.len == 1);
+	assert(call.arguments[0].kind == HOST_VALUE_I64);
+	assert(call.arguments[0].type_id == mitos::TYPE_ID_I64);
+	ReplayHostContext* state = (ReplayHostContext*)context;
+	assert(state.calls < state.arguments.len);
+	long argument = call.arguments[0].integer;
+	state.arguments[state.calls++] = argument;
+	call.result = {
+		.kind = HOST_VALUE_I64,
+		.type_id = mitos::TYPE_ID_I64,
+		.integer = argument,
+	};
+	return HOST_READY;
+}
+
+
+struct AdversarialHostContext
+{
+	uint mode;
+	usz calls;
+}
+
+
+fn TypedDeltaHostDisposition adversarial_host_call(
+	TypedDeltaHostCall* call,
+	void* context
+)
+{
+	assert(call != null && context != null);
+	assert(call.arguments.len == 1);
+	assert(call.arguments[0].kind == HOST_VALUE_STRING);
+	assert(call.arguments[0].type_id == mitos::TYPE_ID_STRING);
+	assert(call.arguments[0].string == "payload");
+	AdversarialHostContext* state = (AdversarialHostContext*)context;
+	state.calls++;
+	if (state.mode == 0)
+	{
+		call.arguments[0].kind = HOST_VALUE_STRING;
+		call.arguments[0].string = (String)((char*)1)[0..1];
+		call.result = {
+			.kind = HOST_VALUE_I64,
+			.type_id = mitos::TYPE_ID_I64,
+			.integer = 42,
+		};
+		return HOST_READY;
+	}
+	call.diagnostic = state.mode == 1
+		? (String)((char*)null)[0..1]
+		: (String)((char*)1)[0..(64 * 1024 + 1)];
+	return HOST_FAIL;
+}
+
 
 fn ulong test_u64_le(char[] bytes, usz offset)
 {
@@ -431,6 +496,56 @@ fn void canonical_identity_and_effect_rows_are_structural() @test
 	assert(mitos::resolved_effect_row_satisfies(
 		&state_row, &identical_state_row
 	));
+}
+
+
+fn void invalid_function_effect_row_tail_rejects_before_interning() @test
+{
+	MitosParseResult parsed = mitos::parse_program(
+		"main():\n  1\nend\n", mem
+	);
+	defer parsed.deinit();
+	assert(parsed.ok());
+	TypeRegistryBuildResult types =
+		mitos::build_type_registry(&parsed.program, mem);
+	defer types.deinit();
+	assert(types.ok());
+	EffectRegistryBuildResult effects = mitos::build_effect_registry(
+		&parsed.program, &types.registry, mem
+	);
+	defer effects.deinit();
+	assert(effects.ok());
+
+	ModuleKey owner = mitos::default_module_key(mem);
+	defer owner.deinit(mem);
+	SymbolKey wrong_tail = mitos::symbol_key(
+		&owner, SYMBOL_GENERIC, "Tail", 0, "", mem
+	);
+	defer wrong_tail.deinit(mem);
+	ResolvedEffectRow invalid = {
+		.has_tail = true,
+		.tail = wrong_tail,
+	};
+	mitos::TypeId[] parameters = { };
+	mitos::TypeId result = mitos::TYPE_ID_INVALID;
+	usz descriptor_count = (usz)types.registry.descriptors.len();
+	ulong epoch = types.registry.epoch;
+	mitos::MitosDiagnostic diagnostic;
+	assert(!mitos::intern_function_type(
+		&types.registry,
+		&effects.registry,
+		parameters,
+		mitos::TYPE_ID_I64,
+		&invalid,
+		&result,
+		&diagnostic
+	));
+	defer diagnostic.deinit();
+	assert(diagnostic.message
+		== "function signature contains a noncanonical effect-row tail");
+	assert(result == mitos::TYPE_ID_INVALID);
+	assert((usz)types.registry.descriptors.len() == descriptor_count);
+	assert(types.registry.epoch == epoch);
 }
 
 fn LayoutDescriptor test_layout(ModuleKey* owner, String name, CopyPolicy policy)
@@ -3642,6 +3757,59 @@ end
 }
 
 
+fn void generic_multishot_replay_preserves_its_handler_and_runs_host_work_per_branch() @test
+{
+	String source = `effect Console:
+  work(value of I64) of I64
+end
+multi effect Choice:
+  choose() of I64
+end
+multi effect Inner:
+  work(value of I64) of I64
+end
+choose_work():
+  first := Choice.choose()
+  second := Choice.choose()
+  Inner.work(first * 10 + second)
+end
+main():
+  handle choose_work():
+    Choice.choose(): superpose(resume(1), resume(2))
+    Inner.work(value): resume(Console.work(value))
+    return(value of I64): value
+  end
+end
+`;
+	MitosParseResult parsed = mitos::parse_program(source, mem);
+	defer parsed.deinit();
+	assert(parsed.ok());
+	DeltaProgramBuildResult lowered = mitos::lower_delta_program(
+		&parsed.program, mem
+	);
+	defer lowered.deinit();
+	assert(lowered.ok());
+	ReplayHostContext host = { };
+	DeltaRuntime runtime;
+	runtime.init(1);
+	assert(runtime.register_host_handler(
+		&lowered.program, 0, &record_replay_host_call, &host
+	));
+	TypedDeltaExecutionResult execution = runtime.run(&lowered.program);
+	assert(execution.status == TYPED_DELTA_COMPLETE);
+	assert(execution.formatted == "superpose(11, 22)");
+	assert(host.calls == 4);
+	long[4] expected = { 11, 12, 21, 22 };
+	foreach (index, argument : host.arguments)
+	{
+		assert(argument == expected[index]);
+	}
+	execution.deinit();
+	assert(runtime.unregister_host_handler(&lowered.program, 0));
+	assert(runtime.free());
+}
+
+
 fn void recursive_parallel_mir_preserves_call_depth_budget() @test
 {
 	String source = `loop() of I64:
@@ -3672,6 +3840,37 @@ end
 		assert(native.diagnostic == "native call-depth limit exceeded");
 		native.free();
 	}
+}
+
+
+fn void parallel_snapshots_preserve_closure_and_aggregate_alias_identity() @test
+{
+	assert_generic_and_jit_result(
+		`enum Holder:
+  Holder(value)
+end
+enum Result:
+  Result(closure_same, aggregate_same)
+end
+make(offset of I64):
+  do() of I64:
+    offset
+  end
+end
+main():
+  f := make(42)
+  closure_alias := f
+  holder := Holder(f)
+  aggregate_alias := holder
+  parallel:
+    closure_same := f = closure_alias
+    aggregate_same := holder = aggregate_alias
+    Result(closure_same, aggregate_same)
+  end
+end
+`,
+		"Result(True, True)"
+	);
 }
 
 
@@ -4116,6 +4315,56 @@ end
 	parsed.deinit();
 	assert_generic_and_jit_result(source, "1");
 }
+fn void aot_rejects_forged_lambda_function_metadata() @test
+{
+	char[160] path_buffer;
+	String path = unique_aot_test_path(path_buffer[..], "lambda-metadata");
+	reserve_aot_test_path(path);
+	defer (void)libc::remove(path.zstr_tcopy());
+	String source = `main():
+  f := do(value of I64) of I64:
+    value
+  end
+  f(42)
+end
+`;
+	MitosParseResult parsed = mitos::parse_program(source, mem);
+	assert(parsed.ok());
+	DeltaProgramBuildResult lowered =
+		mitos::lower_delta_program(&parsed.program, mem);
+	assert(lowered.ok());
+	MitosAotResult canonical = delta_net_abstract_machine::write_mitos_aot(
+		&lowered.program, path, mem
+	);
+	assert(canonical.status == mitos_mir::MirStatus.NATIVE);
+	canonical.free();
+
+	mitos::DeltaNode* lambda = null;
+	foreach (&node : lowered.program.image.nodes)
+	{
+		if (node.kind == mitos::DeltaNodeKind.DELTA_LAMBDA)
+		{
+			lambda = node;
+			break;
+		}
+	}
+	assert(lambda != null);
+	mitos::TypeId runtime_type = lambda.runtime_type;
+	assert(runtime_type != mitos::TYPE_ID_I64);
+	lambda.runtime_type = mitos::TYPE_ID_I64;
+	MitosAotResult rejected = delta_net_abstract_machine::write_mitos_aot(
+		&lowered.program, path, mem
+	);
+	lambda.runtime_type = runtime_type;
+	assert(rejected.status == mitos_mir::MirStatus.ERROR);
+	assert(rejected.diagnostic
+		== "AOT v4 requires a valid complete DeltaProgram");
+	rejected.free();
+	lowered.deinit();
+	parsed.deinit();
+}
+
+
 fn void aot_rejects_binder_hierarchy_and_layout_coherence_mutations() @test
 {
 	char[160] path_buffer;
@@ -4310,6 +4559,55 @@ end
 	lowered.deinit();
 	parsed.deinit();
 }
+
+fn void host_cleanup_ignores_mutated_argument_metadata_and_failure_diagnostics_stay_bounded() @test
+{
+	String source = `effect IO:
+  act(value of String) of I64
+end
+main():
+  IO.act("payload")
+end
+`;
+	MitosParseResult parsed = mitos::parse_program(source, mem);
+	defer parsed.deinit();
+	assert(parsed.ok());
+	DeltaProgramBuildResult lowered = mitos::lower_delta_program(
+		&parsed.program, mem
+	);
+	defer lowered.deinit();
+	assert(lowered.ok());
+	String[2] failures = {
+		"external effect host handler returned a malformed failure diagnostic",
+		"external effect host handler failure diagnostic exceeds its byte limit",
+	};
+	for (usz mode = 0; mode < 3; mode++)
+	{
+		AdversarialHostContext context = { .mode = (uint)mode };
+		DeltaRuntime runtime;
+		runtime.init(1);
+		assert(runtime.register_host_handler(
+			&lowered.program, 0, &adversarial_host_call, &context
+		));
+		TypedDeltaExecutionResult execution = runtime.run(&lowered.program);
+		if (!mode)
+		{
+			assert(execution.status == TYPED_DELTA_COMPLETE);
+			assert(execution.formatted == "42");
+		}
+		else
+		{
+			assert(execution.status == TYPED_DELTA_FAILED);
+			assert(execution.diagnostics.len == 1);
+			assert(execution.diagnostics[0].message == failures[mode - 1]);
+		}
+		assert(context.calls == 1);
+		execution.deinit();
+		assert(runtime.unregister_host_handler(&lowered.program, 0));
+		assert(runtime.free());
+	}
+}
+
 
 fn void ready_string_and_type_results_validate_the_full_host_shape() @test
 {
@@ -4742,7 +5040,7 @@ end
 }
 
 
-fn void mir_cfg_and_parallel_site_metadata_fail_closed() @test
+fn void mir_cfg_constructor_type_and_parallel_site_metadata_fail_closed() @test
 {
 	String match_source = `enum Choice:
   A
@@ -4833,6 +5131,26 @@ end
 	assert(bypassed.status == mitos_mir::MirStatus.ERROR);
 	assert(bypassed.diagnostic.len > 0);
 	bypassed.free();
+	MirInstruction* constructor = null;
+	for (uint index = 0; index < match_program.instruction_count; index++)
+	{
+		MirInstruction* instruction = &match_program.instructions[index];
+		if (instruction.opcode == mitos_mir::MirOpcode.MAKE_CONSTRUCTOR)
+		{
+			constructor = instruction;
+			break;
+		}
+	}
+	assert(constructor != null);
+	uint runtime_type = constructor.b;
+	assert(runtime_type != (uint)mitos::TYPE_ID_I64);
+	constructor.b = (uint)mitos::TYPE_ID_I64;
+	MirExecutionResult wrong_constructor_type =
+		mitos_mir::execute(&match_runtime, &match_program, mem);
+	constructor.b = runtime_type;
+	assert(wrong_constructor_type.status == mitos_mir::MirStatus.ERROR);
+	assert(wrong_constructor_type.diagnostic.len > 0);
+	wrong_constructor_type.free();
 	assert(match_runtime.free());
 	match_native.free();
 	match_lowered.deinit();

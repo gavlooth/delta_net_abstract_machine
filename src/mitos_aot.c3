@@ -92,29 +92,40 @@ fn MitosAotResult aot_error(Allocator allocator, String message)
 struct AotWriter
 {
 	List{char} bytes;
+	usz encoded_bytes;
 	usz* decode_budget;
+	bool sizing;
 	bool failed;
 }
 
 fn void AotWriter.init(
 	&self,
 	Allocator allocator,
-	usz* decode_budget = null
+	usz* decode_budget = null,
+	bool sizing = false
 )
 {
 	self.decode_budget = decode_budget;
-	self.bytes.init(allocator);
+	self.sizing = sizing;
+	if (!sizing) self.bytes.init(allocator);
 }
 
 fn void AotWriter.deinit(&self)
 {
-	self.bytes.free();
+	if (!self.sizing) self.bytes.free();
 	*self = { };
 }
 
 fn void AotWriter.u8(&self, char value)
 {
-	if (!self.failed) self.bytes.push(value);
+	if (self.failed) return;
+	if (self.encoded_bytes >= MITOS_AOT_MAX_BYTES)
+	{
+		self.failed = true;
+		return;
+	}
+	if (!self.sizing) self.bytes.push(value);
+	self.encoded_bytes++;
 }
 
 fn void AotWriter.u32(&self, uint value)
@@ -158,27 +169,30 @@ fn void AotWriter.count(
 
 fn void AotWriter.patch_u64(&self, usz offset, ulong value)
 {
-	if (self.failed || offset > (usz)self.bytes.size
-		|| (usz)self.bytes.size - offset < 8)
+	if (self.failed || offset > self.encoded_bytes
+		|| self.encoded_bytes - offset < 8)
 	{
 		self.failed = true;
 		return;
 	}
+	if (self.sizing) return;
 	for (uint shift = 0; shift < 64; shift += 8)
 	{
 		self.bytes[(sz)(offset + shift / 8)] = (char)((value >> shift) & 0xff);
 	}
 }
 
-fn void AotWriter.string(&self, String value)
+fn void AotWriter.string(&self, String value, usz maximum = (usz)uint::max)
 {
-	if (value.len > (usz)uint::max
-		|| self.bytes.size > (sz)MITOS_AOT_MAX_BYTES - (sz)value.len - 4
-		|| !self.claim_decode_bytes(value.len))
+	if (value.len > (usz)uint::max || value.len > maximum
+		|| value.len > MITOS_AOT_MAX_BYTES - 4
+		|| self.encoded_bytes > MITOS_AOT_MAX_BYTES - 4 - value.len)
 	{
 		self.failed = true;
 		return;
 	}
+	usz allocation_bytes = value.len ? value.len + 1 : 0;
+	if (!self.claim_decode_bytes(allocation_bytes)) return;
 	self.u32((uint)value.len);
 	foreach (character : value) self.u8(character);
 }
@@ -190,15 +204,20 @@ fn void AotWriter.record(
 	AotWriter* record
 )
 {
-	if (record.failed || record.bytes.size < 0
-		|| self.bytes.size > (sz)MITOS_AOT_MAX_BYTES - record.bytes.size - 16)
+	if (record.failed || record.encoded_bytes > MITOS_AOT_MAX_BYTES - 16
+		|| self.encoded_bytes > MITOS_AOT_MAX_BYTES - 16 - record.encoded_bytes)
 	{
 		self.failed = true;
 		return;
 	}
 	self.u32((uint)tag);
 	self.u32((uint)flags);
-	self.u64((ulong)record.bytes.size);
+	self.u64((ulong)record.encoded_bytes);
+	if (self.sizing)
+	{
+		self.encoded_bytes += record.encoded_bytes;
+		return;
+	}
 	foreach (byte : record.bytes) self.u8(byte);
 }
 
@@ -330,7 +349,7 @@ fn bool AotReader.bounded_length(&self, ulong encoded, usz* length)
 	return true;
 }
 
-fn String AotReader.string(&self)
+fn String AotReader.string(&self, usz maximum = (usz)uint::max)
 {
 	uint length = self.u32();
 	if (self.failed || (usz)length > self.bytes.len - self.cursor)
@@ -338,7 +357,13 @@ fn String AotReader.string(&self)
 		self.fail("AOT v4 string extends beyond its bounded record");
 		return { };
 	}
-	if (!self.claim_bytes((usz)length)) return { };
+	if ((usz)length > maximum)
+	{
+		self.fail("AOT v4 string exceeds its production limit");
+		return { };
+	}
+	if (!length) return { };
+	if (!self.claim_bytes((usz)length + 1)) return { };
 	String value = (String)self.bytes[self.cursor:length];
 	self.cursor += length;
 	return value.copy(self.allocator);
@@ -357,7 +382,8 @@ fn String AotReader.bounded_string(&self, usz maximum, String diagnostic)
 		self.fail(diagnostic);
 		return { };
 	}
-	if (!self.claim_bytes((usz)length)) return { };
+	if (!length) return { };
+	if (!self.claim_bytes((usz)length + 1)) return { };
 	String value = (String)self.bytes[self.cursor:length];
 	self.cursor += length;
 	return value.copy(self.allocator);
@@ -378,7 +404,8 @@ fn String AotReader.identifier(&self, bool allow_empty = false)
 		self.fail("AOT v4 name is not a source identifier");
 		return { };
 	}
-	if (!self.claim_bytes((usz)length)) return { };
+	if (!length) return { };
+	if (!self.claim_bytes((usz)length + 1)) return { };
 	self.cursor += length;
 	return value.copy(self.allocator);
 }
@@ -953,7 +980,12 @@ fn void aot_write_nodes(AotWriter* writer, mitos::DeltaProgram* program)
 	{
 		aot_write_symbol_key(writer, &node.key);
 		writer.u32(node.stable_id); writer.u32((uint)node.kind); writer.u32((uint)node.static_type); writer.u32(node.span);
-		writer.u64((ulong)node.integer); writer.string(node.string_value);
+		writer.u64((ulong)node.integer);
+		writer.string(
+			node.string_value,
+			node.kind == mitos::DeltaNodeKind.DELTA_STRING
+				? mitos::MITOS_MAX_STRING_LITERAL_BYTES : (usz)uint::max
+		);
 		writer.u64((ulong)node.descriptor); writer.string(node.name);
 		aot_write_strings(writer, node.names); aot_write_type_ids(writer, node.types);
 		writer.u32((uint)node.runtime_type); writer.u32((uint)node.result_type);
@@ -998,7 +1030,11 @@ fn void aot_read_nodes(AotReader* reader, mitos::DeltaProgram* program)
 		}
 		node.kind = (mitos::DeltaNodeKind)node_kind;
 		node.static_type = (mitos::TypeId)reader.u32(); node.span = reader.u32();
-		node.integer = (long)reader.u64(); node.string_value = reader.string();
+		node.integer = (long)reader.u64();
+		node.string_value = reader.string(
+			node.kind == mitos::DeltaNodeKind.DELTA_STRING
+				? mitos::MITOS_MAX_STRING_LITERAL_BYTES : (usz)uint::max
+		);
 		node.descriptor = reader.usize(); node.name = reader.identifier(true);
 		bool superposition_node = node.kind == mitos::DeltaNodeKind.DELTA_SUPERPOSE
 			|| node.kind == mitos::DeltaNodeKind.DELTA_COLLAPSE;
@@ -1622,74 +1658,108 @@ fn bool aot_manifest_is_supported(AotManifest* manifest)
 	return true;
 }
 
-fn MitosAotResult write_mitos_aot(
+fn void aot_serialize_program(
+	AotWriter* artifact,
 	mitos::DeltaProgram* program,
-	String output,
-	Allocator allocator = mem
+	Allocator allocator
 )
 {
-	if (!program || !program.entry || !validate_aot_delta_program(program))
-	{
-		return aot_error(allocator, "AOT v4 requires a valid complete DeltaProgram");
-	}
-
-	usz decode_budget = MITOS_AOT_MAX_DECODE_BYTES;
-	AotWriter artifact; artifact.init(allocator, &decode_budget); defer artifact.deinit();
 	foreach (character : MITOS_AOT_MAGIC) artifact.u8(character);
 	artifact.u32(mitos::DELTA_AOT_CONTAINER_MAJOR);
 	artifact.u32(mitos::DELTA_AOT_CONTAINER_MINOR);
 	artifact.u32(MITOS_AOT_HEADER_LENGTH);
 	artifact.u64(0);
 
-	AotWriter record; record.init(allocator, &decode_budget);
+	AotWriter record;
+	record.init(allocator, artifact.decode_budget, artifact.sizing);
+	defer record.deinit();
 	aot_write_manifest(&record, program);
 	artifact.record(AOT_MANIFEST, mitos::DELTA_RECORD_REQUIRED, &record);
-	record.deinit(); record.init(allocator, &decode_budget);
+	record.deinit();
+	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_module(&record, program);
 	artifact.record(AOT_MODULE, mitos::DELTA_RECORD_REQUIRED, &record);
-	record.deinit(); record.init(allocator, &decode_budget);
+	record.deinit();
+	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_types(&record, program);
 	artifact.record(AOT_TYPES, mitos::DELTA_RECORD_REQUIRED, &record);
-	record.deinit(); record.init(allocator, &decode_budget);
+	record.deinit();
+	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_methods(&record, program);
 	artifact.record(AOT_METHODS, mitos::DELTA_RECORD_REQUIRED, &record);
-	record.deinit(); record.init(allocator, &decode_budget);
+	record.deinit();
+	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_constructors(&record, program);
 	artifact.record(AOT_CONSTRUCTORS, mitos::DELTA_RECORD_REQUIRED, &record);
-	record.deinit(); record.init(allocator, &decode_budget);
+	record.deinit();
+	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_primitives(&record, program);
 	artifact.record(AOT_PRIMITIVES, mitos::DELTA_RECORD_REQUIRED, &record);
-	record.deinit(); record.init(allocator, &decode_budget);
+	record.deinit();
+	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_nodes(&record, program);
 	artifact.record(AOT_NODES, mitos::DELTA_RECORD_REQUIRED, &record);
-	record.deinit(); record.init(allocator, &decode_budget);
+	record.deinit();
+	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_graph(&record, program);
 	artifact.record(AOT_GRAPH, mitos::DELTA_RECORD_REQUIRED, &record);
-	record.deinit(); record.init(allocator, &decode_budget);
+	record.deinit();
+	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_roots(&record, program);
 	artifact.record(AOT_ROOTS, mitos::DELTA_RECORD_REQUIRED, &record);
-	record.deinit(); record.init(allocator, &decode_budget);
+	record.deinit();
+	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_spans(&record, program);
 	artifact.record(AOT_SPANS, mitos::DELTA_RECORD_REQUIRED, &record);
-	record.deinit(); record.init(allocator, &decode_budget);
+	record.deinit();
+	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_effects(&record, program);
 	artifact.record(AOT_EFFECTS, mitos::DELTA_RECORD_REQUIRED, &record);
-	record.deinit(); record.init(allocator, &decode_budget);
+	record.deinit();
+	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_helper_abi(&record, program);
 	artifact.record(AOT_HELPER_ABI, mitos::DELTA_RECORD_REQUIRED, &record);
-	record.deinit();
+	artifact.patch_u64(20, (ulong)artifact.encoded_bytes);
+}
 
-	if (artifact.failed || artifact.bytes.size < (sz)MITOS_AOT_HEADER_LENGTH
-		|| artifact.bytes.size > (sz)MITOS_AOT_MAX_BYTES)
+fn MitosAotResult write_mitos_aot(
+	mitos::DeltaProgram* program,
+	String output,
+	Allocator allocator = mem
+)
+{
+	if (!program || !program.entry)
+	{
+		return aot_error(allocator, "AOT v4 requires a valid complete DeltaProgram");
+	}
+
+	usz preflight_budget = MITOS_AOT_MAX_DECODE_BYTES;
+	AotWriter preflight;
+	preflight.init(allocator, &preflight_budget, true);
+	defer preflight.deinit();
+	aot_serialize_program(&preflight, program, allocator);
+	if (preflight.failed
+		|| preflight.encoded_bytes < MITOS_AOT_HEADER_LENGTH
+		|| preflight.encoded_bytes > MITOS_AOT_MAX_BYTES)
 	{
 		return aot_error(
 			allocator,
-			"AOT v4 artifact exceeds its paired 64 MiB encode/decode limits"
+			"AOT v4 program exceeds its cardinality, string, or cumulative byte limits"
 		);
 	}
-	ulong artifact_length = (ulong)artifact.bytes.size;
-	artifact.patch_u64(20, artifact_length);
-	if (artifact.failed)
+	if (!validate_aot_delta_program(program))
+	{
+		return aot_error(allocator, "AOT v4 requires a valid complete DeltaProgram");
+	}
+
+	usz decode_budget = MITOS_AOT_MAX_DECODE_BYTES;
+	AotWriter artifact;
+	artifact.init(allocator, &decode_budget);
+	defer artifact.deinit();
+	aot_serialize_program(&artifact, program, allocator);
+	if (artifact.failed || artifact.encoded_bytes != preflight.encoded_bytes
+		|| decode_budget != preflight_budget
+		|| artifact.bytes.size != (sz)artifact.encoded_bytes)
 	{
 		return aot_error(allocator, "AOT v4 writer length accounting failed");
 	}
@@ -4380,6 +4450,7 @@ fn bool validate_aot_delta_program(mitos::DeltaProgram* program)
 						&& node.result_type != mitos::TYPE_ID_I64)) return false;
 			case DELTA_STRING:
 				if (node.static_type != mitos::TYPE_ID_STRING || node.inputs.len
+					|| node.string_value.len > mitos::MITOS_MAX_STRING_LITERAL_BYTES
 					|| (node.runtime_type
 						&& node.runtime_type != mitos::TYPE_ID_STRING)
 					|| (node.result_type
@@ -4388,8 +4459,30 @@ fn bool validate_aot_delta_program(mitos::DeltaProgram* program)
 				if (node.inputs.len != 1 || node.names.len != node.types.len
 					|| !aot_strings_are_unique_nonempty(
 						node.names, program.allocator
-					)
-					|| !node.runtime_type || !node.result_type) return false;
+					)) return false;
+				mitos::TypeDescriptor* function_type = mitos::type_descriptor(
+					&program.types, node.static_type
+				);
+				if (!function_type
+					|| function_type.kind
+						!= mitos::TypeDescriptorKind.TYPE_DESCRIPTOR_FUNCTION_INSTANCE
+					|| node.runtime_type != node.static_type
+					|| node.types.len != function_type.function_parameters.len
+					|| node.result_type != function_type.function_result
+					|| !mitos::resolved_effect_row_equal(
+						&node.effect_row, &function_type.function_effects
+					))
+				{
+					return false;
+				}
+				foreach (parameter_index, parameter_type : node.types)
+				{
+					if (parameter_type
+						!= function_type.function_parameters[parameter_index])
+					{
+						return false;
+					}
+				}
 			case DELTA_APPLY:
 				if (!node.inputs.len) return false;
 			case DELTA_LET:

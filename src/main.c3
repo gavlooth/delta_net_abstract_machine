@@ -18,6 +18,47 @@ const String CLI_USAGE = `usage:
   mitos aot FILE OUTPUT
   mitos aot-run ARTIFACT`;
 
+const usz TERMINAL_DIAGNOSTIC_FIELD_MAX_BYTES = 4096;
+const String TERMINAL_DIAGNOSTIC_HEX = "0123456789abcdef";
+
+fn void terminal_eprint_field(String field)
+{
+	usz escaped_bytes = 0;
+	usz segment_start = 0;
+	foreach (index, character : field)
+	{
+		bool control = (usz)character < 0x20 || (usz)character == 0x7f;
+		usz encoded_bytes = control ? 4 : 1;
+		if (encoded_bytes > TERMINAL_DIAGNOSTIC_FIELD_MAX_BYTES - escaped_bytes)
+		{
+			if (segment_start < (usz)index)
+			{
+				io::eprint(field[segment_start:(usz)index - segment_start]);
+			}
+			io::eprint("...");
+			return;
+		}
+		escaped_bytes += encoded_bytes;
+		if (!control) continue;
+		if (segment_start < (usz)index)
+		{
+			io::eprint(field[segment_start:(usz)index - segment_start]);
+		}
+		usz byte = (usz)character;
+		char[4] escaped = {
+			'\\', 'x',
+			TERMINAL_DIAGNOSTIC_HEX[byte >> 4],
+			TERMINAL_DIAGNOSTIC_HEX[byte & 0x0f],
+		};
+		io::eprint((String)escaped[..]);
+		segment_start = (usz)index + 1;
+	}
+	if (segment_start < field.len)
+	{
+		io::eprint(field[segment_start:field.len - segment_start]);
+	}
+}
+
 enum CliMode : char
 {
 	CLI_RUN,
@@ -56,10 +97,10 @@ fn void print_diagnostic(
 {
 	usz row = span.start.row > 0 ? (usz)span.start.row : 1;
 	usz column = span.start.column > 0 ? (usz)span.start.column : 1;
-	io::eprintfn(
-		"%s:%d:%d: %s",
-		source_name, (long)row, (long)column, message
-	);
+	terminal_eprint_field(source_name);
+	io::eprintf(":%d:%d: ", (long)row, (long)column);
+	terminal_eprint_field(message);
+	io::eprintn("");
 }
 
 fn MitosSpan operation_span(
@@ -89,11 +130,14 @@ fn int run_delta(String source_name, DeltaProgram* program, usz threads)
 	DeltaRuntime runtime;
 	runtime.init((int)threads);
 	defer runtime.free();
- if (!runtime.register_standard_host_handlers(program))
- {
-  io::eprintfn("%s:1:1: failed to register standard external effect helpers", source_name);
-  return 1;
- }
+	if (!runtime.register_standard_host_handlers(program))
+	{
+		print_diagnostic(
+			source_name,
+			"failed to register standard external effect helpers"
+		);
+		return 1;
+	}
 	TypedDeltaExecutionResult execution = runtime.run(program);
 	defer execution.deinit();
 	if (execution.status == TYPED_DELTA_SUSPENDED)
@@ -128,7 +172,7 @@ fn int run_jit(String source_name, DeltaProgram* program)
 	defer (void)runtime.free();
 	if (!runtime.ready())
 	{
-		io::eprintfn("%s:1:1: MIR runtime initialization failed", source_name);
+		print_diagnostic(source_name, "MIR runtime initialization failed");
 		return 1;
 	}
 	MitosJitResult native = mitos_jit::jit_delta_program(
@@ -198,13 +242,13 @@ fn int process_file(CliMode mode, String path, usz threads = 0, String output = 
 	if (catch err = size_result)
 	{
 		(void)err;
-		io::eprintfn("%s:1:1: unable to inspect source file", path);
+		print_diagnostic(path, "unable to inspect source file");
 		return 1;
 	}
 	long size = size_result;
 	if (size < 0 || (ulong)size > (ulong)MAX_SOURCE_BYTES)
 	{
-		io::eprintfn("%s:1:1: source exceeds the 16 MiB limit", path);
+		print_diagnostic(path, "source exceeds the 16 MiB limit");
 		return 1;
 	}
 	char[] buffer = alloc::new_array(mem, char, (usz)size + 1);
@@ -213,13 +257,13 @@ fn int process_file(CliMode mode, String path, usz threads = 0, String output = 
 	if (catch err = load_result)
 	{
 		(void)err;
-		io::eprintfn("%s:1:1: unable to read source file", path);
+		print_diagnostic(path, "unable to read source file");
 		return 1;
 	}
 	char[] source = load_result;
 	if (source.len > MAX_SOURCE_BYTES)
 	{
-		io::eprintfn("%s:1:1: source exceeds the 16 MiB limit", path);
+		print_diagnostic(path, "source exceeds the 16 MiB limit");
 		return 1;
 	}
 	return process_source(mode, path, (String)source, threads, output);

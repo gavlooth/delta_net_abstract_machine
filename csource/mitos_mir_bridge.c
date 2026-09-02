@@ -948,6 +948,22 @@ static Value *new_integer(Runtime *runtime, int64_t integer) {
     return value;
 }
 
+static int constructor_runtime_type_matches(
+    const MitosMirProgram *program,
+    const MitosMirConstructor *descriptor,
+    uint32_t runtime_type
+) {
+    const MitosMirType *type;
+    if (program == NULL || descriptor == NULL || runtime_type == 0
+        || runtime_type > program->type_count
+        || descriptor->runtime_type == 0
+        || descriptor->runtime_type > program->type_count) return 0;
+    if (runtime_type == descriptor->runtime_type) return 1;
+    type = &program->types[runtime_type - 1u];
+    return type->id == runtime_type && type->kind == 2u
+        && type->constructor == descriptor->runtime_type;
+}
+
 static Value *new_constructor(Runtime *runtime, uint32_t tag, uint32_t arity,
                               uint32_t runtime_type) {
     uint32_t descriptor_index = 0;
@@ -964,8 +980,11 @@ static Value *new_constructor(Runtime *runtime, uint32_t tag, uint32_t arity,
         return NULL;
     }
     if (runtime_type == 0) runtime_type = descriptor->runtime_type;
-    if (runtime_type == 0 || runtime_type > runtime->program->type_count) {
-        fail(runtime, "constructor tag %u has an invalid concrete runtime TypeId", tag);
+    if (!constructor_runtime_type_matches(
+            runtime->program, descriptor, runtime_type)) {
+        fail(runtime,
+             "constructor tag %u received a runtime TypeId outside its descriptor",
+             tag);
         return NULL;
     }
     if (arity == 0 && runtime_type == descriptor->runtime_type
@@ -2013,6 +2032,80 @@ typedef struct NativeClosure {
     Value **captures;
 } NativeClosure;
 
+typedef struct ParallelCloneEntry {
+    const Value *source;
+    Value *copy;
+} ParallelCloneEntry;
+
+typedef struct ParallelCloneContext {
+    Runtime *snapshot;
+    Runtime *source;
+    ParallelCloneEntry *entries;
+    size_t entry_count;
+    size_t entry_capacity;
+} ParallelCloneContext;
+
+static Value *parallel_clone_lookup(
+    const ParallelCloneContext *context,
+    const Value *source
+) {
+    size_t slot, start;
+    if (context->entry_capacity == 0) return NULL;
+    slot = metadata_hash(
+        (uint64_t) (uintptr_t) source, context->entry_capacity - 1u);
+    start = slot;
+    do {
+        const ParallelCloneEntry *entry = &context->entries[slot];
+        if (entry->source == NULL) return NULL;
+        if (entry->source == source) return entry->copy;
+        slot = (slot + 1u) & (context->entry_capacity - 1u);
+    } while (slot != start);
+    return NULL;
+}
+
+static int parallel_clone_insert(
+    ParallelCloneContext *context,
+    const Value *source,
+    Value *copy
+) {
+    size_t capacity = context->entry_capacity;
+    size_t slot;
+    if (capacity == 0 || context->entry_count >= capacity / 2u) {
+        ParallelCloneEntry *entries;
+        size_t index;
+        if (capacity > SIZE_MAX / 2u) {
+            fail(context->snapshot, "parallel MIR alias map is too large");
+            return 0;
+        }
+        capacity = capacity == 0 ? 8u : capacity * 2u;
+        if (capacity > SIZE_MAX / sizeof(*entries)) {
+            fail(context->snapshot, "parallel MIR alias map is too large");
+            return 0;
+        }
+        entries = (ParallelCloneEntry *) runtime_allocate(
+            context->snapshot, capacity * sizeof(*entries));
+        if (entries == NULL) return 0;
+        for (index = 0; index < context->entry_capacity; ++index) {
+            ParallelCloneEntry entry = context->entries[index];
+            if (entry.source == NULL) continue;
+            slot = metadata_hash(
+                (uint64_t) (uintptr_t) entry.source, capacity - 1u);
+            while (entries[slot].source != NULL)
+                slot = (slot + 1u) & (capacity - 1u);
+            entries[slot] = entry;
+        }
+        context->entries = entries;
+        context->entry_capacity = capacity;
+    }
+    slot = metadata_hash(
+        (uint64_t) (uintptr_t) source, context->entry_capacity - 1u);
+    while (context->entries[slot].source != NULL)
+        slot = (slot + 1u) & (context->entry_capacity - 1u);
+    context->entries[slot] = (ParallelCloneEntry) {source, copy};
+    context->entry_count++;
+    return 1;
+}
+
 static void initialize_parallel_snapshot(Runtime *snapshot, const Runtime *source) {
     snapshot->program = source->program;
     snapshot->host_runtime = source->host_runtime;
@@ -2032,20 +2125,24 @@ static void initialize_parallel_snapshot(Runtime *snapshot, const Runtime *sourc
 }
 
 static Value *clone_parallel_value(
-    Runtime *snapshot,
-    Runtime *source,
+    ParallelCloneContext *context,
     Value *value,
     uint32_t depth
 ) {
+    Runtime *snapshot = context->snapshot;
+    Runtime *source = context->source;
     Value *copy;
     uint32_t index;
-    if (depth >= MITOS_MAX_VALUE_DEPTH || !valid_value(source, value)) {
+    if (!valid_value(source, value)) return NULL;
+    copy = parallel_clone_lookup(context, value);
+    if (copy != NULL) return copy;
+    if (depth >= MITOS_MAX_VALUE_DEPTH) {
         if (snapshot->diagnostic[0] == '\0')
             fail(snapshot, "parallel MIR argument exceeds the snapshot depth limit");
         return NULL;
     }
     copy = (Value *) runtime_allocate(snapshot, sizeof(*copy));
-    if (copy == NULL) return NULL;
+    if (copy == NULL || !parallel_clone_insert(context, value, copy)) return NULL;
     *copy = *value;
     copy->fields = NULL;
     copy->string = NULL;
@@ -2070,7 +2167,7 @@ static Value *clone_parallel_value(
             if (copy->fields == NULL) return NULL;
             for (index = 0; index < value->arity; ++index) {
                 copy->fields[index] = clone_parallel_value(
-                    snapshot, source, value->fields[index], depth + 1u);
+                    context, value->fields[index], depth + 1u);
                 if (copy->fields[index] == NULL) return NULL;
             }
         }
@@ -2083,7 +2180,7 @@ static Value *clone_parallel_value(
             Alternative *copy_alternative = &copy->alternatives[index];
             *copy_alternative = *source_alternative;
             copy_alternative->value = clone_parallel_value(
-                snapshot, source, source_alternative->value, depth + 1u);
+                context, source_alternative->value, depth + 1u);
             copy_alternative->assignments = NULL;
             if (copy_alternative->value == NULL) return NULL;
             if (source_alternative->assignment_count != 0) {
@@ -2130,8 +2227,7 @@ static Value *clone_parallel_value(
             if (copy_closure->captures == NULL) return NULL;
             for (index = 0; index < source_closure->capture_count; ++index) {
                 copy_closure->captures[index] = clone_parallel_value(
-                    snapshot, source, source_closure->captures[index],
-                    depth + 1u);
+                    context, source_closure->captures[index], depth + 1u);
                 if (copy_closure->captures[index] == NULL) return NULL;
             }
         }
@@ -2149,6 +2245,10 @@ static int snapshot_parallel_arguments(
     uint32_t count,
     Value ***owned_arguments
 ) {
+    ParallelCloneContext context = {
+        .snapshot = snapshot,
+        .source = source
+    };
     uint32_t index;
     *owned_arguments = NULL;
     initialize_parallel_snapshot(snapshot, source);
@@ -2158,7 +2258,7 @@ static int snapshot_parallel_arguments(
     if (*owned_arguments == NULL) return 0;
     for (index = 0; index < count; ++index) {
         (*owned_arguments)[index] = clone_parallel_value(
-            snapshot, source, arguments[index], 0);
+            &context, arguments[index], 0);
         if ((*owned_arguments)[index] == NULL) return 0;
     }
     return 1;
@@ -2195,6 +2295,7 @@ static int parallel_job_run(ParallelJob *job) {
     Runtime *previous_runtime = active_runtime;
     Value *raw_result;
     int result;
+    ParallelCloneContext clone_context;
     active_runtime = &job->child;
     raw_result = as_value(job->wrapper(
         (int64_t *) job->arguments, job->argument_count));
@@ -2213,8 +2314,12 @@ static int parallel_job_run(ParallelJob *job) {
         if (job->result_snapshot.program == NULL)
             initialize_parallel_snapshot(
                 &job->result_snapshot, &job->child);
+        clone_context = (ParallelCloneContext) {
+            .snapshot = &job->result_snapshot,
+            .source = &job->child
+        };
         job->result = clone_parallel_value(
-            &job->result_snapshot, &job->child, raw_result, 0);
+            &clone_context, raw_result, 0);
         if (job->result == NULL) {
             if (job->result_snapshot.budget_exhausted)
                 job->child.budget_exhausted = 1;
@@ -2431,11 +2536,9 @@ static void parallel_job_reset_child(ParallelJob *job) {
     size_t effect_instance_index_capacity =
         child->effect_instance_index_capacity;
     Value **nullary_values = child->nullary_values;
-    if (job->result == NULL
-        && job->result_snapshot.program != NULL) {
-        runtime_free(&job->result_snapshot);
-        memset(&job->result_snapshot, 0, sizeof(job->result_snapshot));
-    }
+    job->result = NULL;
+    runtime_free(&job->result_snapshot);
+    memset(&job->result_snapshot, 0, sizeof(job->result_snapshot));
     runtime_free(child);
     memset(child, 0, sizeof(*child));
     child->program = program;
@@ -2455,7 +2558,6 @@ static void parallel_job_reset_child(ParallelJob *job) {
     child->is_parallel_worker = 1;
     child->nullary_values = nullary_values;
     child->call_depth = job->entry_call_depth;
-    job->result = NULL;
     job->thread_result = 0;
     job->child_released = 0;
 }
@@ -2615,6 +2717,7 @@ static int64_t rt_parallel_call(int64_t function_index, int64_t raw_arguments,
     job->child.is_parallel_worker = 1;
     job->child.nullary_values = active_runtime->nullary_values;
     job->child.call_depth = active_runtime->call_depth;
+    job->entry_call_depth = active_runtime->call_depth;
     job->wrapper = (NativeWrapper) active_runtime->function_wrappers[function_index];
     job->argument_count = (uint32_t) count;
     if (!snapshot_parallel_arguments(
@@ -3889,6 +3992,12 @@ static int validate_program(const MitosMirProgram *program, char *diagnostic, si
                              "function %u constructor index is invalid", function_index);
                     VALIDATE(instruction->b != 0 && instruction->b <= program->type_count,
                              "function %u constructor runtime TypeId is invalid", function_index);
+                    VALIDATE(constructor_runtime_type_matches(
+                                 program,
+                                 &program->constructors[instruction->a],
+                                 instruction->b),
+                             "function %u constructor runtime TypeId does not match its descriptor",
+                             function_index);
                     VALIDATE(range_within(instruction->operand_start, instruction->operand_count,
                                           program->operand_count),
                              "function %u constructor operand range is invalid", function_index);
@@ -4113,6 +4222,12 @@ static int validate_program(const MitosMirProgram *program, char *diagnostic, si
                                  && instruction->b != 0
                                  && instruction->b <= program->type_count,
                              "function %u lifted constructor metadata is invalid",
+                             function_index);
+                    VALIDATE(constructor_runtime_type_matches(
+                                 program,
+                                 &program->constructors[instruction->a],
+                                 instruction->b),
+                             "function %u lifted constructor runtime TypeId does not match its descriptor",
                              function_index);
                     VALIDATE(range_within(instruction->operand_start, instruction->operand_count,
                                           program->operand_count)

@@ -667,7 +667,6 @@ struct DeltaRuntimeState @private
  TypedDeltaHostRegistry host_handlers;
  int max_workers;
  bool shutting_down;
- ulong minimum_effect_epoch;
  ulong identity;
  usz retained_suspension_bytes;
  StableSlotArena{DeltaSuspensionRecord} suspensions;
@@ -827,7 +826,6 @@ fn DeltaRuntime* DeltaRuntime.init(&self, int max_workers = 0)
  DeltaRuntimeState* state = &control.state;
  *state = {
   .max_workers = max_workers,
-  .minimum_effect_epoch = 1,
   .identity = identity,
  };
  typed_delta_registry_init(&state.host_handlers, mem);
@@ -1104,8 +1102,7 @@ fn TypedDeltaExecutionResult DeltaRuntime.run(&self, mitos::DeltaProgram* progra
  }
  typed_delta_registry_leave(registry);
  delta_runtime_control_leave(control);
- if (!delta_effect_metadata_current(program)
-  || program.effects.epoch < state.minimum_effect_epoch)
+ if (!delta_effect_metadata_current(program))
  {
   typed_delta_registry_finish_execution(registry);
   return typed_delta_failure(
@@ -1183,8 +1180,7 @@ fn TypedDeltaExecutionResult DeltaRuntime.resume(
   delta_runtime_control_leave(control);
   return typed_delta_failure("resumption token has already been consumed", mem);
  }
- if (token.effect_epoch < state.minimum_effect_epoch
-  || record.suspension.effect_epoch != token.effect_epoch)
+ if (record.suspension.effect_epoch != token.effect_epoch)
  {
   registry.mutex.unlock();
   typed_delta_registry_leave(registry);
@@ -1288,11 +1284,6 @@ fn DeltaTokenActionResult DeltaRuntime.cancel(
   return delta_token_action(
    false, "resumption token is invalid or belongs to another runtime", allocator
   );
- }
- if (token.effect_epoch < state.minimum_effect_epoch)
- {
-  registry.mutex.unlock();
-  return delta_token_action(false, "resumption token effect epoch is stale", allocator);
  }
  if (record.state != RESUMPTION_ACTIVE || !record.suspension)
  {

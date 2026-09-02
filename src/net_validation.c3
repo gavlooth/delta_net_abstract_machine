@@ -142,24 +142,77 @@ fn bool nodes_are_valid(Net* net)
 
  return true;
 }
+struct ObservableOriginArity @private
+{
+ ulong origin;
+ usz arity;
+}
+
+// Radix sorting makes this check deterministic linear work even when every
+// observable replicator has the same origin. Hash-table probing would make
+// validation input-sensitive and could still degrade to an all-pairs scan.
 fn bool observable_origins_are_valid(Net* net)
 {
- for (SlotId first_id = 0; first_id < net.nodes.next_id; first_id++)
+ usz count = 0;
+ for (SlotId id = 0; id < net.nodes.next_id; id++)
  {
-  if (!net.nodes.contains_id(first_id)) continue;
-  Node* first_node = net.nodes.get_ref(net.nodes.generation_ref(first_id));
-  if (first_node.type != REPLICATOR) continue;
-  Replicator* first = &first_node.agent.replicator;
-  if (!first.observable) continue;
-  for (SlotId second_id = first_id + 1; second_id < net.nodes.next_id; second_id++)
+  if (!net.nodes.contains_id(id)) continue;
+  Node* node = net.nodes.get_ref(net.nodes.generation_ref(id));
+  if (node.type == REPLICATOR && node.agent.replicator.observable) count++;
+ }
+ if (count < 2) return true;
+ if (count > (usz)sz::max / (usz)ObservableOriginArity::size) return false;
+
+ ObservableOriginArity[] first =
+  alloc::new_array(mem, ObservableOriginArity, (sz)count);
+ ObservableOriginArity[] second =
+  alloc::new_array(mem, ObservableOriginArity, (sz)count);
+ defer alloc::free(mem, first);
+ defer alloc::free(mem, second);
+ usz cursor = 0;
+ for (SlotId id = 0; id < net.nodes.next_id; id++)
+ {
+  if (!net.nodes.contains_id(id)) continue;
+  Node* node = net.nodes.get_ref(net.nodes.generation_ref(id));
+  if (node.type != REPLICATOR || !node.agent.replicator.observable) continue;
+  first[cursor++] = {
+   .origin = node.agent.replicator.origin,
+   .arity = node.agent.replicator.auxiliaries.len,
+  };
+ }
+
+ ObservableOriginArity[] source = first;
+ ObservableOriginArity[] destination = second;
+ for (usz pass = 0; pass < 8; pass++)
+ {
+  usz[256] buckets;
+  foreach (&bucket : buckets) *bucket = 0;
+  usz shift = pass * 8;
+  foreach (entry : source)
   {
-   if (!net.nodes.contains_id(second_id)) continue;
-   Node* second_node = net.nodes.get_ref(net.nodes.generation_ref(second_id));
-   if (second_node.type != REPLICATOR) continue;
-   Replicator* second = &second_node.agent.replicator;
-   if (second.observable && second.origin == first.origin
-    && second.auxiliaries.len != first.auxiliaries.len) return false;
+   buckets[(usz)((entry.origin >> shift) & 0xff)]++;
   }
+  usz offset = 0;
+  foreach (&bucket : buckets)
+  {
+   usz frequency = *bucket;
+   *bucket = offset;
+   offset += frequency;
+  }
+  foreach (entry : source)
+  {
+   usz bucket = (usz)((entry.origin >> shift) & 0xff);
+   destination[buckets[bucket]++] = entry;
+  }
+  ObservableOriginArity[] swap = source;
+  source = destination;
+  destination = swap;
+ }
+
+ for (usz index = 1; index < count; index++)
+ {
+  if (source[index - 1].origin == source[index].origin
+   && source[index - 1].arity != source[index].arity) return false;
  }
  return true;
 }
@@ -376,14 +429,22 @@ fn bool effect_continuations_are_valid(Net* net)
   else if (continuation.first_replicator != INVALID_NET_REF
    || continuation.second_replicator != INVALID_NET_REF) return false;
  }
+ if (net.effects.committed > net.effects.commits.len) return false;
  for (usz index = 0; index < net.effects.commits.len; index++)
  {
   OrderedEffectCommit* commit = &net.effects.commits[index];
-  if (!net.effects.continuations.contains_ref(commit.continuation)) return false;
-  EffectContinuation* continuation = net.effects.continuations.get_ref(commit.continuation);
-  if (!continuation.ordered
-   || continuation.source_order != commit.source_root_order
-   || continuation.occurrence_order != commit.operation_order) return false;
+  // Retired ordered continuations intentionally remain as tombstones until
+  // amortized compaction. Their immutable ordering metadata and prefix bit
+  // remain valid even though their generation reference is no longer live.
+  if (net.effects.continuations.contains_ref(commit.continuation))
+  {
+   EffectContinuation* continuation =
+    net.effects.continuations.get_ref(commit.continuation);
+   if (!continuation.ordered
+    || continuation.source_order != commit.source_root_order
+    || continuation.occurrence_order != commit.operation_order) return false;
+  }
+  if (commit.committed != (index < net.effects.committed)) return false;
   if (index)
   {
    OrderedEffectCommit* previous = &net.effects.commits[index - 1];

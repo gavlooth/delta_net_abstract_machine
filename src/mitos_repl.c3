@@ -752,7 +752,9 @@ fn void repl_print_diagnostic(String message, mitos::MitosSpan span = { })
 {
 	usz row = span.start.row > 0 ? (usz)span.start.row : 1;
 	usz column = span.start.column > 0 ? (usz)span.start.column : 1;
-	io::eprintfn("<repl>:%d:%d: %s", (long)row, (long)column, message);
+	io::eprintf("<repl>:%d:%d: ", (long)row, (long)column);
+	terminal_eprint_field(message);
+	io::eprintn("");
 }
 
 fn void repl_print_diagnostics(mitos::MitosDiagnostic[] diagnostics)
@@ -1055,7 +1057,13 @@ fn int run_mitos_repl()
 			repl_clear_declarations(&declarations, mem);
 			bindings.clear(); epochs.clear(); continue;
 		}
-		if (trimmed.starts_with(":")) { io::eprintfn("<repl>:1:1: unknown command '%s'", trimmed); continue; }
+		if (trimmed.starts_with(":"))
+		{
+			io::eprint("<repl>:1:1: unknown command '");
+			terminal_eprint_field(trimmed);
+			io::eprintn("'");
+			continue;
+		}
 		String binding_name;
 		bool binding = repl_binding(source, &binding_name);
 		bool declaration = !binding && repl_is_declaration(source);
