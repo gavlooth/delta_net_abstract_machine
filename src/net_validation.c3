@@ -118,8 +118,16 @@ fn bool node_is_valid(Net* net, NetRef node_ref, Node* node)
   if (node.type == HANDLER_AGENT)
   {
    if (!practical.handler_id || !practical.effect_epoch) return false;
-   if (practical.continuation != INVALID_NET_REF
-    && !net.effects.continuations.contains_ref(practical.continuation)) return false;
+   if (practical.continuation != INVALID_NET_REF)
+   {
+    if (!net.effects.continuations.contains_ref(practical.continuation))
+    {
+     return false;
+    }
+    EffectContinuation* continuation =
+     net.effects.continuations.get_ref(practical.continuation);
+    if (continuation.handler != node_ref) return false;
+   }
   }
   if (node.type == RESUME_AGENT
    && (!practical.handler_id || !practical.effect_epoch
@@ -401,6 +409,12 @@ fn bool practical_storage_owners_are_unique(Net* net) @private
 
 fn bool effect_continuations_are_valid(Net* net)
 {
+ if (net.effects.continuations.next_id > (SlotId)sz::max) return false;
+ char[] live_commit_counts = alloc::new_array(
+  mem, char, (sz)net.effects.continuations.next_id
+ );
+ defer alloc::free(mem, live_commit_counts);
+ foreach (&count : live_commit_counts) *count = 0;
  for (SlotId id = 0; id < net.effects.continuations.next_id; id++)
  {
   if (!net.effects.continuations.contains_id(id)) continue;
@@ -409,6 +423,7 @@ fn bool effect_continuations_are_valid(Net* net)
   if (!net.ports.contains_ref(continuation.root)
    || !net.ports.contains_ref(continuation.hole)
    || !net.nodes.contains_ref(continuation.handler)
+   || net.nodes.get_ref(continuation.handler).type != HANDLER_AGENT
    || !continuation.effect_id
    || !continuation.operation_id
    || !continuation.effect_epoch) return false;
@@ -438,6 +453,8 @@ fn bool effect_continuations_are_valid(Net* net)
   // remain valid even though their generation reference is no longer live.
   if (net.effects.continuations.contains_ref(commit.continuation))
   {
+   if (live_commit_counts[(usz)commit.continuation.id]) return false;
+   live_commit_counts[(usz)commit.continuation.id] = 1;
    EffectContinuation* continuation =
     net.effects.continuations.get_ref(commit.continuation);
    if (!continuation.ordered
@@ -451,6 +468,17 @@ fn bool effect_continuations_are_valid(Net* net)
    if (previous.source_root_order > commit.source_root_order
     || (previous.source_root_order == commit.source_root_order
      && previous.operation_order > commit.operation_order)) return false;
+  }
+ }
+ for (SlotId id = 0; id < net.effects.continuations.next_id; id++)
+ {
+  if (!net.effects.continuations.contains_id(id)) continue;
+  EffectContinuation* continuation = net.effects.continuations.get_ref(
+   net.effects.continuations.generation_ref(id)
+  );
+  if (live_commit_counts[(usz)id] != (continuation.ordered ? 1 : 0))
+  {
+   return false;
   }
  }
  return true;

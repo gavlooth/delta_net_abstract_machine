@@ -27,8 +27,8 @@ fn void terminal_eprint_field(String field)
 	usz segment_start = 0;
 	foreach (index, character : field)
 	{
-		bool control = (usz)character < 0x20 || (usz)character == 0x7f;
-		usz encoded_bytes = control ? 4 : 1;
+		bool escape = (usz)character < 0x20 || (usz)character >= 0x7f;
+		usz encoded_bytes = escape ? 4 : 1;
 		if (encoded_bytes > TERMINAL_DIAGNOSTIC_FIELD_MAX_BYTES - escaped_bytes)
 		{
 			if (segment_start < (usz)index)
@@ -39,7 +39,7 @@ fn void terminal_eprint_field(String field)
 			return;
 		}
 		escaped_bytes += encoded_bytes;
-		if (!control) continue;
+		if (!escape) continue;
 		if (segment_start < (usz)index)
 		{
 			io::eprint(field[segment_start:(usz)index - segment_start]);

@@ -150,6 +150,184 @@ fn bool delta_charge_materialization_bytes(
 	return true;
 }
 
+fn bool delta_charge_materialization_items(
+	usz* bytes,
+	usz count,
+	usz item_size,
+	DeltaDiagnostic* diagnostic,
+	Allocator allocator
+) @private
+{
+	if (count && item_size > DELTA_MAX_MATERIALIZATION_BYTES / count)
+	{
+		diagnostic.init(
+			allocator,
+			"DeltaProgram graph exceeds the total materialization byte limit"
+		);
+		return false;
+	}
+	return delta_charge_materialization_bytes(
+		bytes, count * item_size, diagnostic, allocator
+	);
+}
+
+fn bool delta_materialization_arena_growth(
+	SlotId next_id,
+	SlotId free_head,
+	sz pages_size,
+	sz pages_capacity,
+	usz page_capacity,
+	usz page_size,
+	usz count,
+	usz* growth
+) @private
+{
+	*growth = 0;
+	if (!count) return true;
+	// Materialization only appends to fresh Nets. Refuse a reused arena rather
+	// than guess how many free-list pushes avoid page allocation.
+	if (free_head != stable_slot_arena::INVALID_SLOT_ID
+		|| next_id > (SlotId)usz::max
+		|| pages_size < 0
+		|| pages_capacity < pages_size
+		|| !page_capacity
+		|| !page_size
+		|| count > usz::max - (usz)next_id) return false;
+	usz final_next_id = (usz)next_id + count;
+	usz required_pages = final_next_id / page_capacity;
+	if (final_next_id % page_capacity) required_pages++;
+	usz existing_pages = (usz)pages_size;
+	if (required_pages < existing_pages) return false;
+	usz new_pages = required_pages - existing_pages;
+	if (new_pages > DELTA_MAX_MATERIALIZATION_BYTES / page_size) return false;
+	usz page_bytes = new_pages * page_size;
+
+	usz old_capacity = (usz)pages_capacity;
+	usz new_capacity = old_capacity;
+	while (new_capacity < required_pages)
+	{
+		if (!new_capacity)
+		{
+			new_capacity = 16;
+		}
+		else
+		{
+			if (new_capacity > (usz)sz::max / 2) return false;
+			new_capacity *= 2;
+		}
+	}
+	usz added_pointers = new_capacity - old_capacity;
+	if (added_pointers > DELTA_MAX_MATERIALIZATION_BYTES / (usz)void*::size)
+	{
+		return false;
+	}
+	usz pointer_bytes = added_pointers * (usz)void*::size;
+	if (pointer_bytes > DELTA_MAX_MATERIALIZATION_BYTES - page_bytes) return false;
+	*growth = page_bytes + pointer_bytes;
+	return true;
+}
+
+fn bool delta_charge_materialization_arena(
+	usz* bytes,
+	SlotId next_id,
+	SlotId free_head,
+	sz pages_size,
+	sz pages_capacity,
+	usz page_capacity,
+	usz page_size,
+	usz count,
+	DeltaDiagnostic* diagnostic,
+	Allocator allocator
+) @private
+{
+	usz growth;
+	if (!delta_materialization_arena_growth(
+		next_id,
+		free_head,
+		pages_size,
+		pages_capacity,
+		page_capacity,
+		page_size,
+		count,
+		&growth
+	))
+	{
+		diagnostic.init(
+			allocator,
+			"DeltaProgram graph exceeds the total materialization byte limit"
+		);
+		return false;
+	}
+	return delta_charge_materialization_bytes(
+		bytes, growth, diagnostic, allocator
+	);
+}
+
+// Match the persistent allocations made by Net constructors: StableSlotArena
+// page growth (including page-pointer List capacity) and owned auxiliary refs.
+fn bool delta_charge_materialized_agents(
+	Net* net,
+	usz* bytes,
+	usz arity,
+	usz agent_count,
+	usz wire_count,
+	DeltaDiagnostic* diagnostic,
+	Allocator allocator
+) @private
+{
+	if (arity == usz::max
+		|| agent_count > usz::max / (arity + 1)
+		|| (arity && agent_count > usz::max / arity))
+	{
+		diagnostic.init(
+			allocator,
+			"DeltaProgram graph exceeds the total materialization byte limit"
+		);
+		return false;
+	}
+	usz port_count = agent_count * (arity + 1);
+	usz auxiliary_count = agent_count * arity;
+	return delta_charge_materialization_arena(
+			bytes,
+			net.nodes.next_id,
+			net.nodes.free_head,
+			net.nodes.pages.size,
+			net.nodes.pages.capacity,
+			stable_slot_arena::STABLE_SLOT_PAGE_CAPACITY{Node},
+			(usz)stable_slot_arena::StableSlotPage{Node}::size,
+			agent_count,
+			diagnostic,
+			allocator
+		)
+		&& delta_charge_materialization_arena(
+			bytes,
+			net.ports.next_id,
+			net.ports.free_head,
+			net.ports.pages.size,
+			net.ports.pages.capacity,
+			stable_slot_arena::STABLE_SLOT_PAGE_CAPACITY{Port},
+			(usz)stable_slot_arena::StableSlotPage{Port}::size,
+			port_count,
+			diagnostic,
+			allocator
+		)
+		&& delta_charge_materialization_items(
+			bytes, auxiliary_count, (usz)NetRef::size, diagnostic, allocator
+		)
+		&& delta_charge_materialization_arena(
+			bytes,
+			net.wires.next_id,
+			net.wires.free_head,
+			net.wires.pages.size,
+			net.wires.pages.capacity,
+			stable_slot_arena::STABLE_SLOT_PAGE_CAPACITY{Wire},
+			(usz)stable_slot_arena::StableSlotPage{Wire}::size,
+			wire_count,
+			diagnostic,
+			allocator
+		);
+}
+
 fn bool delta_charge_continuation(
 	usz* work,
 	bool multi,
@@ -382,6 +560,15 @@ fn bool delta_materialize_node(
 				allocator
 			)) return false;
 		}
+		if (!delta_charge_materialized_agents(
+			net,
+			materialization_bytes,
+			source.inputs.len,
+			1,
+			1,
+			diagnostic,
+			allocator
+		)) return false;
 		long[] deltas = mem::alloc_array(long, (sz)source.inputs.len);
 		foreach (&delta : deltas) *delta = 0;
 		NetRef replicator_ref = new_replicator(
@@ -421,10 +608,27 @@ fn bool delta_materialize_node(
  usz source_order = source.kind == DELTA_PARALLEL_ROOT
   ? source.descriptor : root_source_order;
 	usz metadata_ports = source.kind == DELTA_ABORT ? 1 : 0;
+	if (source.inputs.len > usz::max - source.branches.len
+		|| source.inputs.len + source.branches.len > usz::max - metadata_ports)
+	{
+		diagnostic.init(
+			allocator,
+			"DeltaProgram graph exceeds the total materialization byte limit"
+		);
+		return false;
+	}
+	usz arity = source.inputs.len + source.branches.len + metadata_ports;
+	if (!delta_charge_materialized_agents(
+		net, materialization_bytes, arity, 1, 1, diagnostic, allocator
+	)) return false;
+	if (source.kind == DELTA_STRING
+		&& !delta_charge_materialization_bytes(
+			materialization_bytes, source.string_value.len, diagnostic, allocator
+		)) return false;
 	NetRef practical_ref = new_practical_agent(
 		net,
 		type,
-		source.inputs.len + source.branches.len + metadata_ports,
+		arity,
 		(uint)node_id,
 		(uint)source.static_type,
 		source.integer,
@@ -435,15 +639,15 @@ fn bool delta_materialize_node(
 	NetRef practical_principal = practical.agent.practical.principal;
 	NetRef[] practical_auxiliaries = practical.agent.practical.auxiliaries;
 	(void)connect(net, destination, practical_principal);
- if (source.kind == DELTA_STRING)
- {
-  if (!delta_charge_materialization_bytes(
-   materialization_bytes, source.string_value.len, diagnostic, allocator
-  )) return false;
-  practical = net.nodes.get_ref(practical_ref);
-  practical.agent.practical.text = source.string_value.copy(mem);
-  practical.agent.practical.owns_text = true;
- }
+	if (source.kind == DELTA_STRING)
+	{
+		practical = net.nodes.get_ref(practical_ref);
+		practical.agent.practical.text = source.string_value.copy(mem);
+		practical.agent.practical.owns_text = true;
+		net_account_node_payload_allocate(
+			net, practical, source.string_value.len
+		);
+	}
 	if (source.kind == DELTA_EFFECT)
 	{
 		if (source.descriptor >= program.effects.operations.len)
@@ -530,6 +734,9 @@ fn bool delta_materialize_node(
 			diagnostic.init(allocator, "abort node has an invalid handler descriptor");
 			return false;
 		}
+		if (!delta_charge_materialized_agents(
+			net, materialization_bytes, 0, 1, 1, diagnostic, allocator
+		)) return false;
 		NetRef eraser_ref = new_eraser(net, PARENT);
 		Node* eraser = net.nodes.get_ref(eraser_ref);
 		(void)connect(net, practical_auxiliaries[source.inputs.len], eraser.agent.eraser.principal);
@@ -608,6 +815,28 @@ fn bool delta_materialize_node(
 					diagnostic,
 					allocator
 				)) return false;
+				if (!delta_charge_materialization_arena(
+					materialization_bytes,
+					net.effects.continuations.next_id,
+					net.effects.continuations.free_head,
+					net.effects.continuations.pages.size,
+					net.effects.continuations.pages.capacity,
+					stable_slot_arena::STABLE_SLOT_PAGE_CAPACITY{EffectContinuation},
+					(usz)stable_slot_arena::StableSlotPage{EffectContinuation}::size,
+					1,
+					diagnostic,
+					allocator
+				)) return false;
+				if (clause.multi && resume_count > 1
+					&& !delta_charge_materialized_agents(
+						net,
+						materialization_bytes,
+						resume_count,
+						2,
+						resume_count + 1,
+						diagnostic,
+						allocator
+					)) return false;
 				NetRef continuation = new_effect_continuation(
 					net,
 					practical_principal,
@@ -647,59 +876,64 @@ fn bool delta_materialize_node(
 	return true;
 }
 fn bool delta_effect_commit_precedes_or_ties(
- OrderedEffectCommit* left,
- OrderedEffectCommit* right
+	OrderedEffectCommit* left,
+	OrderedEffectCommit* right
 ) @private
 {
- return left.source_root_order < right.source_root_order
-  || (left.source_root_order == right.source_root_order
-   && left.operation_order <= right.operation_order);
+	return left.source_root_order < right.source_root_order
+		|| (left.source_root_order == right.source_root_order
+			&& left.operation_order <= right.operation_order);
 }
 
 // Bottom-up merge sort keeps equal-key continuations in stable slot order and
 // bounds queue construction to O(n log n) comparisons.
 fn void delta_stable_sort_effect_commits(OrderedEffectCommit[] commits) @private
 {
- usz count = commits.len;
- if (count < 2) return;
- OrderedEffectCommit[] scratch =
-  mem::alloc_array(OrderedEffectCommit, (sz)count);
- defer mem::free(scratch);
- usz width = 1;
- while (width < count)
- {
-  usz start = 0;
-  while (start < count)
-  {
-   usz left = start;
-   usz middle = start + (width < count - start ? width : count - start);
-   usz right = middle;
-   usz end = middle + (width < count - middle ? width : count - middle);
-   usz output = start;
-   while (left < middle && right < end)
-   {
-    if (delta_effect_commit_precedes_or_ties(
-     &commits[left], &commits[right]
-    ))
-    {
-     scratch[output++] = commits[left++];
-    }
-    else
-    {
-     scratch[output++] = commits[right++];
-    }
-   }
-   while (left < middle) scratch[output++] = commits[left++];
-   while (right < end) scratch[output++] = commits[right++];
-   start = end;
-  }
-  foreach (index, &commit : commits) *commit = scratch[(usz)index];
-  if (width > count / 2) break;
-  width *= 2;
- }
+	usz count = commits.len;
+	if (count < 2) return;
+	OrderedEffectCommit[] scratch =
+		mem::alloc_array(OrderedEffectCommit, (sz)count);
+	defer mem::free(scratch);
+	usz width = 1;
+	while (width < count)
+	{
+		usz start = 0;
+		while (start < count)
+		{
+			usz left = start;
+			usz middle = start + (width < count - start ? width : count - start);
+			usz right = middle;
+			usz end = middle + (width < count - middle ? width : count - middle);
+			usz output = start;
+			while (left < middle && right < end)
+			{
+				if (delta_effect_commit_precedes_or_ties(
+					&commits[left], &commits[right]
+				))
+				{
+					scratch[output++] = commits[left++];
+				}
+				else
+				{
+					scratch[output++] = commits[right++];
+				}
+			}
+			while (left < middle) scratch[output++] = commits[left++];
+			while (right < end) scratch[output++] = commits[right++];
+			start = end;
+		}
+		foreach (index, &commit : commits) *commit = scratch[(usz)index];
+		if (width > count / 2) break;
+		width *= 2;
+	}
 }
 
-fn void delta_build_effect_commit_queue(Net* net)
+fn bool delta_build_effect_commit_queue(
+	Net* net,
+	usz* materialization_bytes = null,
+	DeltaDiagnostic* diagnostic = null,
+	Allocator allocator = mem
+)
 {
 	usz count = 0;
 	for (SlotId id = 0; id < net.effects.continuations.next_id; id++)
@@ -710,10 +944,19 @@ fn void delta_build_effect_commit_queue(Net* net)
 		);
 		if (continuation.ordered) count++;
 	}
- mem::free(net.effects.commits);
- net.effects.commits = { };
- net.effects.committed = 0;
+	if (materialization_bytes && !delta_charge_materialization_items(
+		materialization_bytes,
+		count,
+		(usz)OrderedEffectCommit::size,
+		diagnostic,
+		allocator
+	)) return false;
+	mem::free(net.effects.commits);
+	net.effects.commits = { };
+	net.effects.committed = 0;
+	net.effects.commit_allocation_count = 0;
 	net.effects.commits = mem::alloc_array(OrderedEffectCommit, (sz)count);
+	net.effects.commit_allocation_count = count;
 	usz cursor = 0;
 	for (SlotId id = 0; id < net.effects.continuations.next_id; id++)
 	{
@@ -727,7 +970,8 @@ fn void delta_build_effect_commit_queue(Net* net)
 			.operation_order = continuation.occurrence_order,
 		};
 	}
- delta_stable_sort_effect_commits(net.effects.commits);
+	delta_stable_sort_effect_commits(net.effects.commits);
+	return true;
 }
 
 
@@ -740,7 +984,11 @@ fn DeltaTranslationResult translate_delta_program_with_budget(
 	Allocator allocator = mem
 )
 {
-	DeltaTranslationResult result = { .allocator = allocator, .root = INVALID_NET_REF, .owns_net = true };
+	DeltaTranslationResult result = {
+		.allocator = allocator,
+		.root = INVALID_NET_REF,
+		.owns_net = true
+	};
 	result.net.init();
 	if (!mitos::delta_program_is_compatible(program))
 	{
@@ -752,39 +1000,80 @@ fn DeltaTranslationResult translate_delta_program_with_budget(
 	}
 	result.net.effects.program_epoch = program.effects.epoch;
 	result.net.effects.execution_epoch = program.effects.epoch;
-	result.root = new_interface(&result.net, ROOT, "");
-	NetRef destination = result.net.interfaces.get_ref(result.root).port;
- usz root_source_order = 0;
- foreach (&boundary : program.image.interfaces)
- {
-  if (boundary.root == root) { root_source_order = boundary.source_order; break; }
- }
- usz occurrence_counter = 0;
- DeltaDiagnostic diagnostic;
- if (!delta_materialize_node(
-  program,
-  &result.net,
-  root,
-  destination,
-  root_source_order,
-  &occurrence_counter,
-  materialization_work,
-  materialization_bytes,
-  null,
-  0,
-  &diagnostic,
-  allocator
- ))
+	DeltaDiagnostic diagnostic;
+	if (!delta_charge_materialization_arena(
+		materialization_bytes,
+		result.net.ports.next_id,
+		result.net.ports.free_head,
+		result.net.ports.pages.size,
+		result.net.ports.pages.capacity,
+		stable_slot_arena::STABLE_SLOT_PAGE_CAPACITY{Port},
+		(usz)stable_slot_arena::StableSlotPage{Port}::size,
+		1,
+		&diagnostic,
+		allocator
+	) || !delta_charge_materialization_arena(
+		materialization_bytes,
+		result.net.interfaces.next_id,
+		result.net.interfaces.free_head,
+		result.net.interfaces.pages.size,
+		result.net.interfaces.pages.capacity,
+		stable_slot_arena::STABLE_SLOT_PAGE_CAPACITY{InterfacePort},
+		(usz)stable_slot_arena::StableSlotPage{InterfacePort}::size,
+		1,
+		&diagnostic,
+		allocator
+	))
 	{
 		result.diagnostics = alloc::new_array(allocator, DeltaDiagnostic, 1);
 		result.diagnostics[0] = diagnostic;
 		return result;
 	}
-	delta_build_effect_commit_queue(&result.net);
+	result.root = new_interface(&result.net, ROOT, "");
+	NetRef destination = result.net.interfaces.get_ref(result.root).port;
+	usz root_source_order = 0;
+	foreach (&boundary : program.image.interfaces)
+	{
+		if (boundary.root == root)
+		{
+			root_source_order = boundary.source_order;
+			break;
+		}
+	}
+	usz occurrence_counter = 0;
+	if (!delta_materialize_node(
+		program,
+		&result.net,
+		root,
+		destination,
+		root_source_order,
+		&occurrence_counter,
+		materialization_work,
+		materialization_bytes,
+		null,
+		0,
+		&diagnostic,
+		allocator
+	))
+	{
+		result.diagnostics = alloc::new_array(allocator, DeltaDiagnostic, 1);
+		result.diagnostics[0] = diagnostic;
+		return result;
+	}
+	if (!delta_build_effect_commit_queue(
+		&result.net, materialization_bytes, &diagnostic, allocator
+	))
+	{
+		result.diagnostics = alloc::new_array(allocator, DeltaDiagnostic, 1);
+		result.diagnostics[0] = diagnostic;
+		return result;
+	}
 	if (!validate_net(&result.net))
 	{
 		result.diagnostics = alloc::new_array(allocator, DeltaDiagnostic, 1);
-		result.diagnostics[0].init(allocator, "materialized DeltaProgram failed stable-slot validation");
+		result.diagnostics[0].init(
+			allocator, "materialized DeltaProgram failed stable-slot validation"
+		);
 	}
 	return result;
 }

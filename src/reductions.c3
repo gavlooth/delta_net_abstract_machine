@@ -218,12 +218,174 @@ fn bool replicator_footprint_add(
  return true;
 }
 
+fn bool replicator_level_add(
+ ulong level,
+ long delta,
+ ulong* result
+) @private
+{
+ int128 adjusted = (int128)level + (int128)delta;
+ if (adjusted < 0 || adjusted > (int128)ulong::max) return false;
+ *result = (ulong)adjusted;
+ return true;
+}
+
+
+fn bool replicator_arena_growth(
+ SlotId next_id,
+ usz free_slots,
+ sz pages_size,
+ sz pages_capacity,
+ usz page_capacity,
+ usz page_size,
+ usz pushes,
+ usz* growth
+) @private
+{
+ *growth = 0;
+ if (next_id > (SlotId)usz::max || pages_size < 0
+  || pages_capacity < pages_size || !page_capacity || !page_size) return false;
+ usz appended = pushes > free_slots ? pushes - free_slots : 0;
+ if (appended > usz::max - (usz)next_id) return false;
+ usz final_next_id = (usz)next_id + appended;
+ usz required_pages = final_next_id / page_capacity;
+ if (final_next_id % page_capacity) required_pages++;
+ if (required_pages < (usz)pages_size) return false;
+ usz new_pages = required_pages - (usz)pages_size;
+ usz page_bytes;
+ if (!replicator_footprint_multiply(new_pages, page_size, &page_bytes))
+ {
+  return false;
+ }
+ usz new_capacity = (usz)pages_capacity;
+ while (new_capacity < required_pages)
+ {
+  if (!new_capacity)
+  {
+   new_capacity = 16;
+  }
+  else
+  {
+   if (new_capacity > (usz)sz::max / 2) return false;
+   new_capacity *= 2;
+  }
+ }
+ usz pointer_bytes;
+ if (!replicator_footprint_multiply(
+  new_capacity - (usz)pages_capacity, (usz)void*::size, &pointer_bytes
+ )) return false;
+ return replicator_footprint_add(page_bytes, pointer_bytes, growth);
+}
+
+fn bool replicator_current_arena_bytes(
+ sz pages_size,
+ sz pages_capacity,
+ usz page_size,
+ usz* bytes
+) @private
+{
+ if (pages_size < 0 || pages_capacity < pages_size || !page_size) return false;
+ usz page_bytes;
+ usz pointer_bytes;
+ if (!replicator_footprint_multiply(
+  (usz)pages_size, page_size, &page_bytes
+ ) || !replicator_footprint_multiply(
+  (usz)pages_capacity, (usz)void*::size, &pointer_bytes
+ )) return false;
+ return replicator_footprint_add(page_bytes, pointer_bytes, bytes);
+}
+
+fn bool replicator_net_owned_bytes(Net* net, usz* bytes) @private
+{
+ *bytes = 0;
+ usz component;
+ if (!replicator_current_arena_bytes(
+   net.nodes.pages.size,
+   net.nodes.pages.capacity,
+   (usz)stable_slot_arena::StableSlotPage{Node}::size,
+   &component
+  )
+  || !replicator_footprint_add(*bytes, component, bytes)
+  || !replicator_current_arena_bytes(
+   net.ports.pages.size,
+   net.ports.pages.capacity,
+   (usz)stable_slot_arena::StableSlotPage{Port}::size,
+   &component
+  )
+  || !replicator_footprint_add(*bytes, component, bytes)
+  || !replicator_current_arena_bytes(
+   net.wires.pages.size,
+   net.wires.pages.capacity,
+   (usz)stable_slot_arena::StableSlotPage{Wire}::size,
+   &component
+  )
+  || !replicator_footprint_add(*bytes, component, bytes)
+  || !replicator_current_arena_bytes(
+   net.interfaces.pages.size,
+   net.interfaces.pages.capacity,
+   (usz)stable_slot_arena::StableSlotPage{InterfacePort}::size,
+   &component
+  )
+  || !replicator_footprint_add(*bytes, component, bytes)
+  || !replicator_current_arena_bytes(
+   net.effects.continuations.pages.size,
+   net.effects.continuations.pages.capacity,
+   (usz)stable_slot_arena::StableSlotPage{EffectContinuation}::size,
+   &component
+  )
+  || !replicator_footprint_add(*bytes, component, bytes)) return false;
+
+ if (!net.node_payload_bytes_accounted
+  || !replicator_footprint_add(
+   *bytes, net.node_payload_bytes, bytes
+  )
+  || mitos_storage::retained_bytes(&net.storage, &component)
+   != mitos_storage::StorageError.STORAGE_OK
+  || !replicator_footprint_add(*bytes, component, bytes)) return false;
+
+ usz commit_allocation_count = net.effects.commit_allocation_count;
+ if (commit_allocation_count < net.effects.commits.len)
+ {
+  commit_allocation_count = net.effects.commits.len;
+ }
+ if (!replicator_footprint_multiply(
+   commit_allocation_count, (usz)OrderedEffectCommit::size, &component
+  )
+  || !replicator_footprint_add(*bytes, component, bytes)
+  || !replicator_footprint_multiply(
+   net.effects.continuation_index.node_heads.len,
+   (usz)SlotId::size,
+   &component
+  )
+  || !replicator_footprint_add(*bytes, component, bytes)
+  || !replicator_footprint_multiply(
+   net.effects.continuation_index.node_tails.len,
+   (usz)SlotId::size,
+   &component
+  )
+  || !replicator_footprint_add(*bytes, component, bytes)
+  || !replicator_footprint_multiply(
+   net.effects.continuation_index.links.len,
+   (usz)PracticalContinuationLink::size,
+   &component
+  )
+  || !replicator_footprint_add(*bytes, component, bytes)
+  || !replicator_footprint_multiply(
+   net.effects.continuation_index.effect_buckets.len,
+   (usz)NetRef::size,
+   &component
+  )
+  || !replicator_footprint_add(*bytes, component, bytes)) return false;
+ return true;
+}
+
 // Each Cartesian cell creates two auxiliary references, two ports, and one
 // wire. The remaining units cover copied templates, row descriptors, and new
 // replicator nodes. Charging the complete logical footprint against the
 // evaluator's existing work bound prevents a single interaction from
 // materializing more records than a whole bounded evaluation may process.
 fn bool replicator_cartesian_expansion_fits(
+ Net* net,
  sz higher_count,
  sz lower_count
 ) @private
@@ -234,6 +396,8 @@ fn bool replicator_cartesian_expansion_fits(
  usz product;
  usz footprint;
  usz component;
+ usz node_count;
+ usz port_count;
  if (!replicator_footprint_multiply(higher, lower, &product)
   || !replicator_footprint_multiply(product, 5, &footprint)
   || !replicator_footprint_multiply(higher, 2, &component)
@@ -242,9 +406,18 @@ fn bool replicator_cartesian_expansion_fits(
   || !replicator_footprint_add(footprint, component, &footprint)
   || footprint > mitos::DELTA_MAX_EVALUATION_STEPS) return false;
 
- // Preflight every direct allocation as well as the aggregate work charge.
+ // Bound peak ownership by the same 64 MiB materialization budget used to
+ // build a Net. Arena pages, node payloads, storage retention, and effect
+ // arrays remain live while this charges temporary templates, new auxiliary
+ // rows, and exact StableSlot page/page-pointer growth after free-list reuse.
  usz allocation_bytes = 0;
- if (!replicator_footprint_multiply(higher, (usz)Port::size, &component)
+ usz node_free = net.nodes.free_slots();
+ usz port_free = net.ports.free_slots();
+ usz wire_free = net.wires.free_slots();
+ usz growth;
+ if (!replicator_footprint_add(higher, lower, &node_count)
+  || !replicator_footprint_multiply(product, 2, &port_count)
+  || !replicator_footprint_multiply(higher, (usz)Port::size, &component)
   || !replicator_footprint_add(allocation_bytes, component, &allocation_bytes)
   || !replicator_footprint_multiply(lower, (usz)Port::size, &component)
   || !replicator_footprint_add(allocation_bytes, component, &allocation_bytes)
@@ -255,7 +428,49 @@ fn bool replicator_cartesian_expansion_fits(
   || !replicator_footprint_multiply(product, (usz)NetRef::size, &component)
   || !replicator_footprint_add(allocation_bytes, component, &allocation_bytes)
   || !replicator_footprint_add(allocation_bytes, component, &allocation_bytes)
-  || allocation_bytes > (usz)sz::max) return false;
+  || !replicator_arena_growth(
+   net.nodes.next_id,
+   node_free,
+   net.nodes.pages.size,
+   net.nodes.pages.capacity,
+   stable_slot_arena::STABLE_SLOT_PAGE_CAPACITY{Node},
+   (usz)stable_slot_arena::StableSlotPage{Node}::size,
+   node_count,
+   &growth
+  )
+  || !replicator_footprint_add(allocation_bytes, growth, &allocation_bytes)
+  || !replicator_arena_growth(
+   net.ports.next_id,
+   port_free,
+   net.ports.pages.size,
+   net.ports.pages.capacity,
+   stable_slot_arena::STABLE_SLOT_PAGE_CAPACITY{Port},
+   (usz)stable_slot_arena::StableSlotPage{Port}::size,
+   port_count,
+   &growth
+  )
+  || !replicator_footprint_add(allocation_bytes, growth, &allocation_bytes)
+  || !replicator_arena_growth(
+   net.wires.next_id,
+   wire_free,
+   net.wires.pages.size,
+   net.wires.pages.capacity,
+   stable_slot_arena::STABLE_SLOT_PAGE_CAPACITY{Wire},
+   (usz)stable_slot_arena::StableSlotPage{Wire}::size,
+   product,
+   &growth
+  )
+  || !replicator_footprint_add(allocation_bytes, growth, &allocation_bytes))
+ {
+  return false;
+ }
+ usz owned_bytes;
+ if (!replicator_net_owned_bytes(net, &owned_bytes)
+  || owned_bytes > DELTA_MAX_MATERIALIZATION_BYTES
+  || allocation_bytes > DELTA_MAX_MATERIALIZATION_BYTES - owned_bytes)
+ {
+  return false;
+ }
  return true;
 }
 
@@ -348,9 +563,20 @@ ulong higher_origin = first_is_higher ? first_origin : second_origin;
 ulong lower_origin = first_is_higher ? second_origin : first_origin;
 sz higher_count = higher_auxiliaries.len;
 sz lower_count = lower_auxiliaries.len;
-if (!replicator_cartesian_expansion_fits(higher_count, lower_count))
+if (!replicator_cartesian_expansion_fits(net, higher_count, lower_count))
 {
  return false;
+}
+
+// Level failure is part of the reduction preflight: no arena or port may be
+// mutated until every higher-copy level is known to fit the wire format.
+foreach (auxiliary : lower_auxiliaries)
+{
+ Port* port = net.ports.get_ref(auxiliary);
+ ulong replica_level;
+ if (!replicator_level_add(
+  higher_level, port.slot.properties.value.delta_level, &replica_level
+ )) return false;
 }
 
 Port[] higher_templates = mem::alloc_array(Port, higher_count);
@@ -369,22 +595,22 @@ lower_templates[idx] = net.ports.get(auxiliary);
 foreach (lower_idx, principal : lower_auxiliaries)
 {
  NetRef[] auxiliaries = mem::alloc_array(NetRef, higher_count);
- int128 replica_level = (int128)higher_level
- + (int128)lower_templates[lower_idx].slot.properties.value.delta_level;
- assert(replica_level >= 0
- && replica_level <= (int128)18_446_744_073_709_551_615,
- "Replicator level is out of range");
+ int128 adjusted_level = (int128)higher_level
+  + (int128)lower_templates[lower_idx].slot.properties.value.delta_level;
  NetRef copy_id = net.nodes.push({
   .agent = { .replicator = {
     .principal = principal,
     .auxiliaries = auxiliaries,
-    .delta_level = (ulong)replica_level,
+    .delta_level = (ulong)adjusted_level,
     .status = higher_status,
     .observable = higher_observable,
     .origin = higher_origin
    }},
  .type = REPLICATOR
 });
+ net_account_node_references_allocate(
+  net, net.nodes.get_ref(copy_id), (usz)higher_count
+ );
 
 Port* principal_port = net.ports.get_ref(principal);
 principal_port.node_id = copy_id;
@@ -412,6 +638,9 @@ foreach (higher_idx, principal : higher_auxiliaries)
    }},
  .type = REPLICATOR
 });
+ net_account_node_references_allocate(
+  net, net.nodes.get_ref(copy_id), (usz)lower_count
+ );
 
 Port* principal_port = net.ports.get_ref(principal);
 principal_port.node_id = copy_id;
@@ -634,6 +863,31 @@ fn bool practical_continuation_index_build(
  usz effect_capacity = practical_effect_index_capacity(live_count);
  if (live_count && (!effect_capacity
   || effect_capacity > (usz)sz::max / (usz)NetRef::size)) return false;
+ if (live_count)
+ {
+  usz index_bytes = 0;
+  usz component;
+  usz owned_bytes;
+  if (!replicator_footprint_multiply(
+    node_count, (usz)SlotId::size, &component
+   )
+   || !replicator_footprint_add(index_bytes, component, &index_bytes)
+   || !replicator_footprint_add(index_bytes, component, &index_bytes)
+   || !replicator_footprint_multiply(
+    live_count * 6, (usz)PracticalContinuationLink::size, &component
+   )
+   || !replicator_footprint_add(index_bytes, component, &index_bytes)
+   || !replicator_footprint_multiply(
+    effect_capacity, (usz)NetRef::size, &component
+   )
+   || !replicator_footprint_add(index_bytes, component, &index_bytes)
+   || !replicator_net_owned_bytes(net, &owned_bytes)
+   || owned_bytes > DELTA_MAX_MATERIALIZATION_BYTES
+   || index_bytes > DELTA_MAX_MATERIALIZATION_BYTES - owned_bytes)
+  {
+   return false;
+  }
+ }
 
  index.allocator = net.effects.continuations.allocator;
  index.continuation_next_id = net.effects.continuations.next_id;
@@ -734,8 +988,8 @@ fn bool practical_continuation_references_node(
 }
 
 // Retired continuations are tombstones until they occupy a fixed fraction of
-// the queue. Each compaction then removes enough records to pay for its scan,
-// while preserving the physical committed prefix of the retained records.
+// the logical queue. Stable in-place compaction performs one paid scan and
+// cannot fail for lack of a second queue allocation.
 fn void practical_maybe_compact_effect_commits(
  Net* net,
  PracticalContinuationIndex* index
@@ -752,15 +1006,32 @@ fn void practical_maybe_compact_effect_commits(
  if (count % 4) threshold++;
  if (index.ordered_commit_tombstones < threshold) return;
 
- usz retained_cursor = 0;
+ if (net.effects.commit_allocation_count < count)
+ {
+  net.effects.commit_allocation_count = count;
+ }
+ usz retained_count = 0;
  usz retained_committed = 0;
  foreach (commit_index, &commit : net.effects.commits)
  {
   if (!net.effects.continuations.contains_ref(commit.continuation)) continue;
-  net.effects.commits[retained_cursor++] = *commit;
+  if (retained_count != (usz)commit_index)
+  {
+   net.effects.commits[retained_count] = *commit;
+  }
+  retained_count++;
   if ((usz)commit_index < net.effects.committed) retained_committed++;
  }
- net.effects.commits = net.effects.commits[:(sz)retained_cursor];
+ if (!retained_count)
+ {
+  mem::free(net.effects.commits);
+  net.effects.commits = { };
+  net.effects.commit_allocation_count = 0;
+  net.effects.committed = 0;
+  index.ordered_commit_tombstones = 0;
+  return;
+ }
+ net.effects.commits = net.effects.commits[:(sz)retained_count];
  net.effects.committed = retained_committed;
  index.ordered_commit_tombstones = 0;
 }
@@ -843,6 +1114,15 @@ fn void practical_retire_continuations_for_node(
    && net.nodes.contains_ref(second_resource))
   {
    destroy_node(net, second_resource);
+  }
+  if (net.nodes.contains_ref(continuation.handler))
+  {
+   Node* handler = net.nodes.get_ref(continuation.handler);
+   if (handler.type == HANDLER_AGENT
+    && handler.agent.practical.continuation == reference)
+   {
+    handler.agent.practical.continuation = INVALID_NET_REF;
+   }
   }
   if (net.effects.continuations.erase(reference))
   {

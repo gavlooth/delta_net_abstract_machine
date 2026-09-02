@@ -972,6 +972,352 @@ fn void oversized_different_coordinate_replicator_expansion_rejects_atomically()
 	assert_wire_preserved(&net, principal_wire, wire);
 }
 
+fn void run_out_of_range_cartesian_level_case(
+	ulong higher_level,
+	long lower_delta
+)
+{
+	Net net;
+	net.init();
+	defer net.free();
+
+	NetRef higher = add_replicator(&net, higher_level, 1);
+	NetRef lower = add_replicator(&net, 0, 1, PARENT);
+	Replicator* higher_value =
+		&net.nodes.get_ref(higher).agent.replicator;
+	Replicator* lower_value =
+		&net.nodes.get_ref(lower).agent.replicator;
+	NetRef higher_principal = higher_value.principal;
+	NetRef lower_principal = lower_value.principal;
+	NetRef higher_auxiliary = higher_value.auxiliaries[0];
+	NetRef lower_auxiliary = lower_value.auxiliaries[0];
+	set_auxiliary_delta(&net, lower_auxiliary, lower_delta);
+	connect(&net, higher_auxiliary, add_external_port(&net, CHILD));
+	connect(&net, lower_auxiliary, add_external_port(&net, PARENT));
+	connect(&net, higher_principal, lower_principal);
+	NetRef principal_wire = net.ports.get_ref(higher_principal).wire_id;
+	NetRef higher_wire = net.ports.get_ref(higher_auxiliary).wire_id;
+	NetRef lower_wire = net.ports.get_ref(lower_auxiliary).wire_id;
+
+	Replicator higher_snapshot = *higher_value;
+	Replicator lower_snapshot = *lower_value;
+	Port higher_principal_snapshot = *net.ports.get_ref(higher_principal);
+	Port lower_principal_snapshot = *net.ports.get_ref(lower_principal);
+	Port higher_auxiliary_snapshot = *net.ports.get_ref(higher_auxiliary);
+	Port lower_auxiliary_snapshot = *net.ports.get_ref(lower_auxiliary);
+	Wire principal_wire_snapshot = *net.wires.get_ref(principal_wire);
+	Wire higher_wire_snapshot = *net.wires.get_ref(higher_wire);
+	Wire lower_wire_snapshot = *net.wires.get_ref(lower_wire);
+	usz node_count = net.nodes.len();
+	usz port_count = net.ports.len();
+	usz wire_count = net.wires.len();
+	assert(delta_net_abstract_machine::validate_net(&net));
+
+	assert(!delta_net_abstract_machine::interact(&net, principal_wire));
+	assert(net.nodes.len() == node_count);
+	assert(net.ports.len() == port_count);
+	assert(net.wires.len() == wire_count);
+	assert(net.nodes.contains_ref(higher));
+	assert(net.nodes.contains_ref(lower));
+	Replicator* retained_higher =
+		&net.nodes.get_ref(higher).agent.replicator;
+	Replicator* retained_lower =
+		&net.nodes.get_ref(lower).agent.replicator;
+	assert(retained_higher.principal == higher_snapshot.principal);
+	assert(retained_higher.auxiliaries.ptr == higher_snapshot.auxiliaries.ptr);
+	assert(retained_higher.auxiliaries.len == higher_snapshot.auxiliaries.len);
+	assert(retained_higher.delta_level == higher_snapshot.delta_level);
+	assert(retained_lower.principal == lower_snapshot.principal);
+	assert(retained_lower.auxiliaries.ptr == lower_snapshot.auxiliaries.ptr);
+	assert(retained_lower.auxiliaries.len == lower_snapshot.auxiliaries.len);
+	assert(retained_lower.delta_level == lower_snapshot.delta_level);
+	assert_port_preserved(
+		&net, higher_principal, higher_principal_snapshot
+	);
+	assert_port_preserved(
+		&net, lower_principal, lower_principal_snapshot
+	);
+	assert_port_preserved(
+		&net, higher_auxiliary, higher_auxiliary_snapshot
+	);
+	assert_port_preserved(
+		&net, lower_auxiliary, lower_auxiliary_snapshot
+	);
+	assert_wire_preserved(&net, principal_wire, principal_wire_snapshot);
+	assert_wire_preserved(&net, higher_wire, higher_wire_snapshot);
+	assert_wire_preserved(&net, lower_wire, lower_wire_snapshot);
+	assert(delta_net_abstract_machine::validate_net(&net));
+}
+
+fn void out_of_range_cartesian_derived_levels_reject_atomically() @test
+{
+	run_out_of_range_cartesian_level_case(1, -2);
+	run_out_of_range_cartesian_level_case(ulong::max, 1);
+}
+
+fn void storage_retained_bytes_bound_cartesian_growth_atomically() @test
+{
+	const sz ARITY = 500;
+	const sz LIVE_STORAGE_BYTES = 48 * 1024 * 1024;
+	// The 500² expansion fits the per-rewrite limits in isolation, but not
+	// alongside storage that the Net must retain throughout the rewrite.
+	Net net;
+	net.init();
+	defer net.free();
+
+	mitos::TypeId ballast_type = (mitos::TypeId)9_001;
+	LayoutHandle ballast_layout = register_shared_layout(
+		&net, ballast_type, "CartesianStorageBallast"
+	);
+	char[] ballast_bytes = mem::alloc_array(char, LIVE_STORAGE_BYTES);
+	defer mem::free(ballast_bytes);
+	foreach (&byte : ballast_bytes) *byte = 0;
+	StorageHandle ballast_storage = allocate_shared_storage(
+		&net, ballast_layout, ballast_bytes, 8
+	);
+	NetRef ballast = delta_net_abstract_machine::new_practical_agent(
+		&net, ARRAY_AGENT, 0, 0, (uint)ballast_type
+	);
+	assert(delta_net_abstract_machine::practical_agent_take_storage(
+		&net,
+		ballast,
+		&ballast_storage,
+		(usz)LIVE_STORAGE_BYTES / 8,
+		8
+	));
+	PracticalAgent* ballast_value =
+		&net.nodes.get_ref(ballast).agent.practical;
+	connect(
+		&net,
+		ballast_value.principal,
+		add_external_port(&net, CHILD)
+	);
+	usz retained_storage_bytes;
+	assert(mitos_storage::retained_bytes(
+		&net.storage, &retained_storage_bytes
+	) == STORAGE_OK);
+	assert(retained_storage_bytes >= (usz)LIVE_STORAGE_BYTES);
+
+	NetRef higher = add_replicator(&net, 2, ARITY);
+	NetRef lower = add_replicator(&net, 1, ARITY, PARENT);
+	Replicator* higher_value =
+		&net.nodes.get_ref(higher).agent.replicator;
+	Replicator* lower_value =
+		&net.nodes.get_ref(lower).agent.replicator;
+	foreach (auxiliary : higher_value.auxiliaries)
+		connect(&net, auxiliary, add_external_port(&net, CHILD));
+	foreach (auxiliary : lower_value.auxiliaries)
+		connect(&net, auxiliary, add_external_port(&net, PARENT));
+	NetRef higher_principal = higher_value.principal;
+	NetRef lower_principal = lower_value.principal;
+	connect(&net, higher_principal, lower_principal);
+	NetRef principal_wire = net.ports.get_ref(higher_principal).wire_id;
+
+	PracticalAgent ballast_snapshot = *ballast_value;
+	Replicator higher_snapshot = *higher_value;
+	Replicator lower_snapshot = *lower_value;
+	Port higher_port_snapshot = *net.ports.get_ref(higher_principal);
+	Port lower_port_snapshot = *net.ports.get_ref(lower_principal);
+	Wire wire_snapshot = *net.wires.get_ref(principal_wire);
+	usz node_count = net.nodes.len();
+	usz port_count = net.ports.len();
+	usz wire_count = net.wires.len();
+	SlotId node_next = net.nodes.next_id;
+	SlotId port_next = net.ports.next_id;
+	SlotId wire_next = net.wires.next_id;
+	usz node_free = net.nodes.free_slots();
+	usz port_free = net.ports.free_slots();
+	usz wire_free = net.wires.free_slots();
+	usz payload_bytes = net.node_payload_bytes;
+	assert(delta_net_abstract_machine::validate_net(&net));
+
+	assert(!delta_net_abstract_machine::interact(&net, principal_wire));
+	assert(net.nodes.len() == node_count);
+	assert(net.ports.len() == port_count);
+	assert(net.wires.len() == wire_count);
+	assert(net.nodes.next_id == node_next);
+	assert(net.ports.next_id == port_next);
+	assert(net.wires.next_id == wire_next);
+	assert(net.nodes.free_slots() == node_free);
+	assert(net.ports.free_slots() == port_free);
+	assert(net.wires.free_slots() == wire_free);
+	assert(net.node_payload_bytes == payload_bytes);
+	assert_practical_preserved(
+		&net, ballast, ARRAY_AGENT, ballast_snapshot
+	);
+	usz retained_after_failure;
+	assert(mitos_storage::retained_bytes(
+		&net.storage, &retained_after_failure
+	) == STORAGE_OK);
+	assert(retained_after_failure == retained_storage_bytes);
+	assert(net.nodes.contains_ref(higher));
+	assert(net.nodes.contains_ref(lower));
+	Replicator* retained_higher =
+		&net.nodes.get_ref(higher).agent.replicator;
+	Replicator* retained_lower =
+		&net.nodes.get_ref(lower).agent.replicator;
+	assert(retained_higher.principal == higher_snapshot.principal);
+	assert(retained_higher.auxiliaries.ptr == higher_snapshot.auxiliaries.ptr);
+	assert(retained_higher.auxiliaries.len == higher_snapshot.auxiliaries.len);
+	assert(retained_higher.delta_level == higher_snapshot.delta_level);
+	assert(retained_lower.principal == lower_snapshot.principal);
+	assert(retained_lower.auxiliaries.ptr == lower_snapshot.auxiliaries.ptr);
+	assert(retained_lower.auxiliaries.len == lower_snapshot.auxiliaries.len);
+	assert(retained_lower.delta_level == lower_snapshot.delta_level);
+	assert_port_preserved(&net, higher_principal, higher_port_snapshot);
+	assert_port_preserved(&net, lower_principal, lower_port_snapshot);
+	assert_wire_preserved(&net, principal_wire, wire_snapshot);
+	assert(delta_net_abstract_machine::validate_net(&net));
+}
+
+fn void assert_net_allocation_counters_exact(Net* net)
+{
+	assert(net.nodes.free_slots() + net.nodes.len()
+		== (usz)net.nodes.next_id);
+	assert(net.ports.free_slots() + net.ports.len()
+		== (usz)net.ports.next_id);
+	assert(net.wires.free_slots() + net.wires.len()
+		== (usz)net.wires.next_id);
+
+	usz accounted_payload_bytes = 0;
+	for (SlotId id = 0; id < net.nodes.next_id; id++)
+	{
+		if (!net.nodes.contains_id(id)) continue;
+		Node* node = net.nodes.get_ref(net.nodes.generation_ref(id));
+		assert(node.accounted_payload_bytes
+			<= usz::max - accounted_payload_bytes);
+		accounted_payload_bytes += node.accounted_payload_bytes;
+	}
+	assert(net.node_payload_bytes == accounted_payload_bytes);
+}
+
+fn void cartesian_reductions_preserve_reuse_and_payload_accounting() @test
+{
+	const usz ITERATIONS = 4;
+	long[2] deltas = { 0, 1 };
+	Net net;
+	net.init();
+	defer net.free();
+
+	NetRef practical = delta_net_abstract_machine::new_practical_agent(
+		&net, I64_AGENT, 3
+	);
+	assert(net.nodes.get_ref(practical).accounted_payload_bytes
+		== 3 * (usz)NetRef::size);
+	assert(net.node_payload_bytes == 3 * (usz)NetRef::size);
+	delta_net_abstract_machine::destroy_node(&net, practical);
+	assert(net.node_payload_bytes == 0);
+	assert(net.nodes.free_slots() == 1);
+	assert_net_allocation_counters_exact(&net);
+
+	for (usz iteration = 0; iteration < ITERATIONS; iteration++)
+	{
+		usz payload_before = net.node_payload_bytes;
+		SlotId node_next_before = net.nodes.next_id;
+		usz node_free_before = net.nodes.free_slots();
+		if (iteration)
+		{
+			assert(node_free_before == 2);
+		}
+
+		NetRef higher = delta_net_abstract_machine::new_replicator(
+			&net, 2, deltas[..], UNKNOWN, CHILD
+		);
+		NetRef lower = delta_net_abstract_machine::new_replicator(
+			&net, 1, deltas[..], UNKNOWN, PARENT
+		);
+		assert(net.node_payload_bytes
+			== payload_before + 4 * (usz)NetRef::size);
+		if (iteration)
+		{
+			assert(net.nodes.next_id == node_next_before);
+			assert(net.nodes.free_slots() == node_free_before - 2);
+		}
+
+		Replicator* higher_value =
+			&net.nodes.get_ref(higher).agent.replicator;
+		Replicator* lower_value =
+			&net.nodes.get_ref(lower).agent.replicator;
+		foreach (auxiliary : higher_value.auxiliaries)
+			connect(&net, auxiliary, add_external_port(&net, CHILD));
+		foreach (auxiliary : lower_value.auxiliaries)
+			connect(&net, auxiliary, add_external_port(&net, PARENT));
+		connect(&net, higher_value.principal, lower_value.principal);
+		NetRef principal_wire =
+			net.ports.get_ref(higher_value.principal).wire_id;
+
+		assert(delta_net_abstract_machine::interact(
+			&net, principal_wire
+		));
+		// Four live Cartesian copies each retain two auxiliary references.
+		assert(net.node_payload_bytes
+			== payload_before + 8 * (usz)NetRef::size);
+		assert(net.nodes.free_slots() == 2);
+		assert_net_allocation_counters_exact(&net);
+		assert(delta_net_abstract_machine::validate_net(&net));
+	}
+
+	// Raw test construction deliberately bypasses the production charge path.
+	// Teardown must free its owned allocation without subtracting forged bytes.
+	usz payload_before_forgery = net.node_payload_bytes;
+	usz free_before_forgery = net.nodes.free_slots();
+	NetRef forged = add_replicator(&net, 9, 3);
+	assert(net.nodes.get_ref(forged).accounted_payload_bytes == 0);
+	assert(net.node_payload_bytes == payload_before_forgery);
+	delta_net_abstract_machine::destroy_node(&net, forged);
+	assert(!net.nodes.contains_ref(forged));
+	assert(net.node_payload_bytes == payload_before_forgery);
+	assert(net.nodes.free_slots() == free_before_forgery);
+	assert_net_allocation_counters_exact(&net);
+	assert(delta_net_abstract_machine::validate_net(&net));
+
+	NetRef forged_practical =
+		delta_net_abstract_machine::new_practical_agent(
+			&net, STRING_AGENT, 0, 0, (uint)mitos::TYPE_ID_STRING
+		);
+	PracticalAgent* forged_value =
+		&net.nodes.get_ref(forged_practical).agent.practical;
+	char[] forged_text = mem::alloc_array(char, 16);
+	forged_value.text = (String)forged_text;
+	forged_value.owns_text = true;
+	assert(forged_value.text.len == 16);
+	assert(net.nodes.get_ref(forged_practical).accounted_payload_bytes == 0);
+	delta_net_abstract_machine::destroy_node(&net, forged_practical);
+	assert(!net.nodes.contains_ref(forged_practical));
+	assert(net.node_payload_bytes == payload_before_forgery);
+	assert_net_allocation_counters_exact(&net);
+	assert(delta_net_abstract_machine::validate_net(&net));
+}
+
+fn void retired_slots_become_reusable_only_after_erase() @test
+{
+	Net net;
+	net.init();
+	defer net.free();
+
+	NetRef first = net.interfaces.push({ });
+	SlotId next = net.interfaces.next_id;
+	assert(net.interfaces.len() == 1);
+	assert(net.interfaces.free_slots() == 0);
+	assert(net.interfaces.claim(first));
+	assert(net.interfaces.free_slots() == 0);
+	assert(net.interfaces.retire_claimed(first));
+	assert(net.interfaces.len() == 0);
+	assert(net.interfaces.free_slots() == 0);
+
+	assert(net.interfaces.erase(first));
+	assert(net.interfaces.free_slots() == 1);
+	NetRef reused = net.interfaces.push({ });
+	assert(reused.id == first.id);
+	assert(reused.generation != first.generation);
+	assert(net.interfaces.next_id == next);
+	assert(net.interfaces.len() == 1);
+	assert(net.interfaces.free_slots() == 0);
+	assert(net.interfaces.erase(reused));
+	assert(net.interfaces.free_slots() == 1);
+	assert(net.interfaces.is_empty());
+}
+
 fn void net_validator_accepts_a_fully_wired_fan_and_boundaries() @test
 {
 	Net net;
@@ -2190,6 +2536,71 @@ fn void handler_eraser_retires_live_continuation_resources() @test
 	assert(delta_net_abstract_machine::validate_net(&net));
 }
 
+fn void continuation_retirement_clears_a_surviving_handler_reference() @test
+{
+	Net net;
+	net.init();
+	defer net.free();
+
+	NetRef handler = delta_net_abstract_machine::new_practical_agent(
+		&net, HANDLER_AGENT, 2
+	);
+	PracticalAgent* practical = &net.nodes.get_ref(handler).agent.practical;
+	practical.handler_id = 19;
+	practical.effect_epoch = 23;
+	connect(
+		&net,
+		practical.principal,
+		add_external_port(&net, CHILD)
+	);
+	foreach (auxiliary : practical.auxiliaries)
+		connect(&net, auxiliary, add_external_port(&net, PARENT));
+
+	NetRef effect = delta_net_abstract_machine::new_practical_agent(
+		&net, EFFECT_AGENT, 1
+	);
+	PracticalAgent* effect_value =
+		&net.nodes.get_ref(effect).agent.practical;
+	effect_value.effect_id = 29;
+	effect_value.operation_id = 31;
+	effect_value.effect_epoch = practical.effect_epoch;
+	NetRef eraser = add_eraser(&net, CHILD);
+	connect(&net, effect_value.principal, principal(&net, eraser));
+	connect(
+		&net,
+		effect_value.auxiliaries[0],
+		add_external_port(&net, PARENT)
+	);
+	NetRef effect_wire = net.ports.get_ref(effect_value.principal).wire_id;
+	NetRef continuation = delta_net_abstract_machine::new_effect_continuation(
+		&net,
+		practical.auxiliaries[0],
+		effect_value.auxiliaries[0],
+		handler,
+		practical.handler_id,
+		effect_value.effect_id,
+		effect_value.operation_id,
+		practical.effect_epoch,
+		1,
+		3,
+		5,
+		false,
+		HOST_EFFECT_PURE,
+		false
+	);
+	practical.continuation = continuation;
+	assert(delta_net_abstract_machine::validate_net(&net));
+
+	assert(delta_net_abstract_machine::interact(&net, effect_wire));
+	assert(net.nodes.contains_ref(handler));
+	assert(!net.nodes.contains_ref(effect));
+	assert(!net.nodes.contains_ref(eraser));
+	assert(!net.effects.continuations.contains_ref(continuation));
+	assert(net.nodes.get_ref(handler).agent.practical.continuation
+		== delta_net_abstract_machine::INVALID_NET_REF);
+	assert(delta_net_abstract_machine::validate_net(&net));
+}
+
 fn void later_continuation_retirement_preserves_ordered_commit_prefix() @test
 {
 	Net net;
@@ -2278,6 +2689,93 @@ fn void later_continuation_retirement_preserves_ordered_commit_prefix() @test
 	assert(net.effects.committed == 2);
 	assert(net.effects.commits[1].committed);
 	assert(delta_net_abstract_machine::validate_net(&net));
+}
+
+fn void run_continuation_validator_commit_membership_case(usz variant)
+{
+	Net net;
+	net.init();
+	defer net.free();
+
+	NetRef[3] continuations;
+	foreach (index, &continuation : continuations)
+	{
+		NetRef handler = delta_net_abstract_machine::new_practical_agent(
+			&net, HANDLER_AGENT, 2
+		);
+		PracticalAgent* practical =
+			&net.nodes.get_ref(handler).agent.practical;
+		practical.handler_id = (uint)(101 + index);
+		practical.effect_epoch = 37;
+		connect(
+			&net,
+			practical.principal,
+			add_external_port(&net, CHILD)
+		);
+		foreach (auxiliary : practical.auxiliaries)
+			connect(&net, auxiliary, add_external_port(&net, PARENT));
+		*continuation =
+			delta_net_abstract_machine::new_effect_continuation(
+				&net,
+				practical.auxiliaries[0],
+				practical.auxiliaries[1],
+				handler,
+				practical.handler_id,
+				107,
+				(uint)(109 + index),
+				practical.effect_epoch,
+				1,
+				(usz)index,
+				0,
+				false,
+				HOST_EFFECT_PURE,
+				index < 2
+			);
+		practical.continuation = *continuation;
+	}
+	delta_net_abstract_machine::delta_build_effect_commit_queue(&net);
+	assert(net.effects.commits.len == 2);
+	assert(delta_net_abstract_machine::validate_net(&net));
+
+	OrderedEffectCommit[] valid_commits = net.effects.commits;
+	OrderedEffectCommit[] forged_commits = { };
+	switch (variant)
+	{
+	case 0:
+		net.effects.commits = valid_commits[0:1];
+	case 1:
+		forged_commits = mem::alloc_array(OrderedEffectCommit, 3);
+		forged_commits[0] = valid_commits[0];
+		forged_commits[1] = valid_commits[0];
+		forged_commits[2] = valid_commits[1];
+		net.effects.commits = forged_commits;
+	case 2:
+		forged_commits = mem::alloc_array(OrderedEffectCommit, 3);
+		forged_commits[0] = valid_commits[0];
+		forged_commits[1] = valid_commits[1];
+		EffectContinuation* unordered =
+			net.effects.continuations.get_ref(continuations[2]);
+		forged_commits[2] = {
+			.continuation = continuations[2],
+			.source_root_order = unordered.source_order,
+			.operation_order = unordered.occurrence_order
+		};
+		net.effects.commits = forged_commits;
+	default:
+		unreachable("invalid continuation validator variant");
+	}
+	assert(!delta_net_abstract_machine::validate_net(&net));
+
+	net.effects.commits = valid_commits;
+	if (forged_commits.ptr) mem::free(forged_commits);
+	assert(delta_net_abstract_machine::validate_net(&net));
+}
+
+fn void continuation_validator_enforces_live_commit_membership() @test
+{
+	run_continuation_validator_commit_membership_case(0);
+	run_continuation_validator_commit_membership_case(1);
+	run_continuation_validator_commit_membership_case(2);
 }
 
 fn void large_ordered_commit_queue_is_sorted_stably() @test
@@ -2548,6 +3046,9 @@ fn void retained_ordered_commit_tombstones_validate_and_compact_without_reorderi
 	net.effects.execution_epoch = EFFECT_EPOCH;
 	delta_net_abstract_machine::delta_build_effect_commit_queue(&net);
 	assert(net.effects.commits.len == CONTINUATION_COUNT);
+	OrderedEffectCommit* commit_allocation = net.effects.commits.ptr;
+	assert(commit_allocation != null);
+	assert(net.effects.commit_allocation_count == CONTINUATION_COUNT);
 	assert(delta_net_abstract_machine::resume_effect_continuation(
 		&net, continuations[0]
 	));
@@ -2565,6 +3066,9 @@ fn void retained_ordered_commit_tombstones_validate_and_compact_without_reorderi
 	assert(!net.nodes.contains_ref(second_resources[0]));
 	assert(net.effects.commits.len == CONTINUATION_COUNT);
 	assert(net.effects.committed == 2);
+	// One tombstone is below the 25% threshold: no scan or relocation yet.
+	assert(net.effects.commits.ptr == commit_allocation);
+	assert(net.effects.commit_allocation_count == CONTINUATION_COUNT);
 	assert(delta_net_abstract_machine::validate_net(&net));
 
 	NetRef second_retired_wire = net.ports.get_ref(
@@ -2578,6 +3082,10 @@ fn void retained_ordered_commit_tombstones_validate_and_compact_without_reorderi
 	usz[6] retained = { 1, 2, 4, 5, 6, 7 };
 	assert(net.effects.commits.len == retained.len);
 	assert(net.effects.committed == 1);
+	// The second tombstone pays for one stable in-place scan. Logical length
+	// shrinks, while retained-byte accounting keeps the physical allocation.
+	assert(net.effects.commits.ptr == commit_allocation);
+	assert(net.effects.commit_allocation_count == CONTINUATION_COUNT);
 	foreach (queue_index, continuation_index : retained)
 	{
 		assert(net.effects.commits[queue_index].continuation
@@ -2596,5 +3104,22 @@ fn void retained_ordered_commit_tombstones_validate_and_compact_without_reorderi
 	assert(net.effects.committed == 2);
 	assert(net.effects.commits[0].committed);
 	assert(net.effects.commits[1].committed);
+	assert(delta_net_abstract_machine::validate_net(&net));
+
+	foreach (continuation_index : retained)
+	{
+		NetRef retired_wire = net.ports.get_ref(
+			net.nodes.get_ref(handlers[continuation_index])
+				.agent.practical.principal
+		).wire_id;
+		assert(delta_net_abstract_machine::interact(&net, retired_wire));
+		assert(!net.effects.continuations.contains_ref(
+			continuations[continuation_index]
+		));
+	}
+	assert(net.effects.commits.len == 0);
+	assert(net.effects.commits.ptr == null);
+	assert(net.effects.commit_allocation_count == 0);
+	assert(net.effects.committed == 0);
 	assert(delta_net_abstract_machine::validate_net(&net));
 }

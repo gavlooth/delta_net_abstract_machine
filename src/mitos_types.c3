@@ -2202,9 +2202,9 @@ fn TypeRegistryBuildResult build_type_registry(
 		diagnostics.free();
 		return result;
 	}
-	bool[] accepted_types = alloc::new_array(allocator, bool, program.types.len);
+	TypeId[] accepted_types = alloc::new_array(allocator, TypeId, program.types.len);
 	defer alloc::free(allocator, accepted_types);
-	foreach (&accepted : accepted_types) *accepted = false;
+	foreach (&accepted : accepted_types) *accepted = TYPE_ID_INVALID;
 	foreach (type_index, &type_decl : program.types)
 	{
 		if (!symbol_key_matches_declaration(
@@ -2241,10 +2241,8 @@ fn TypeRegistryBuildResult build_type_registry(
 				&& primitive.kind == declared_kind
 				&& !type_decl.fields.len)
 			{
-				type_decl.key.deinit(program.allocator);
-				type_decl.key = clone_symbol_key(&primitive.key, program.allocator);
 				primitive.span = type_decl.span;
-				accepted_types[type_index] = true;
+				accepted_types[type_index] = existing;
 
 				continue;
 			}
@@ -2267,6 +2265,7 @@ fn TypeRegistryBuildResult build_type_registry(
 			.alignment = 1,
 			.stable_key = clone_symbol_key(&key, allocator),
 		};
+		TypeId registered;
 		if (!type_registry_append(&result.registry, {
 			.key = key,
 			.layout = layout,
@@ -2275,12 +2274,12 @@ fn TypeRegistryBuildResult build_type_registry(
 			.parameters = parameters,
 			.arity = type_decl.parameters.len,
 			.span = type_decl.span,
-		}))
+		}, &registered))
 		{
 			types_add_diagnostic(&diagnostics, allocator, "type registry exhausted its bounded capacity", type_decl.span);
 			break;
 		}
-		accepted_types[type_index] = true;
+		accepted_types[type_index] = registered;
 
 	}
 	foreach (&enum_decl : program.enums)
@@ -2334,8 +2333,8 @@ fn TypeRegistryBuildResult build_type_registry(
 	}
 	foreach (type_index, &type_decl : program.types)
 	{
-		if (!accepted_types[type_index]) continue;
-		TypeId id = find_type_by_key(&result.registry, &type_decl.key);
+		TypeId id = accepted_types[type_index];
+		if (!id) continue;
 		TypeDescriptor* descriptor = type_descriptor(&result.registry, id);
 		if (!descriptor) continue;
 		if (id > TYPE_ID_SUPERPOSITION) descriptor.nominal_parent = TYPE_ID_ANY;

@@ -235,6 +235,7 @@ struct TypedDeltaRetainedAllocator (Allocator) @private
 {
 	Allocator backing;
 	usz live_bytes;
+	usz peak_bytes;
 	bool overflowed;
 }
 
@@ -286,6 +287,7 @@ fn void*? TypedDeltaRetainedAllocator.acquire(
 		mem::clear(payload, size, mem::DEFAULT_MEM_ALIGNMENT);
 	}
 	self.live_bytes += allocation_bytes;
+	if (self.live_bytes > self.peak_bytes) self.peak_bytes = self.live_bytes;
 	return payload;
 }
 
@@ -1138,10 +1140,12 @@ struct TypedDeltaContext
  TypedDeltaRetainedAllocator program_allocator;
  List{TypedDeltaBinding[]} environments;
  List{TypedDeltaExternalLane} external_lanes;
+ usz[] external_lane_buckets;
  TypedDeltaExecutionStats stats;
  usz steps;
  usz owned_bytes;
  usz accounted_program_bytes;
+ usz accounted_program_payload_bytes;
  usz accounted_storage_bytes;
  usz storage_payload_bytes;
  usz accounted_storage_payload_bytes;
@@ -1315,6 +1319,82 @@ fn bool typed_delta_charge(
  return true;
 }
 
+fn void typed_delta_uncharge(
+ TypedDeltaContext* context,
+ usz bytes
+) @private
+{
+ if (!bytes) return;
+ if (context.shared_budget_mutex)
+ {
+  context.shared_budget_mutex.lock();
+  assert(
+   *context.shared_owned_bytes >= bytes,
+   "typed Delta shared byte accounting underflow"
+  );
+  *context.shared_owned_bytes -= bytes;
+  context.shared_budget_mutex.unlock();
+ }
+ assert(
+  context.owned_bytes >= bytes,
+  "typed Delta owned byte accounting underflow"
+ );
+ context.owned_bytes -= bytes;
+}
+
+// A retained List resize temporarily owns both backings. The caller has
+// already charged the logical payload; measure the allocator's full peak so
+// capacity and allocator-header bytes are counted once, then release the old
+// backing's charge after replacement.
+fn void typed_delta_begin_retained_control(
+ TypedDeltaContext* context,
+ usz charged_payload
+) @private
+{
+ if (!context.owned_program) return;
+ assert(
+  !context.accounted_program_payload_bytes,
+  "typed Delta retained allocation measurements overlap"
+ );
+ context.accounted_program_payload_bytes = charged_payload;
+ context.program_allocator.peak_bytes = context.program_allocator.live_bytes;
+}
+
+fn bool typed_delta_reconcile_retained_control(
+ TypedDeltaContext* context
+) @private
+{
+ if (!context.owned_program) return true;
+ if (context.program_allocator.overflowed)
+ {
+  typed_delta_fail(context, "typed Delta program-clone byte accounting failed");
+  return false;
+ }
+ usz baseline = context.accounted_program_bytes;
+ usz peak = context.program_allocator.peak_bytes;
+ usz live = context.program_allocator.live_bytes;
+ usz payload = context.accounted_program_payload_bytes;
+ if (peak < baseline || peak < live)
+ {
+  typed_delta_fail(context, "typed Delta program-clone byte accounting failed");
+  return false;
+ }
+ usz peak_growth = peak - baseline;
+ if (peak_growth > payload)
+ {
+  if (!typed_delta_charge(context, peak_growth - payload)) return false;
+ }
+ else
+ {
+  typed_delta_uncharge(context, payload - peak_growth);
+ }
+ typed_delta_uncharge(context, peak - live);
+ context.accounted_program_bytes = live;
+ context.accounted_program_payload_bytes = 0;
+ context.program_allocator.peak_bytes = live;
+ return true;
+}
+
 fn bool typed_delta_take_step(
  TypedDeltaContext* context,
  String failure
@@ -1352,7 +1432,14 @@ fn TypedDeltaValue* typed_delta_value(
  TypedDeltaValue* owned = alloc::new(
   context.allocator, TypedDeltaValue, value
  );
+ typed_delta_begin_retained_control(context, (usz)usz::size);
  context.values.push(owned);
+ if (!typed_delta_reconcile_retained_control(context))
+ {
+  (void)context.values.pop()!!;
+  alloc::free(context.allocator, owned);
+  return null;
+ }
  return owned;
 }
 fn bool typed_delta_is_effect(TypedDeltaValue* value) @private
@@ -1776,7 +1863,14 @@ fn TypedDeltaBinding[] typed_delta_environment(
   context.allocator, TypedDeltaBinding, (sz)count
  );
  foreach (index, binding : base.bindings) bindings[index] = binding;
+ typed_delta_begin_retained_control(context, (usz)usz::size);
  context.environments.push(bindings);
+ if (!typed_delta_reconcile_retained_control(context))
+ {
+  (void)context.environments.pop()!!;
+  alloc::free(context.allocator, bindings);
+  return { };
+ }
  return bindings;
 }
 fn TypedDeltaValue* typed_delta_lookup(
@@ -2669,6 +2763,100 @@ fn TypedDeltaValue* typed_delta_match_value(
 	);
 }
 
+fn usz typed_delta_external_lane_index_capacity(usz count) @private
+{
+ if (!count || count > (usz::max - 1) / 2) return 0;
+ usz required = count * 2 + 1;
+ usz capacity = 1;
+ while (capacity < required)
+ {
+  if (capacity > usz::max / 2) return 0;
+  capacity *= 2;
+ }
+ return capacity;
+}
+
+fn ulong typed_delta_external_lane_hash(
+ usz source_order,
+ ulong replay_lineage
+) @private
+{
+ ulong hash = 1469598103934665603UL;
+ hash ^= (ulong)source_order;
+ hash *= 1099511628211UL;
+ hash ^= replay_lineage;
+ hash *= 1099511628211UL;
+ return hash;
+}
+
+fn bool typed_delta_external_lane_index_add(
+ usz[] buckets,
+ List{TypedDeltaExternalLane}* lanes,
+ usz lane_index
+) @private
+{
+ TypedDeltaExternalLane* lane = &(*lanes)[(sz)lane_index];
+ usz bucket = (usz)(typed_delta_external_lane_hash(
+  lane.source_order, lane.replay_lineage
+ ) % (ulong)buckets.len);
+ for (usz probe = 0; probe < buckets.len; probe++)
+ {
+  if (!buckets[bucket])
+  {
+   buckets[bucket] = lane_index + 1;
+   return true;
+  }
+  bucket++;
+  if (bucket == buckets.len) bucket = 0;
+ }
+ return false;
+}
+
+fn bool typed_delta_external_lane_index_ensure(
+ TypedDeltaContext* owner,
+ usz count
+) @private
+{
+ if (owner.external_lane_buckets.len
+  && count <= owner.external_lane_buckets.len / 2) return true;
+ usz capacity = typed_delta_external_lane_index_capacity(count);
+ if (!capacity || capacity > (usz)sz::max / (usz)usz::size)
+ {
+  typed_delta_fail(owner, "external effect replay lane index exceeds its resource bound");
+  return false;
+ }
+ usz bytes = capacity * (usz)usz::size;
+ if (!typed_delta_charge(owner, bytes)) return false;
+ typed_delta_begin_retained_control(owner, bytes);
+ Allocator control_allocator = owner.owned_program
+  ? (Allocator)&owner.program_allocator : owner.allocator;
+ usz[] buckets = alloc::new_array(
+  control_allocator, usz, (sz)capacity
+ );
+ foreach (&bucket : buckets) *bucket = 0;
+ for (usz lane_index = 0;
+  lane_index < (usz)owner.external_lanes.len();
+  lane_index++)
+ {
+  if (!typed_delta_external_lane_index_add(
+   buckets, &owner.external_lanes, lane_index
+  ))
+  {
+   alloc::free(control_allocator, buckets);
+   (void)typed_delta_reconcile_retained_control(owner);
+   if (!owner.owned_program) typed_delta_uncharge(owner, bytes);
+   typed_delta_fail(owner, "external effect replay lane index exceeds its resource bound");
+   return false;
+  }
+ }
+ usz old_bytes = owner.external_lane_buckets.len * (usz)usz::size;
+ alloc::free(control_allocator, owner.external_lane_buckets);
+ owner.external_lane_buckets = buckets;
+ if (!typed_delta_reconcile_retained_control(owner)) return false;
+ if (!owner.owned_program) typed_delta_uncharge(owner, old_bytes);
+ return true;
+}
+
 fn TypedDeltaExternalLane* typed_delta_external_lane(
  TypedDeltaContext* context,
  usz source_order,
@@ -2686,18 +2874,43 @@ fn TypedDeltaExternalLane* typed_delta_external_lane(
   if (cached.source_order == source_order
    && cached.replay_lineage == replay_lineage) return cached;
  }
- foreach (index, &lane : owner.external_lanes)
+ if (owner.external_lane_buckets.len)
  {
-  if (lane.source_order != source_order
-   || lane.replay_lineage != replay_lineage) continue;
-  context.external_lane_index = (usz)index;
-  context.external_lane_cached = true;
-  return lane;
+  usz capacity = owner.external_lane_buckets.len;
+  usz bucket = (usz)(typed_delta_external_lane_hash(
+   source_order, replay_lineage
+  ) % (ulong)capacity);
+  for (usz probe = 0; probe < capacity; probe++)
+  {
+   usz stored = owner.external_lane_buckets[bucket];
+   if (!stored) break;
+   usz lane_index = stored - 1;
+   assert(
+    lane_index < (usz)owner.external_lanes.len(),
+    "typed Delta external lane index is inconsistent"
+   );
+   TypedDeltaExternalLane* lane = &owner.external_lanes[(sz)lane_index];
+   if (lane.source_order == source_order
+    && lane.replay_lineage == replay_lineage)
+   {
+    context.external_lane_index = lane_index;
+    context.external_lane_cached = true;
+    return lane;
+   }
+   bucket++;
+   if (bucket == capacity) bucket = 0;
+  }
  }
  if (!create) return null;
+ usz lane_index = (usz)owner.external_lanes.len();
+ if (lane_index == usz::max
+  || !typed_delta_external_lane_index_ensure(owner, lane_index + 1)) return null;
  if (!typed_delta_charge(
   owner, (usz)TypedDeltaExternalLane::size + (usz)usz::size
  )) return null;
+ typed_delta_begin_retained_control(
+  owner, (usz)TypedDeltaExternalLane::size + (usz)usz::size
+ );
  TypedDeltaExternalLane lane = {
   .source_order = source_order,
   .replay_lineage = replay_lineage,
@@ -2706,9 +2919,14 @@ fn TypedDeltaExternalLane* typed_delta_external_lane(
   ? (Allocator)&owner.program_allocator : owner.allocator;
  lane.results.init(control_allocator);
  owner.external_lanes.push(lane);
- context.external_lane_index = (usz)owner.external_lanes.len() - 1;
+ if (!typed_delta_reconcile_retained_control(owner)) return null;
+ bool indexed = typed_delta_external_lane_index_add(
+  owner.external_lane_buckets, &owner.external_lanes, lane_index
+ );
+ assert(indexed, "typed Delta external lane index capacity is inconsistent");
+ context.external_lane_index = lane_index;
  context.external_lane_cached = true;
- return &owner.external_lanes[(sz)context.external_lane_index];
+ return &owner.external_lanes[(sz)lane_index];
 }
 
 fn TypedDeltaExternalResult* typed_delta_external_slot(
@@ -2767,10 +2985,14 @@ fn TypedDeltaExternalResult* typed_delta_external_slot(
  if (!typed_delta_charge(
   owner, (usz)TypedDeltaExternalResult::size + (usz)usz::size
  )) return null;
+ typed_delta_begin_retained_control(
+  owner, (usz)TypedDeltaExternalResult::size + (usz)usz::size
+ );
  lane.results.push({
   .occurrence_order = occurrence_order,
   .hole = hole,
  });
+ if (!typed_delta_reconcile_retained_control(owner)) return null;
  if (created) *created = true;
  return &lane.results[(sz)count];
 }
@@ -3910,12 +4132,27 @@ fn void typed_delta_adopt_child(
  TypedDeltaContext* child
 ) @private
 {
- foreach (value : child.values) parent.values.push(value);
- child.values.free();
- foreach (environment : child.environments) parent.environments.push(environment);
- child.environments.free();
- child.external_lanes.free();
  parent.owned_bytes += child.owned_bytes;
+ usz child_value_index_bytes = (usz)child.values.len() * (usz)usz::size;
+ foreach (value : child.values)
+ {
+  if (!parent.failed) typed_delta_begin_retained_control(parent, 0);
+  parent.values.push(value);
+  if (!parent.failed) (void)typed_delta_reconcile_retained_control(parent);
+ }
+ child.values.free();
+ typed_delta_uncharge(parent, child_value_index_bytes);
+ usz child_environment_index_bytes =
+  (usz)child.environments.len() * (usz)usz::size;
+ foreach (environment : child.environments)
+ {
+  if (!parent.failed) typed_delta_begin_retained_control(parent, 0);
+  parent.environments.push(environment);
+  if (!parent.failed) (void)typed_delta_reconcile_retained_control(parent);
+ }
+ child.environments.free();
+ typed_delta_uncharge(parent, child_environment_index_bytes);
+ child.external_lanes.free();
  parent.value_count += child.value_count;
  parent.environment_count += child.environment_count;
  parent.storage_payload_bytes += child.storage_payload_bytes;
@@ -4989,6 +5226,10 @@ fn void typed_delta_context_free(TypedDeltaContext* context) @private
  if (context.external_owner == context)
  {
   foreach (&lane : context.external_lanes) lane.results.free();
+  Allocator control_allocator = context.owned_program
+   ? (Allocator)&context.program_allocator : context.allocator;
+  alloc::free(control_allocator, context.external_lane_buckets);
+  context.external_lane_buckets = { };
  }
  context.external_lanes.free();
 	if (context.owns_storage) context.local_storage.free();
@@ -5065,13 +5306,15 @@ fn bool typed_delta_preflight_roots(
   return false;
  }
  usz seen_bytes = program.image.nodes.len + 1;
+ // The preflight bitmap remains live, but each temporary Net is freed before
+ // the next distinct root is materialized.
  char[] seen = alloc::new_array(
   allocator, char, (sz)seen_bytes
  );
  defer alloc::free(allocator, seen);
  foreach (&entry : seen) *entry = 0;
  usz materialization_work = 0;
- usz materialization_bytes = seen_bytes;
+ usz root_live_bytes = seen_bytes;
  mitos::DeltaNodeId root = program.entry;
  if ((usz)root <= program.image.nodes.len) seen[(usz)root] = 1;
  (*root_count)++;
@@ -5079,7 +5322,7 @@ fn bool typed_delta_preflight_roots(
   program,
   root,
   &materialization_work,
-  &materialization_bytes,
+  &root_live_bytes,
   allocator,
   diagnostic
  )) return false;
@@ -5089,11 +5332,12 @@ fn bool typed_delta_preflight_roots(
   if ((usz)root <= program.image.nodes.len && seen[(usz)root]) continue;
   if ((usz)root <= program.image.nodes.len) seen[(usz)root] = 1;
   (*root_count)++;
+  root_live_bytes = seen_bytes;
   if (!typed_delta_materialize_root(
    program,
    root,
    &materialization_work,
-   &materialization_bytes,
+   &root_live_bytes,
    allocator,
    diagnostic
   )) return false;
@@ -5262,16 +5506,7 @@ fn bool typed_delta_charge_retained_state(
 	TypedDeltaContext* context
 ) @private
 {
-	if (context.program_allocator.overflowed
-		|| context.program_allocator.live_bytes < context.accounted_program_bytes)
-	{
-		typed_delta_fail(context, "typed Delta program-clone byte accounting failed");
-		return false;
-	}
-	usz program_delta =
-		context.program_allocator.live_bytes - context.accounted_program_bytes;
-	if (program_delta && !typed_delta_charge(context, program_delta)) return false;
-	context.accounted_program_bytes = context.program_allocator.live_bytes;
+ if (!typed_delta_reconcile_retained_control(context)) return false;
 
 	usz storage_bytes = 0;
 	mitos_storage::StorageError measured = mitos_storage::retained_bytes(
@@ -5639,6 +5874,7 @@ fn TypedDeltaExecutionResult run_typed_delta_program(
   context.program = owned_program;
   context.owned_program = owned_program;
   context.accounted_program_bytes = context.program_allocator.live_bytes;
+  context.program_allocator.peak_bytes = context.program_allocator.live_bytes;
   if (context.program_allocator.overflowed
    || !typed_delta_charge(context, (usz)TypedDeltaContext::size)
    || !typed_delta_charge(context, context.accounted_program_bytes)

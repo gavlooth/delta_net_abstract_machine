@@ -494,6 +494,31 @@ struct DeltaValueProvenance
 	bool uncertain_constructor;
 }
 
+struct DeltaApplyProvenanceSummary
+{
+	bool seen;
+	DeltaNodeId first_lambda;
+	DeltaNodeId second_lambda;
+	bool many;
+	bool has_effectful_closure;
+	bool uncertain_closure;
+	bool uncertain_effectful_closure;
+}
+
+struct DeltaApplyProvenanceResult
+{
+	Allocator allocator;
+	DeltaApplyProvenanceSummary[] by_node;
+	bool failed_closed;
+}
+
+fn void DeltaApplyProvenanceResult.deinit(&self)
+{
+	if (!self.allocator) return;
+	alloc::free(self.allocator, self.by_node);
+	*self = { };
+}
+
 struct DeltaClosureBinding
 {
 	DeltaClosureBinding* parent;
@@ -554,6 +579,7 @@ struct DeltaProvenanceContext
 	char[] root_active;
 	char[] memo_state;
 	DeltaValueProvenance[] memo_values;
+	DeltaApplyProvenanceSummary[] apply_summaries;
 }
 
 fn bool delta_effect_row_has_effects(ResolvedEffectRow* row)
@@ -775,6 +801,49 @@ fn void delta_note_merged_closure_provenance(
 		|| value.uncertain_effectful_closure)
 	{
 		context.dynamic_effectful_closure = true;
+	}
+}
+
+fn void delta_note_apply_provenance(
+	DeltaProvenanceContext* context,
+	DeltaNodeId application,
+	DeltaValueProvenance callee
+)
+{
+	if (!context || !application
+		|| (usz)application > context.apply_summaries.len) return;
+	DeltaApplyProvenanceSummary* summary =
+		&context.apply_summaries[(usz)application - 1];
+	summary.seen = true;
+	summary.many = summary.many || callee.closure_many
+		|| callee.second_closure.lambda != DELTA_NODE_INVALID;
+	summary.has_effectful_closure =
+		summary.has_effectful_closure || callee.has_effectful_closure;
+	summary.uncertain_closure =
+		summary.uncertain_closure || callee.uncertain_closure;
+	summary.uncertain_effectful_closure =
+		summary.uncertain_effectful_closure
+		|| callee.uncertain_effectful_closure;
+	DeltaNodeId[2] candidates = {
+		callee.first_closure.lambda,
+		callee.second_closure.lambda,
+	};
+	foreach (candidate : candidates)
+	{
+		if (!candidate || candidate == summary.first_lambda
+			|| candidate == summary.second_lambda) continue;
+		if (!summary.first_lambda)
+		{
+			summary.first_lambda = candidate;
+		}
+		else if (!summary.second_lambda)
+		{
+			summary.second_lambda = candidate;
+		}
+		else
+		{
+			summary.many = true;
+		}
 	}
 }
 
@@ -1767,6 +1836,7 @@ fn DeltaValueProvenance delta_analyze_provenance_body(
 			DeltaValueProvenance callee = delta_analyze_provenance(
 				context, node.inputs[0], bindings
 			);
+			delta_note_apply_provenance(context, node_id, callee);
 			if (callee.suspended_request_path)
 			{
 				result.suspended_request_path = true;
@@ -2240,6 +2310,56 @@ fn bool delta_program_requires_dynamic_effect_closures(
 	alloc::free(allocator, context.memo_state);
 	alloc::free(allocator, context.memo_values);
 	return required;
+}
+
+fn DeltaApplyProvenanceResult delta_program_apply_provenance(
+	DeltaProgram* program,
+	Allocator allocator = mem
+)
+{
+	DeltaApplyProvenanceResult result = { .allocator = allocator };
+	if (!program || !program.entry || !program.image.nodes.len) return result;
+	result.by_node = alloc::new_array(
+		allocator, DeltaApplyProvenanceSummary, (sz)program.image.nodes.len
+	);
+	foreach (&summary : result.by_node) *summary = { };
+	DeltaProvenanceContext context = {
+		.program = program,
+		.allocator = allocator,
+		.work_limit = delta_provenance_work_limit(program),
+		.apply_summaries = result.by_node,
+	};
+	context.binding_sets.init(allocator);
+	context.active.init(allocator);
+	context.root_active = alloc::new_array(
+		allocator, char, (sz)program.method_roots.len
+	);
+	context.memo_state = alloc::new_array(
+		allocator, char, (sz)program.image.nodes.len
+	);
+	context.memo_values = alloc::new_array(
+		allocator, DeltaValueProvenance, (sz)program.image.nodes.len
+	);
+	foreach (&state : context.root_active) *state = 0;
+	foreach (&state : context.memo_state) *state = 0;
+	foreach (&value : context.memo_values) *value = { };
+
+	DeltaValueProvenance entry = delta_analyze_provenance(
+		&context, program.entry, null
+	);
+	delta_note_merged_closure_provenance(&context, entry);
+	result.failed_closed = context.failed_closed;
+
+	foreach (set : context.binding_sets)
+	{
+		alloc::free(allocator, set);
+	}
+	context.binding_sets.free();
+	context.active.free();
+	alloc::free(allocator, context.root_active);
+	alloc::free(allocator, context.memo_state);
+	alloc::free(allocator, context.memo_values);
+	return result;
 }
 
 fn DeltaFeatureBits delta_program_semantic_features(DeltaProgram* program)

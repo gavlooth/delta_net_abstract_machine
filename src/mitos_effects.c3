@@ -1337,13 +1337,238 @@ struct EffectCallIndex
 	ModuleKey* caller_module;
 	List{EffectCallGroup} groups;
 	sz[] buckets;
+	Program* program;
+}
+
+struct EffectLexicalScope
+{
+	EffectLexicalScope* parent;
+	String[] names;
+	SurfaceExpr*[] closures;
+	EffectLexicalScope*[] closure_scopes;
+	ParallelBinding[] parallel_bindings;
+	SurfaceExpr*[] values;
+	EffectLexicalScope*[] value_scopes;
+	EffectLexicalScope* value_default_scope;
+	SurfaceExpr* pattern_scrutinee;
+	String pattern_constructor;
+	EffectLexicalScope* pattern_scope;
+	EffectCallIndex* calls;
+	usz function_index_plus_one;
+	String handler_effect_name;
+	String handler_operation_name;
 }
 
 struct EffectInferenceWork
 {
+	Allocator allocator;
+	List{EffectLexicalScope*} scopes;
 	usz used;
 	usz max;
 	bool exhausted;
+}
+
+fn EffectCallIndex* effect_scope_call_index(
+	EffectLexicalScope* scope,
+	EffectInferenceWork* work
+) @private
+{
+	for (EffectLexicalScope* current = scope; current; current = current.parent)
+	{
+		if (!effect_charge(work)) return null;
+		if (current.calls) return current.calls;
+	}
+	return null;
+}
+
+
+fn bool effect_lexical_lookup(
+	EffectLexicalScope* scope,
+	String name,
+	EffectInferenceWork* work,
+	SurfaceExpr** closure = null,
+	EffectLexicalScope** closure_scope = null,
+	SurfaceExpr** value = null,
+	EffectLexicalScope** value_scope = null,
+	bool* unresolved_producer = null
+) @private
+{
+	for (EffectLexicalScope* current = scope; current; current = current.parent)
+	{
+		if (!effect_charge(work)) return false;
+		foreach (index, candidate : current.names)
+		{
+			if (!effect_charge(work)) return false;
+			if (candidate != name) continue;
+			SurfaceExpr* resolved_value = index < current.values.len
+				? current.values[index] : null;
+			EffectLexicalScope* resolved_value_scope =
+				index < current.value_scopes.len
+					? current.value_scopes[index] : current.value_default_scope;
+			if (!resolved_value && current.pattern_scrutinee)
+			{
+				EffectCallIndex* calls = effect_scope_call_index(
+					current.pattern_scope, work
+				);
+				if (calls)
+				{
+					(void)effect_resolve_pattern_value(
+						calls, current.pattern_scrutinee, current.pattern_scope,
+						current.pattern_constructor, (usz)index, &resolved_value,
+						&resolved_value_scope, work, 0
+					);
+				}
+			}
+			if (closure)
+			{
+				*closure = index < current.closures.len ? current.closures[index] : null;
+			}
+			if (closure_scope)
+			{
+				*closure_scope = index < current.closure_scopes.len
+					? current.closure_scopes[index] : resolved_value_scope;
+			}
+			if (value) *value = resolved_value;
+			if (value_scope) *value_scope = resolved_value_scope;
+			if (unresolved_producer)
+			{
+				*unresolved_producer = current.pattern_scrutinee && !resolved_value;
+			}
+			return true;
+		}
+		foreach (&binding : current.parallel_bindings)
+		{
+			if (!effect_charge(work)) return false;
+			if (binding.name != name) continue;
+			SurfaceExpr* resolved_closure = null;
+			EffectLexicalScope* resolved_scope = current.parent;
+			if (binding.value && binding.value.kind == SURFACE_LAMBDA)
+			{
+				resolved_closure = binding.value;
+			}
+			else if (binding.value && binding.value.kind == SURFACE_VARIABLE)
+			{
+				(void)effect_lexical_lookup(
+					current.parent, binding.value.data.variable.name, work,
+					&resolved_closure, &resolved_scope
+				);
+			}
+			if (closure) *closure = resolved_closure;
+			if (closure_scope) *closure_scope = resolved_scope;
+			if (value) *value = binding.value;
+			if (value_scope) *value_scope = current.parent;
+			if (unresolved_producer) *unresolved_producer = false;
+			return true;
+		}
+	}
+	return false;
+}
+
+fn bool effect_lexical_origin(
+	EffectLexicalScope* scope,
+	String name,
+	EffectInferenceWork* work,
+	usz* function_index,
+	usz* parameter_index,
+	String* effect_name,
+	String* operation_name
+) @private
+{
+	for (EffectLexicalScope* current = scope; current; current = current.parent)
+	{
+		if (!effect_charge(work)) return false;
+		foreach (index, candidate : current.names)
+		{
+			if (!effect_charge(work)) return false;
+			if (candidate != name) continue;
+			if (current.function_index_plus_one)
+			{
+				*function_index = current.function_index_plus_one - 1;
+				*parameter_index = (usz)index;
+				return true;
+			}
+			if (current.handler_effect_name.len && current.handler_operation_name.len)
+			{
+				*parameter_index = (usz)index;
+				*effect_name = current.handler_effect_name;
+				*operation_name = current.handler_operation_name;
+				return true;
+			}
+			return false;
+		}
+		foreach (&binding : current.parallel_bindings)
+		{
+			if (!effect_charge(work)) return false;
+			if (binding.name == name) return false;
+		}
+	}
+	return false;
+}
+
+fn bool effect_lexical_is_bound(
+	EffectLexicalScope* scope,
+	String name,
+	EffectInferenceWork* work
+) @private
+{
+	for (EffectLexicalScope* current = scope; current; current = current.parent)
+	{
+		if (!effect_charge(work)) return false;
+		foreach (candidate : current.names)
+		{
+			if (!effect_charge(work)) return false;
+			if (candidate == name) return true;
+		}
+		foreach (&binding : current.parallel_bindings)
+		{
+			if (!effect_charge(work)) return false;
+			if (binding.name == name) return true;
+		}
+	}
+	return false;
+}
+
+
+fn void effect_follow_callable_alias(
+	SurfaceExpr** callable,
+	EffectLexicalScope** callable_scope,
+	bool* lexical,
+	String* callable_name,
+	EffectInferenceWork* work,
+	usz depth
+) @private
+{
+	for (usz step = depth; *lexical && *callable
+		&& (*callable).kind == SURFACE_VARIABLE
+		&& step < MITOS_MAX_TYPE_FORMAT_DEPTH; step++)
+	{
+		String candidate_name = (*callable).data.variable.name;
+		SurfaceExpr* nested_closure = null;
+		EffectLexicalScope* nested_closure_scope = *callable_scope;
+		SurfaceExpr* nested_value = null;
+		EffectLexicalScope* nested_value_scope = *callable_scope;
+		if (!effect_lexical_lookup(
+			*callable_scope, candidate_name, work,
+			&nested_closure, &nested_closure_scope,
+			&nested_value, &nested_value_scope
+		))
+		{
+			if (!work.exhausted)
+			{
+				*callable_name = candidate_name;
+				*callable = null;
+				*lexical = false;
+			}
+			return;
+		}
+		SurfaceExpr* next = nested_closure ? nested_closure : nested_value;
+		EffectLexicalScope* next_scope = nested_closure
+			? nested_closure_scope : nested_value_scope;
+		if (!next
+			|| (next == *callable && next_scope == *callable_scope)) return;
+		*callable = next;
+		*callable_scope = next_scope;
+	}
 }
 
 fn ulong effect_call_hash(ModuleKey* owner, String name, usz arity) @private
@@ -1394,9 +1619,291 @@ fn EffectCallGroup* effect_call_group(EffectCallIndex* index, String name, usz a
 fn void EffectCallIndex.deinit(&self)
 {
 	foreach (&group : self.groups) group.targets.free();
+
 	self.groups.free();
 	alloc::free(self.allocator, self.buckets);
 	*self = { };
+}
+fn bool effect_resolve_pattern_value(
+	EffectCallIndex* calls,
+	SurfaceExpr* producer,
+	EffectLexicalScope* scope,
+	String constructor,
+	usz field_index,
+	SurfaceExpr** result,
+	EffectLexicalScope** result_scope,
+	EffectInferenceWork* work,
+	usz depth
+) @private
+{
+	if (!producer || depth >= MITOS_MAX_TYPE_FORMAT_DEPTH
+		|| !effect_charge(work)) return false;
+	switch (producer.kind)
+	{
+		case SURFACE_VARIABLE:
+			SurfaceExpr* value = null;
+			EffectLexicalScope* value_scope = scope;
+			if (!effect_lexical_lookup(
+				scope, producer.data.variable.name, work,
+				null, null, &value, &value_scope
+			) || !value || value == producer) return false;
+			return effect_resolve_pattern_value(
+				calls, value, value_scope, constructor, field_index,
+				result, result_scope, work, depth + 1
+			);
+		case SURFACE_APPLICATION:
+			ApplicationExpr* application = &producer.data.application;
+			bool constructor_call = application.callee
+				&& application.callee.kind == SURFACE_VARIABLE
+				&& application.callee.data.variable.name == constructor;
+			bool constructor_shadowed = constructor_call
+				&& effect_lexical_is_bound(scope, constructor, work);
+			if (work.exhausted) return false;
+			if (constructor_call && !constructor_shadowed
+				&& field_index < application.arguments.len)
+			{
+				SurfaceExpr* selected = application.arguments[field_index];
+				EffectLexicalScope* selected_scope = scope;
+				for (usz selected_depth = depth + 1;
+					selected && selected_depth < MITOS_MAX_TYPE_FORMAT_DEPTH;
+					selected_depth++)
+				{
+					if (selected.kind != SURFACE_VARIABLE) break;
+					SurfaceExpr* nested = null;
+					EffectLexicalScope* nested_scope = selected_scope;
+					if (!effect_lexical_lookup(
+						selected_scope, selected.data.variable.name, work,
+						null, null, &nested, &nested_scope
+					) || !nested || nested == selected) break;
+					selected = nested;
+					selected_scope = nested_scope;
+				}
+				if (!selected) return false;
+				*result = selected;
+				*result_scope = selected_scope;
+				return true;
+			}
+			SurfaceExpr* callable = null;
+			EffectLexicalScope* callable_scope = scope;
+			bool lexical = false;
+			String callable_name;
+			if (application.callee && application.callee.kind == SURFACE_LAMBDA)
+			{
+				callable = application.callee;
+				lexical = true;
+			}
+			else if (application.callee && application.callee.kind == SURFACE_VARIABLE)
+			{
+				callable_name = application.callee.data.variable.name;
+				SurfaceExpr* callable_value = null;
+				EffectLexicalScope* callable_value_scope = scope;
+				lexical = effect_lexical_lookup(
+					scope, application.callee.data.variable.name, work,
+					&callable, &callable_scope, &callable_value, &callable_value_scope
+				);
+				if (lexical && !callable)
+				{
+					callable = callable_value;
+					callable_scope = callable_value_scope;
+				}
+				effect_follow_callable_alias(
+					&callable, &callable_scope, &lexical, &callable_name,
+					work, 0
+				);
+				if (work.exhausted) return false;
+			}
+			if (lexical && callable && callable.kind == SURFACE_LAMBDA)
+			{
+				EffectLexicalScope invocation_value = {
+					.parent = callable_scope,
+					.names = callable.data.lambda.parameters,
+					.values = application.arguments,
+					.value_default_scope = scope,
+					.calls = calls,
+				};
+				EffectLexicalScope* invocation_scope = effect_work_scope(
+					work, &invocation_value
+				);
+				if (!invocation_scope) return false;
+				return effect_resolve_pattern_value(
+					calls, callable.data.lambda.body, invocation_scope,
+					constructor, field_index, result, result_scope, work, depth + 1
+				);
+			}
+			if (lexical) return false;
+			EffectCallGroup* group = callable_name.len
+				? effect_call_group(
+					calls, callable_name, application.arguments.len
+				) : null;
+			if (!group) return false;
+			SurfaceExpr* resolved = null;
+			EffectLexicalScope* resolved_scope = null;
+			bool found = false;
+			foreach (target : group.targets)
+			{
+				if (!effect_charge(work)) return false;
+				if (target >= calls.program.functions.len) continue;
+				FunctionDecl* function = &calls.program.functions[target];
+				EffectLexicalScope function_value = {
+					.names = function.parameters,
+					.values = application.arguments,
+					.value_default_scope = scope,
+					.calls = calls,
+				};
+				EffectLexicalScope* function_scope = effect_work_scope(
+					work, &function_value
+				);
+				if (!function_scope) return false;
+				SurfaceExpr* candidate = null;
+				EffectLexicalScope* candidate_scope = null;
+				if (!effect_resolve_pattern_value(
+					calls, function.body, function_scope, constructor, field_index,
+					&candidate, &candidate_scope, work, depth + 1
+				)) return false;
+				if (found && (candidate != resolved || candidate_scope != resolved_scope))
+				{
+					return false;
+				}
+				resolved = candidate;
+				resolved_scope = candidate_scope;
+				found = true;
+			}
+			if (!found) return false;
+			*result = resolved;
+			*result_scope = resolved_scope;
+			return true;
+		case SURFACE_DEFINITION:
+			String[1] definition_name = { producer.data.definition.name };
+			SurfaceExpr*[1] definition_value = { producer.data.definition.value };
+			EffectLexicalScope definition_prototype = {
+				.parent = scope,
+				.names = definition_name[..],
+				.values = definition_value[..],
+				.value_default_scope = scope,
+				.calls = calls,
+			};
+			EffectLexicalScope* definition_scope = effect_work_scope(
+				work, &definition_prototype
+			);
+			if (!definition_scope) return false;
+			return effect_resolve_pattern_value(
+				calls, producer.data.definition.body, definition_scope,
+				constructor, field_index, result, result_scope, work, depth + 1
+			);
+		case SURFACE_MATCH:
+			SurfaceExpr* resolved = null;
+			EffectLexicalScope* resolved_scope = null;
+			bool found = false;
+			foreach (&arm : producer.data.match_expr.arms)
+			{
+				if (!effect_charge(work)) return false;
+				EffectLexicalScope arm_value = {
+					.parent = scope,
+					.names = arm.pattern.bindings,
+					.pattern_scrutinee = producer.data.match_expr.scrutinee,
+					.pattern_constructor = arm.pattern.constructor,
+					.pattern_scope = scope,
+					.calls = calls,
+				};
+				EffectLexicalScope* arm_scope = effect_work_scope(work, &arm_value);
+				if (!arm_scope) return false;
+				SurfaceExpr* candidate = null;
+				EffectLexicalScope* candidate_scope = null;
+				if (!effect_resolve_pattern_value(
+					calls, arm.body, arm_scope, constructor, field_index,
+					&candidate, &candidate_scope, work, depth + 1
+				)) return false;
+				if (found && (candidate != resolved || candidate_scope != resolved_scope))
+				{
+					return false;
+				}
+				resolved = candidate;
+				resolved_scope = candidate_scope;
+				found = true;
+			}
+			if (!found) return false;
+			*result = resolved;
+			*result_scope = resolved_scope;
+			return true;
+		case SURFACE_PARALLEL:
+			EffectLexicalScope parallel_value = {
+				.parent = scope,
+				.parallel_bindings = producer.data.parallel.bindings,
+				.calls = calls,
+			};
+			EffectLexicalScope* parallel_scope = effect_work_scope(
+				work, &parallel_value
+			);
+			if (!parallel_scope) return false;
+			return effect_resolve_pattern_value(
+				calls, producer.data.parallel.result, parallel_scope,
+				constructor, field_index, result, result_scope, work, depth + 1
+			);
+		case SURFACE_RESUME:
+			return effect_resolve_pattern_value(
+				calls, producer.data.resume.value, scope, constructor, field_index,
+				result, result_scope, work, depth + 1
+			);
+		case SURFACE_HANDLER:
+			SurfaceExpr* resolved = null;
+			EffectLexicalScope* resolved_scope = null;
+			bool found = false;
+			foreach (&clause : producer.data.handler.clauses)
+			{
+				if (!effect_charge(work)) return false;
+				EffectLexicalScope clause_value = {
+					.parent = scope,
+					.names = clause.parameters,
+					.calls = calls,
+				};
+				EffectLexicalScope* clause_scope = effect_work_scope(
+					work, &clause_value
+				);
+				if (!clause_scope) return false;
+				SurfaceExpr* candidate = null;
+				EffectLexicalScope* candidate_scope = null;
+				if (!effect_resolve_pattern_value(
+					calls, clause.body, clause_scope, constructor, field_index,
+					&candidate, &candidate_scope, work, depth + 1
+				)) return false;
+				if (found && (candidate != resolved || candidate_scope != resolved_scope))
+				{
+					return false;
+				}
+				resolved = candidate;
+				resolved_scope = candidate_scope;
+				found = true;
+			}
+			String[1] return_name = { producer.data.handler.return_clause.parameter };
+			SurfaceExpr*[1] return_value = { producer.data.handler.handled };
+			EffectLexicalScope return_value_scope = {
+				.parent = scope,
+				.names = return_name[..],
+				.values = return_value[..],
+				.value_default_scope = scope,
+				.calls = calls,
+			};
+			EffectLexicalScope* return_scope = effect_work_scope(
+				work, &return_value_scope
+			);
+			if (!return_scope) return false;
+			SurfaceExpr* candidate = null;
+			EffectLexicalScope* candidate_scope = null;
+			if (!effect_resolve_pattern_value(
+				calls, producer.data.handler.return_clause.body, return_scope,
+				constructor, field_index, &candidate, &candidate_scope,
+				work, depth + 1
+			)) return false;
+			if (found && (candidate != resolved || candidate_scope != resolved_scope))
+			{
+				return false;
+			}
+			*result = candidate;
+			*result_scope = candidate_scope;
+			return true;
+		default:
+			return false;
+	}
 }
 
 fn EffectCallIndex build_effect_call_index(
@@ -1408,6 +1915,7 @@ fn EffectCallIndex build_effect_call_index(
 	EffectCallIndex index = {
 		.allocator = allocator,
 		.caller_module = &program.module_key,
+		.program = program,
 	};
 	index.groups.init(allocator);
 	index.buckets = alloc::new_array(
@@ -1466,6 +1974,232 @@ fn bool effect_charge(EffectInferenceWork* work, usz amount = 1) @private
 	return true;
 }
 
+fn EffectLexicalScope* effect_work_scope(
+	EffectInferenceWork* work,
+	EffectLexicalScope* prototype
+) @private
+{
+	if (!effect_charge(work)
+		|| !effect_charge(work, prototype.names.len)
+		|| !effect_charge(work, prototype.closures.len)
+		|| !effect_charge(work, prototype.closure_scopes.len)
+		|| !effect_charge(work, prototype.parallel_bindings.len)
+		|| !effect_charge(work, prototype.values.len)
+		|| !effect_charge(work, prototype.value_scopes.len)) return null;
+	EffectLexicalScope* owned = alloc::new(
+		work.allocator, EffectLexicalScope, *prototype
+	);
+	owned.names = alloc::clone_slice(work.allocator, prototype.names);
+	owned.closures = alloc::clone_slice(work.allocator, prototype.closures);
+	owned.closure_scopes = alloc::clone_slice(
+		work.allocator, prototype.closure_scopes
+	);
+	owned.parallel_bindings = alloc::clone_slice(
+		work.allocator, prototype.parallel_bindings
+	);
+	owned.values = alloc::clone_slice(work.allocator, prototype.values);
+	owned.value_scopes = alloc::clone_slice(
+		work.allocator, prototype.value_scopes
+	);
+	work.scopes.push(owned);
+	return owned;
+}
+
+fn void effect_work_clear_scopes(EffectInferenceWork* work) @private
+{
+	foreach (scope : work.scopes)
+	{
+		alloc::free(work.allocator, scope.names);
+		alloc::free(work.allocator, scope.closures);
+		alloc::free(work.allocator, scope.closure_scopes);
+		alloc::free(work.allocator, scope.parallel_bindings);
+		alloc::free(work.allocator, scope.values);
+		alloc::free(work.allocator, scope.value_scopes);
+		alloc::free(work.allocator, scope);
+	}
+	work.scopes.clear();
+}
+
+fn bool effect_producer_contains_closure(
+	EffectCallIndex* calls,
+	SurfaceExpr* producer,
+	EffectLexicalScope* scope,
+	EffectInferenceWork* work,
+	usz depth
+) @private
+{
+	if (!producer || depth >= MITOS_MAX_TYPE_FORMAT_DEPTH || !effect_charge(work)) return false;
+	switch (producer.kind)
+	{
+		case SURFACE_LAMBDA:
+			return true;
+		case SURFACE_VARIABLE:
+			SurfaceExpr* closure = null;
+			EffectLexicalScope* closure_scope = scope;
+			SurfaceExpr* value = null;
+			EffectLexicalScope* value_scope = scope;
+			if (!effect_lexical_lookup(
+				scope, producer.data.variable.name, work,
+				&closure, &closure_scope, &value, &value_scope
+			)) return false;
+			return closure || effect_producer_contains_closure(
+				calls, value, value_scope, work, depth + 1
+			);
+		case SURFACE_APPLICATION:
+			ApplicationExpr* application = &producer.data.application;
+			SurfaceExpr* callable = null;
+			EffectLexicalScope* callable_scope = scope;
+			bool lexical = false;
+			String callable_name;
+			if (application.callee && application.callee.kind == SURFACE_LAMBDA)
+			{
+				callable = application.callee;
+				lexical = true;
+			}
+			else if (application.callee && application.callee.kind == SURFACE_VARIABLE)
+			{
+				callable_name = application.callee.data.variable.name;
+				SurfaceExpr* callable_value = null;
+				EffectLexicalScope* callable_value_scope = scope;
+				lexical = effect_lexical_lookup(
+					scope, callable_name, work,
+					&callable, &callable_scope, &callable_value, &callable_value_scope
+				);
+				if (lexical && !callable)
+				{
+					callable = callable_value;
+					callable_scope = callable_value_scope;
+				}
+				effect_follow_callable_alias(
+					&callable, &callable_scope, &lexical, &callable_name,
+					work, 0
+				);
+				if (work.exhausted) return false;
+			}
+			if (lexical && callable && callable.kind == SURFACE_LAMBDA)
+			{
+				EffectLexicalScope invocation_scope = {
+					.parent = callable_scope,
+					.names = callable.data.lambda.parameters,
+					.values = application.arguments,
+					.value_default_scope = scope,
+					.calls = calls,
+				};
+				return effect_producer_contains_closure(
+					calls, callable.data.lambda.body, &invocation_scope,
+					work, depth + 1
+				);
+			}
+			if (lexical) return callable && effect_producer_contains_closure(
+				calls, callable, callable_scope, work, depth + 1
+			);
+			if (!callable_name.len) return false;
+			if (callable_name == "superpose")
+			{
+				if (!application.arguments.len) return false;
+				foreach (alternative : application.arguments)
+				{
+					if (!effect_producer_contains_closure(
+						calls, alternative, scope, work, depth + 1
+					)) return false;
+				}
+				return true;
+			}
+			EffectCallGroup* group = effect_call_group(
+				calls, callable_name, application.arguments.len
+			);
+			if (!group || !group.targets.len()) return false;
+			foreach (target : group.targets)
+			{
+				if (!effect_charge(work)) return false;
+				if (target >= calls.program.functions.len) return false;
+				FunctionDecl* function = &calls.program.functions[target];
+				EffectLexicalScope function_scope = {
+					.names = function.parameters,
+					.values = application.arguments,
+					.value_default_scope = scope,
+					.calls = calls,
+				};
+				if (!effect_producer_contains_closure(
+					calls, function.body, &function_scope, work, depth + 1
+				)) return false;
+			}
+			return true;
+		case SURFACE_DEFINITION:
+			String[1] definition_name = { producer.data.definition.name };
+			SurfaceExpr*[1] definition_value = { producer.data.definition.value };
+			EffectLexicalScope definition_scope = {
+				.parent = scope,
+				.names = definition_name[..],
+				.values = definition_value[..],
+				.value_default_scope = scope,
+				.calls = calls,
+			};
+			return effect_producer_contains_closure(
+				calls, producer.data.definition.body, &definition_scope,
+				work, depth + 1
+			);
+		case SURFACE_MATCH:
+			if (!producer.data.match_expr.arms.len) return false;
+			foreach (&arm : producer.data.match_expr.arms)
+			{
+				EffectLexicalScope arm_scope = {
+					.parent = scope,
+					.names = arm.pattern.bindings,
+					.pattern_scrutinee = producer.data.match_expr.scrutinee,
+					.pattern_constructor = arm.pattern.constructor,
+					.pattern_scope = scope,
+					.calls = calls,
+				};
+				if (!effect_producer_contains_closure(
+					calls, arm.body, &arm_scope, work, depth + 1
+				)) return false;
+			}
+			return true;
+		case SURFACE_PARALLEL:
+			EffectLexicalScope parallel_scope = {
+				.parent = scope,
+				.parallel_bindings = producer.data.parallel.bindings,
+				.calls = calls,
+			};
+			return effect_producer_contains_closure(
+				calls, producer.data.parallel.result, &parallel_scope,
+				work, depth + 1
+			);
+		case SURFACE_RESUME:
+			return effect_producer_contains_closure(
+				calls, producer.data.resume.value, scope, work, depth + 1
+			);
+		case SURFACE_HANDLER:
+			foreach (&clause : producer.data.handler.clauses)
+			{
+				EffectLexicalScope clause_scope = {
+					.parent = scope,
+					.names = clause.parameters,
+					.calls = calls,
+				};
+				if (effect_producer_contains_closure(
+					calls, clause.body, &clause_scope, work, depth + 1
+				)) return true;
+			}
+			String[1] return_name = { producer.data.handler.return_clause.parameter };
+			SurfaceExpr*[1] return_value = { producer.data.handler.handled };
+			EffectLexicalScope return_scope = {
+				.parent = scope,
+				.names = return_name[..],
+				.values = return_value[..],
+				.value_default_scope = scope,
+				.calls = calls,
+			};
+			return effect_producer_contains_closure(
+				calls, producer.data.handler.return_clause.body, &return_scope,
+				work, depth + 1
+			);
+		default:
+			return false;
+	}
+}
+
 fn bool inferred_row_add(
 	List{EffectId}* row,
 	EffectId effect,
@@ -1499,10 +2233,537 @@ fn void inferred_row_tail(
 	}
 }
 
+fn bool collect_known_callable_producer(
+	EffectRegistry* registry,
+	EffectCallIndex* calls,
+	SurfaceExpr* producer,
+	EffectLexicalScope* scope,
+	List{EffectId}* row,
+	List{EffectId}[] current_rows,
+	SymbolKey*[] current_tails,
+	SymbolKey** tail,
+	List{MitosDiagnostic}* diagnostics,
+	Allocator allocator,
+	EffectInferenceWork* work,
+	usz depth
+) @private
+{
+	if (!producer || depth >= MITOS_MAX_TYPE_FORMAT_DEPTH) return false;
+	if (effect_producer_contains_closure(calls, producer, scope, work, depth + 1))
+	{
+		collect_callable_producer_effects(
+			registry, calls, producer, scope, row, current_rows, current_tails,
+			tail, diagnostics, allocator, work, depth + 1
+		);
+		return true;
+	}
+	if (producer.kind != SURFACE_VARIABLE) return false;
+	usz origin_function = usz::max;
+	usz origin_parameter = usz::max;
+	String origin_effect;
+	String origin_operation;
+	if (!effect_lexical_origin(
+		scope, producer.data.variable.name, work,
+		&origin_function, &origin_parameter, &origin_effect, &origin_operation
+	)) return false;
+	return collect_reachable_parameter_effects(
+		registry, calls, origin_function, origin_effect, origin_operation,
+		origin_parameter, row, current_rows, current_tails, tail, diagnostics,
+		allocator, work, depth + 1
+	);
+}
+
+
+fn void collect_reachable_callable_arguments(
+	EffectRegistry* registry,
+	EffectCallIndex* calls,
+	SurfaceExpr* expression,
+	EffectLexicalScope* scope,
+	usz target_function,
+	String target_effect,
+	String target_operation,
+	usz parameter_index,
+	List{EffectId}* row,
+	List{EffectId}[] current_rows,
+	SymbolKey*[] current_tails,
+	SymbolKey** tail,
+	List{MitosDiagnostic}* diagnostics,
+	Allocator allocator,
+	EffectInferenceWork* work,
+	bool* found,
+	usz depth
+) @private
+{
+	if (!expression || depth >= MITOS_MAX_TYPE_FORMAT_DEPTH || !effect_charge(work)) return;
+	switch (expression.kind)
+	{
+		case SURFACE_LAMBDA:
+			EffectLexicalScope lambda_scope = {
+				.parent = scope,
+				.names = expression.data.lambda.parameters,
+				.calls = calls,
+			};
+			collect_reachable_callable_arguments(
+				registry, calls, expression.data.lambda.body, &lambda_scope,
+				target_function, target_effect, target_operation, parameter_index,
+				row, current_rows, current_tails, tail, diagnostics, allocator,
+				work, found, depth + 1
+			);
+		case SURFACE_APPLICATION:
+			ApplicationExpr* application = &expression.data.application;
+			collect_reachable_callable_arguments(
+				registry, calls, application.callee, scope, target_function,
+				target_effect, target_operation, parameter_index, row, current_rows,
+				current_tails, tail, diagnostics, allocator, work, found, depth + 1
+			);
+			foreach (argument : application.arguments)
+			{
+				collect_reachable_callable_arguments(
+					registry, calls, argument, scope, target_function,
+					target_effect, target_operation, parameter_index, row, current_rows,
+					current_tails, tail, diagnostics, allocator, work, found, depth + 1
+				);
+			}
+			if (target_function != usz::max && application.callee
+				&& application.callee.kind == SURFACE_VARIABLE
+				&& !effect_lexical_is_bound(
+					scope, application.callee.data.variable.name, work
+				))
+			{
+				EffectCallGroup* group = effect_call_group(
+					calls, application.callee.data.variable.name,
+					application.arguments.len
+				);
+				bool targets_function = false;
+				if (group) foreach (target : group.targets)
+				{
+					if (!effect_charge(work)) return;
+					if (target == target_function)
+					{
+						targets_function = true;
+						break;
+					}
+				}
+				if (targets_function && parameter_index < application.arguments.len)
+				{
+					SurfaceExpr* argument = application.arguments[parameter_index];
+					if (collect_known_callable_producer(
+						registry, calls, argument, scope, row, current_rows,
+						current_tails, tail, diagnostics, allocator, work, depth + 1
+					)) *found = true;
+				}
+			}
+		case SURFACE_EFFECT_OPERATION:
+			foreach (argument : expression.data.effect_operation.arguments)
+			{
+				collect_reachable_callable_arguments(
+					registry, calls, argument, scope, target_function,
+					target_effect, target_operation, parameter_index, row, current_rows,
+					current_tails, tail, diagnostics, allocator, work, found, depth + 1
+				);
+			}
+			if (target_function == usz::max
+				&& expression.data.effect_operation.effect_name == target_effect
+				&& expression.data.effect_operation.operation_name == target_operation
+				&& parameter_index < expression.data.effect_operation.arguments.len)
+			{
+				SurfaceExpr* argument =
+					expression.data.effect_operation.arguments[parameter_index];
+				if (collect_known_callable_producer(
+					registry, calls, argument, scope, row, current_rows,
+					current_tails, tail, diagnostics, allocator, work, depth + 1
+				)) *found = true;
+			}
+		case SURFACE_BINARY:
+			collect_reachable_callable_arguments(
+				registry, calls, expression.data.binary.left, scope, target_function,
+				target_effect, target_operation, parameter_index, row, current_rows,
+				current_tails, tail, diagnostics, allocator, work, found, depth + 1
+			);
+			collect_reachable_callable_arguments(
+				registry, calls, expression.data.binary.right, scope, target_function,
+				target_effect, target_operation, parameter_index, row, current_rows,
+				current_tails, tail, diagnostics, allocator, work, found, depth + 1
+			);
+		case SURFACE_DEFINITION:
+			DefinitionExpr* definition = &expression.data.definition;
+			collect_reachable_callable_arguments(
+				registry, calls, definition.value, scope, target_function,
+				target_effect, target_operation, parameter_index, row, current_rows,
+				current_tails, tail, diagnostics, allocator, work, found, depth + 1
+			);
+			String[1] definition_name = { definition.name };
+			SurfaceExpr*[1] definition_value = { definition.value };
+			EffectLexicalScope definition_scope = {
+				.parent = scope,
+				.names = definition_name[..],
+				.values = definition_value[..],
+				.value_default_scope = scope,
+				.calls = calls,
+			};
+			collect_reachable_callable_arguments(
+				registry, calls, definition.body, &definition_scope, target_function,
+				target_effect, target_operation, parameter_index, row, current_rows,
+				current_tails, tail, diagnostics, allocator, work, found, depth + 1
+			);
+		case SURFACE_MATCH:
+			collect_reachable_callable_arguments(
+				registry, calls, expression.data.match_expr.scrutinee, scope,
+				target_function, target_effect, target_operation, parameter_index,
+				row, current_rows, current_tails, tail, diagnostics, allocator,
+				work, found, depth + 1
+			);
+			foreach (&arm : expression.data.match_expr.arms)
+			{
+				EffectLexicalScope arm_scope = {
+					.parent = scope,
+					.names = arm.pattern.bindings,
+					.pattern_scrutinee = expression.data.match_expr.scrutinee,
+					.pattern_constructor = arm.pattern.constructor,
+					.pattern_scope = scope,
+					.calls = calls,
+				};
+				collect_reachable_callable_arguments(
+					registry, calls, arm.body, &arm_scope, target_function,
+					target_effect, target_operation, parameter_index, row, current_rows,
+					current_tails, tail, diagnostics, allocator, work, found, depth + 1
+				);
+			}
+		case SURFACE_PARALLEL:
+			foreach (&binding : expression.data.parallel.bindings)
+			{
+				collect_reachable_callable_arguments(
+					registry, calls, binding.value, scope, target_function,
+					target_effect, target_operation, parameter_index, row, current_rows,
+					current_tails, tail, diagnostics, allocator, work, found, depth + 1
+				);
+			}
+			EffectLexicalScope parallel_scope = {
+				.parent = scope,
+				.parallel_bindings = expression.data.parallel.bindings,
+				.calls = calls,
+			};
+			collect_reachable_callable_arguments(
+				registry, calls, expression.data.parallel.result, &parallel_scope,
+				target_function, target_effect, target_operation, parameter_index,
+				row, current_rows, current_tails, tail, diagnostics, allocator,
+				work, found, depth + 1
+			);
+		case SURFACE_HANDLER:
+			collect_reachable_callable_arguments(
+				registry, calls, expression.data.handler.handled, scope,
+				target_function, target_effect, target_operation, parameter_index,
+				row, current_rows, current_tails, tail, diagnostics, allocator,
+				work, found, depth + 1
+			);
+			foreach (&clause : expression.data.handler.clauses)
+			{
+				EffectLexicalScope clause_scope = {
+					.parent = scope,
+					.names = clause.parameters,
+					.handler_effect_name = clause.effect_name,
+					.handler_operation_name = clause.operation_name,
+					.calls = calls,
+				};
+				collect_reachable_callable_arguments(
+					registry, calls, clause.body, &clause_scope, target_function,
+					target_effect, target_operation, parameter_index, row, current_rows,
+					current_tails, tail, diagnostics, allocator, work, found, depth + 1
+				);
+			}
+			String[1] return_name = { expression.data.handler.return_clause.parameter };
+			SurfaceExpr*[1] return_value = { expression.data.handler.handled };
+			EffectLexicalScope return_scope = {
+				.parent = scope,
+				.names = return_name[..],
+				.values = return_value[..],
+				.value_default_scope = scope,
+				.calls = calls,
+			};
+			collect_reachable_callable_arguments(
+				registry, calls, expression.data.handler.return_clause.body,
+				&return_scope, target_function, target_effect, target_operation,
+				parameter_index, row, current_rows, current_tails, tail, diagnostics,
+				allocator, work, found, depth + 1
+			);
+		case SURFACE_RESUME:
+			collect_reachable_callable_arguments(
+				registry, calls, expression.data.resume.value, scope, target_function,
+				target_effect, target_operation, parameter_index, row, current_rows,
+				current_tails, tail, diagnostics, allocator, work, found, depth + 1
+			);
+		default:
+	}
+}
+
+fn bool collect_reachable_parameter_effects(
+	EffectRegistry* registry,
+	EffectCallIndex* calls,
+	usz target_function,
+	String target_effect,
+	String target_operation,
+	usz parameter_index,
+	List{EffectId}* row,
+	List{EffectId}[] current_rows,
+	SymbolKey*[] current_tails,
+	SymbolKey** tail,
+	List{MitosDiagnostic}* diagnostics,
+	Allocator allocator,
+	EffectInferenceWork* work,
+	usz depth
+) @private
+{
+	bool found = false;
+	foreach (function_index, &function : calls.program.functions)
+	{
+		EffectLexicalScope function_scope = {
+			.names = function.parameters,
+			.calls = calls,
+			.function_index_plus_one = (usz)function_index + 1,
+		};
+		collect_reachable_callable_arguments(
+			registry, calls, function.body, &function_scope, target_function,
+			target_effect, target_operation, parameter_index, row, current_rows,
+			current_tails, tail, diagnostics, allocator, work, &found, depth + 1
+		);
+	}
+	return found;
+}
+
+
+fn void collect_callable_producer_effects(
+	EffectRegistry* registry,
+	EffectCallIndex* calls,
+	SurfaceExpr* producer,
+	EffectLexicalScope* producer_scope,
+	List{EffectId}* row,
+	List{EffectId}[] current_rows,
+	SymbolKey*[] current_tails,
+	SymbolKey** tail,
+	List{MitosDiagnostic}* diagnostics,
+	Allocator allocator,
+	EffectInferenceWork* work,
+	usz depth
+) @private
+{
+	if (!producer || depth >= MITOS_MAX_TYPE_FORMAT_DEPTH || !effect_charge(work)) return;
+	switch (producer.kind)
+	{
+		case SURFACE_VARIABLE:
+			SurfaceExpr* closure = null;
+			EffectLexicalScope* closure_scope = producer_scope;
+			SurfaceExpr* value = null;
+			EffectLexicalScope* value_scope = producer_scope;
+			if (effect_lexical_lookup(
+				producer_scope, producer.data.variable.name, work,
+				&closure, &closure_scope, &value, &value_scope
+			))
+			{
+				collect_callable_producer_effects(
+					registry, calls, closure ? closure : value,
+					closure ? closure_scope : value_scope, row, current_rows,
+					current_tails, tail, diagnostics, allocator, work, depth + 1
+				);
+			}
+		case SURFACE_LAMBDA:
+			LambdaExpr* lambda = &producer.data.lambda;
+			EffectLexicalScope lambda_scope = {
+				.parent = producer_scope,
+				.names = lambda.parameters,
+			};
+			collect_expression_effects(
+				registry, calls, lambda.body, &lambda_scope, row, current_rows,
+				current_tails, tail, diagnostics, allocator, work, depth + 1
+			);
+			if (lambda.effect_row && lambda.effect_row.has_tail)
+			{
+				inferred_row_tail(
+					tail, &lambda.effect_row.tail, diagnostics, allocator, producer.span
+				);
+			}
+		case SURFACE_APPLICATION:
+			ApplicationExpr* application = &producer.data.application;
+			SurfaceExpr* callable = null;
+			EffectLexicalScope* callable_scope = producer_scope;
+			String producer_name;
+			bool lexical = false;
+			if (application.callee && application.callee.kind == SURFACE_LAMBDA)
+			{
+				callable = application.callee;
+				lexical = true;
+			}
+			else if (application.callee && application.callee.kind == SURFACE_VARIABLE)
+			{
+				producer_name = application.callee.data.variable.name;
+				SurfaceExpr* callable_value = null;
+				EffectLexicalScope* callable_value_scope = producer_scope;
+				lexical = effect_lexical_lookup(
+					producer_scope, producer_name, work,
+					&callable, &callable_scope, &callable_value, &callable_value_scope
+				);
+				if (lexical && !callable)
+				{
+					callable = callable_value;
+					callable_scope = callable_value_scope;
+				}
+				effect_follow_callable_alias(
+					&callable, &callable_scope, &lexical, &producer_name,
+					work, 0
+				);
+				if (work.exhausted) return;
+				if (!lexical)
+				{
+					if (producer_name == "superpose")
+					{
+						foreach (alternative : application.arguments)
+						{
+							collect_callable_producer_effects(
+								registry, calls, alternative, producer_scope, row,
+								current_rows, current_tails, tail, diagnostics,
+								allocator, work, depth + 1
+							);
+						}
+						return;
+					}
+					if (producer_name == "collapse" || producer_name == "typeOf"
+						|| producer_name == "assertType")
+					{
+						effects_add_diagnostic(
+							diagnostics, allocator,
+							"effect inference cannot resolve a callable intrinsic producer",
+							producer.span
+						);
+						return;
+					}
+					EffectCallGroup* group = effect_call_group(
+						calls, producer_name, application.arguments.len
+					);
+					if (group) foreach (target : group.targets)
+					{
+						if (!effect_charge(work)) return;
+						if (target >= calls.program.functions.len) continue;
+						FunctionDecl* function = &calls.program.functions[target];
+						EffectLexicalScope function_scope = {
+							.names = function.parameters,
+							.values = application.arguments,
+							.value_default_scope = producer_scope,
+							.calls = calls,
+						};
+						collect_callable_producer_effects(
+							registry, calls, function.body, &function_scope, row,
+							current_rows, current_tails, tail, diagnostics, allocator,
+							work, depth + 1
+						);
+					}
+					return;
+				}
+			}
+			if (callable && callable.kind == SURFACE_LAMBDA)
+			{
+				EffectLexicalScope invocation_scope = {
+					.parent = callable_scope,
+					.names = callable.data.lambda.parameters,
+					.values = application.arguments,
+					.value_default_scope = producer_scope,
+				};
+				collect_callable_producer_effects(
+					registry, calls, callable.data.lambda.body, &invocation_scope, row,
+					current_rows, current_tails, tail, diagnostics, allocator,
+					work, depth + 1
+				);
+			}
+			else if (callable)
+			{
+				collect_callable_producer_effects(
+					registry, calls, callable, callable_scope, row, current_rows,
+					current_tails, tail, diagnostics, allocator, work, depth + 1
+				);
+			}
+		case SURFACE_DEFINITION:
+			DefinitionExpr* definition = &producer.data.definition;
+			String[1] definition_name = { definition.name };
+			SurfaceExpr*[1] definition_value = { definition.value };
+			EffectLexicalScope definition_scope = {
+				.parent = producer_scope,
+				.names = definition_name[..],
+				.values = definition_value[..],
+				.value_default_scope = producer_scope,
+			};
+			collect_callable_producer_effects(
+				registry, calls, definition.body, &definition_scope, row,
+				current_rows, current_tails, tail, diagnostics, allocator,
+				work, depth + 1
+			);
+		case SURFACE_MATCH:
+			foreach (&arm : producer.data.match_expr.arms)
+			{
+				EffectLexicalScope arm_scope = {
+					.parent = producer_scope,
+					.names = arm.pattern.bindings,
+					.pattern_scrutinee = producer.data.match_expr.scrutinee,
+					.pattern_constructor = arm.pattern.constructor,
+					.pattern_scope = producer_scope,
+				};
+				collect_callable_producer_effects(
+					registry, calls, arm.body, &arm_scope, row, current_rows,
+					current_tails, tail, diagnostics, allocator, work, depth + 1
+				);
+			}
+		case SURFACE_PARALLEL:
+			EffectLexicalScope parallel_scope = {
+				.parent = producer_scope,
+				.parallel_bindings = producer.data.parallel.bindings,
+				.calls = calls,
+			};
+			collect_callable_producer_effects(
+				registry, calls, producer.data.parallel.result, &parallel_scope, row,
+				current_rows, current_tails, tail, diagnostics, allocator,
+				work, depth + 1
+			);
+		case SURFACE_RESUME:
+			collect_callable_producer_effects(
+				registry, calls, producer.data.resume.value, producer_scope, row,
+				current_rows, current_tails, tail, diagnostics, allocator,
+				work, depth + 1
+			);
+		case SURFACE_HANDLER:
+			foreach (&clause : producer.data.handler.clauses)
+			{
+				EffectLexicalScope clause_scope = {
+					.parent = producer_scope,
+					.names = clause.parameters,
+					.handler_effect_name = clause.effect_name,
+					.handler_operation_name = clause.operation_name,
+					.calls = calls,
+				};
+				collect_callable_producer_effects(
+					registry, calls, clause.body, &clause_scope, row, current_rows,
+					current_tails, tail, diagnostics, allocator, work, depth + 1
+				);
+			}
+			String[1] return_name = { producer.data.handler.return_clause.parameter };
+			SurfaceExpr*[1] return_value = { producer.data.handler.handled };
+			EffectLexicalScope return_scope = {
+				.parent = producer_scope,
+				.names = return_name[..],
+				.values = return_value[..],
+				.value_default_scope = producer_scope,
+			};
+			collect_callable_producer_effects(
+				registry, calls, producer.data.handler.return_clause.body,
+				&return_scope, row, current_rows, current_tails, tail, diagnostics,
+				allocator, work, depth + 1
+			);
+		default:
+	}
+}
+
+
 fn void collect_expression_effects(
 	EffectRegistry* registry,
 	EffectCallIndex* calls,
 	SurfaceExpr* expression,
+	EffectLexicalScope* scope,
 	List{EffectId}* row,
 	List{EffectId}[] current_rows,
 	SymbolKey*[] current_tails,
@@ -1522,48 +2783,191 @@ fn void collect_expression_effects(
 		case SURFACE_LAMBDA:
 			return;
 		case SURFACE_APPLICATION:
+			ApplicationExpr* application = &expression.data.application;
 			collect_expression_effects(
-				registry, calls, expression.data.application.callee, row,
-				current_rows, current_tails, tail, diagnostics, allocator, work, depth + 1
+				registry, calls, application.callee, scope, row, current_rows,
+				current_tails, tail, diagnostics, allocator, work, depth + 1
 			);
-			foreach (argument : expression.data.application.arguments)
+			foreach (argument : application.arguments)
 				collect_expression_effects(
-					registry, calls, argument, row, current_rows, current_tails,
+					registry, calls, argument, scope, row, current_rows, current_tails,
 					tail, diagnostics, allocator, work, depth + 1
 				);
-			if (expression.data.application.callee
-				&& expression.data.application.callee.kind == SURFACE_VARIABLE)
+			SurfaceExpr* applied_closure = null;
+			EffectLexicalScope* closure_scope = scope;
+			SurfaceExpr* applied_producer = null;
+			EffectLexicalScope* producer_scope = scope;
+			bool unresolved_producer = false;
+			bool lexical_callee = false;
+			String callee_name;
+			if (application.callee && application.callee.kind == SURFACE_VARIABLE)
 			{
-				EffectCallGroup* group = effect_call_group(
-					calls, expression.data.application.callee.data.variable.name,
-					expression.data.application.arguments.len
+				callee_name = application.callee.data.variable.name;
+				lexical_callee = effect_lexical_lookup(
+					scope, callee_name, work,
+					&applied_closure, &closure_scope,
+					&applied_producer, &producer_scope, &unresolved_producer
 				);
-				if (group)
+				if (lexical_callee && !applied_closure && applied_producer)
 				{
-					(void)effect_charge(work, (usz)group.targets.len());
-					foreach (function_index : group.targets)
+					SurfaceExpr* resolved_callable = applied_producer;
+					EffectLexicalScope* resolved_scope = producer_scope;
+					bool resolved_lexical = true;
+					effect_follow_callable_alias(
+						&resolved_callable, &resolved_scope, &resolved_lexical,
+						&callee_name, work, 0
+					);
+					if (resolved_callable && resolved_callable.kind == SURFACE_LAMBDA)
 					{
-						foreach (effect : current_rows[function_index])
-							(void)inferred_row_add(row, effect, work);
-						inferred_row_tail(
-							tail, current_tails[function_index], diagnostics,
-							allocator, expression.span
-						);
+						applied_closure = resolved_callable;
+						closure_scope = resolved_scope;
+						applied_producer = null;
+					}
+					else if (!resolved_lexical)
+					{
+						applied_producer = null;
+						unresolved_producer = false;
+						lexical_callee = false;
+					}
+					else
+					{
+						applied_producer = resolved_callable;
+						producer_scope = resolved_scope;
+					}
+				}
+				if (work.exhausted) return;
+				if (!lexical_callee)
+				{
+					EffectCallGroup* group = effect_call_group(
+						calls, callee_name, application.arguments.len
+					);
+					if (group)
+					{
+						bool specialize = false;
+						foreach (argument : application.arguments)
+						{
+							if (effect_producer_contains_closure(
+								calls, argument, scope, work, depth + 1
+							))
+							{
+								specialize = true;
+								break;
+							}
+						}
+						foreach (function_index : group.targets)
+						{
+							if (!effect_charge(work)) break;
+							if (specialize && function_index < calls.program.functions.len)
+							{
+								FunctionDecl* function =
+									&calls.program.functions[function_index];
+								EffectLexicalScope function_scope = {
+									.names = function.parameters,
+									.values = application.arguments,
+									.value_default_scope = scope,
+									.calls = calls,
+								};
+								collect_expression_effects(
+									registry, calls, function.body, &function_scope, row,
+									current_rows, current_tails, tail, diagnostics,
+									allocator, work, depth + 1
+								);
+								if (function.effect_row && function.effect_row.has_tail)
+								{
+									inferred_row_tail(
+										tail, &function.effect_row.tail, diagnostics,
+										allocator, expression.span
+									);
+								}
+								continue;
+							}
+							foreach (effect : current_rows[function_index])
+								(void)inferred_row_add(row, effect, work);
+							inferred_row_tail(
+								tail, current_tails[function_index], diagnostics,
+								allocator, expression.span
+							);
+						}
 					}
 				}
 			}
-			if (expression.data.application.callee
-				&& expression.data.application.callee.kind == SURFACE_LAMBDA)
+			else if (application.callee && application.callee.kind == SURFACE_LAMBDA)
 			{
-				LambdaExpr* lambda = &expression.data.application.callee.data.lambda;
+				applied_closure = application.callee;
+			}
+			if (applied_closure && applied_closure.kind == SURFACE_LAMBDA)
+			{
+				LambdaExpr* lambda = &applied_closure.data.lambda;
+				EffectLexicalScope lambda_scope = {
+					.parent = closure_scope,
+					.names = lambda.parameters,
+					.values = application.arguments,
+					.value_default_scope = scope,
+				};
 				collect_expression_effects(
-					registry, calls, lambda.body, row, current_rows, current_tails,
-					tail, diagnostics, allocator, work, depth + 1
+					registry, calls, lambda.body, &lambda_scope, row, current_rows,
+					current_tails, tail, diagnostics, allocator, work, depth + 1
 				);
 				if (lambda.effect_row && lambda.effect_row.has_tail)
 				{
 					inferred_row_tail(
 						tail, &lambda.effect_row.tail, diagnostics, allocator, expression.span
+					);
+				}
+			}
+			else if (lexical_callee && applied_producer)
+			{
+				if (applied_producer.kind == SURFACE_HANDLER)
+				{
+					collect_callable_producer_effects(
+						registry, calls, applied_producer, producer_scope, row,
+						current_rows, current_tails, tail, diagnostics, allocator,
+						work, depth + 1
+					);
+				}
+				else if (!collect_known_callable_producer(
+					registry, calls, applied_producer, producer_scope, row,
+					current_rows, current_tails, tail, diagnostics, allocator,
+					work, depth + 1
+				))
+				{
+					effects_add_diagnostic(
+						diagnostics, allocator,
+						"effect inference cannot prove a lexical callable producer pure",
+						expression.span
+					);
+				}
+			}
+			else if (lexical_callee && unresolved_producer)
+			{
+				effects_add_diagnostic(
+					diagnostics, allocator,
+					"effect inference cannot resolve a callable pattern binding producer",
+					expression.span
+				);
+			}
+			else if (lexical_callee)
+			{
+				usz origin_function = usz::max;
+				usz origin_parameter = usz::max;
+				String origin_effect;
+				String origin_operation;
+				bool has_origin = effect_lexical_origin(
+					scope, application.callee.data.variable.name, work,
+					&origin_function, &origin_parameter,
+					&origin_effect, &origin_operation
+				);
+				bool found_reachable = has_origin && collect_reachable_parameter_effects(
+					registry, calls, origin_function, origin_effect, origin_operation,
+					origin_parameter, row, current_rows, current_tails, tail,
+					diagnostics, allocator, work, depth + 1
+				);
+				if (!found_reachable)
+				{
+					effects_add_diagnostic(
+						diagnostics, allocator,
+						"effect inference cannot prove a lexical callable binding pure",
+						expression.span
 					);
 				}
 			}
@@ -1593,45 +2997,87 @@ fn void collect_expression_effects(
 			}
 			foreach (argument : expression.data.effect_operation.arguments)
 				collect_expression_effects(
-					registry, calls, argument, row, current_rows, current_tails,
+					registry, calls, argument, scope, row, current_rows, current_tails,
 					tail, diagnostics, allocator, work, depth + 1
 				);
 		case SURFACE_BINARY:
 			collect_expression_effects(
-				registry, calls, expression.data.binary.left, row, current_rows,
+				registry, calls, expression.data.binary.left, scope, row, current_rows,
 				current_tails, tail, diagnostics, allocator, work, depth + 1
 			);
 			collect_expression_effects(
-				registry, calls, expression.data.binary.right, row, current_rows,
+				registry, calls, expression.data.binary.right, scope, row, current_rows,
 				current_tails, tail, diagnostics, allocator, work, depth + 1
 			);
 		case SURFACE_DEFINITION:
+			DefinitionExpr* definition = &expression.data.definition;
 			collect_expression_effects(
-				registry, calls, expression.data.definition.value, row, current_rows,
+				registry, calls, definition.value, scope, row, current_rows,
 				current_tails, tail, diagnostics, allocator, work, depth + 1
 			);
+			SurfaceExpr* bound_closure = null;
+			EffectLexicalScope* bound_scope = scope;
+			if (definition.value && definition.value.kind == SURFACE_LAMBDA)
+			{
+				bound_closure = definition.value;
+			}
+			else if (definition.value && definition.value.kind == SURFACE_VARIABLE)
+			{
+				(void)effect_lexical_lookup(
+					scope, definition.value.data.variable.name, work,
+					&bound_closure, &bound_scope
+				);
+			}
+			String[1] definition_name = { definition.name };
+			SurfaceExpr*[1] definition_closure = { bound_closure };
+			EffectLexicalScope*[1] definition_capture = { bound_scope };
+			SurfaceExpr*[1] definition_value = { definition.value };
+			EffectLexicalScope definition_scope = {
+				.parent = scope,
+				.names = definition_name[..],
+				.closures = definition_closure[..],
+				.closure_scopes = definition_capture[..],
+				.values = definition_value[..],
+				.value_default_scope = scope,
+			};
 			collect_expression_effects(
-				registry, calls, expression.data.definition.body, row, current_rows,
+				registry, calls, definition.body, &definition_scope, row, current_rows,
 				current_tails, tail, diagnostics, allocator, work, depth + 1
 			);
 		case SURFACE_MATCH:
 			collect_expression_effects(
-				registry, calls, expression.data.match_expr.scrutinee, row, current_rows,
-				current_tails, tail, diagnostics, allocator, work, depth + 1
+				registry, calls, expression.data.match_expr.scrutinee, scope, row,
+				current_rows, current_tails, tail, diagnostics, allocator, work, depth + 1
 			);
 			foreach (&arm : expression.data.match_expr.arms)
+			{
+				EffectLexicalScope arm_scope = {
+					.parent = scope,
+					.names = arm.pattern.bindings,
+					.pattern_scrutinee = expression.data.match_expr.scrutinee,
+					.pattern_constructor = arm.pattern.constructor,
+					.pattern_scope = scope,
+				};
 				collect_expression_effects(
-					registry, calls, arm.body, row, current_rows, current_tails,
-					tail, diagnostics, allocator, work, depth + 1
+					registry, calls, arm.body, &arm_scope, row, current_rows,
+					current_tails, tail, diagnostics, allocator, work, depth + 1
 				);
+			}
 		case SURFACE_PARALLEL:
-			foreach (&binding : expression.data.parallel.bindings)
+			ParallelExpr* parallel = &expression.data.parallel;
+			foreach (&binding : parallel.bindings)
+			{
 				collect_expression_effects(
-					registry, calls, binding.value, row, current_rows, current_tails,
-					tail, diagnostics, allocator, work, depth + 1
+					registry, calls, binding.value, scope, row, current_rows,
+					current_tails, tail, diagnostics, allocator, work, depth + 1
 				);
+			}
+			EffectLexicalScope parallel_scope = {
+				.parent = scope,
+				.parallel_bindings = parallel.bindings,
+			};
 			collect_expression_effects(
-				registry, calls, expression.data.parallel.result, row, current_rows,
+				registry, calls, parallel.result, &parallel_scope, row, current_rows,
 				current_tails, tail, diagnostics, allocator, work, depth + 1
 			);
 		case SURFACE_HANDLER:
@@ -1639,8 +3085,9 @@ fn void collect_expression_effects(
 			handled.init(allocator);
 			SymbolKey* handled_tail = null;
 			collect_expression_effects(
-				registry, calls, expression.data.handler.handled, &handled, current_rows,
-				current_tails, &handled_tail, diagnostics, allocator, work, depth + 1
+				registry, calls, expression.data.handler.handled, scope, &handled,
+				current_rows, current_tails, &handled_tail, diagnostics, allocator,
+				work, depth + 1
 			);
 			foreach (&clause : expression.data.handler.clauses)
 			{
@@ -1663,9 +3110,16 @@ fn void collect_expression_effects(
 						"handler clause parameter count does not match the operation", clause.span
 					);
 				}
+				EffectLexicalScope clause_scope = {
+					.parent = scope,
+					.names = clause.parameters,
+					.handler_effect_name = clause.effect_name,
+					.handler_operation_name = clause.operation_name,
+					.calls = calls,
+				};
 				collect_expression_effects(
-					registry, calls, clause.body, row, current_rows, current_tails,
-					tail, diagnostics, allocator, work, depth + 1
+					registry, calls, clause.body, &clause_scope, row, current_rows,
+					current_tails, tail, diagnostics, allocator, work, depth + 1
 				);
 			}
 			foreach (&handled_effect : registry.effects)
@@ -1714,13 +3168,22 @@ fn void collect_expression_effects(
 			foreach (candidate : handled) (void)inferred_row_add(row, candidate, work);
 			handled.free();
 			inferred_row_tail(tail, handled_tail, diagnostics, allocator, expression.span);
+			String[1] return_name = { expression.data.handler.return_clause.parameter };
+			SurfaceExpr*[1] return_value = { expression.data.handler.handled };
+			EffectLexicalScope return_scope = {
+				.parent = scope,
+				.names = return_name[..],
+				.values = return_value[..],
+				.value_default_scope = scope,
+			};
 			collect_expression_effects(
-				registry, calls, expression.data.handler.return_clause.body, row,
-				current_rows, current_tails, tail, diagnostics, allocator, work, depth + 1
+				registry, calls, expression.data.handler.return_clause.body,
+				&return_scope, row, current_rows, current_tails, tail, diagnostics,
+				allocator, work, depth + 1
 			);
 		case SURFACE_RESUME:
 			collect_expression_effects(
-				registry, calls, expression.data.resume.value, row, current_rows,
+				registry, calls, expression.data.resume.value, scope, row, current_rows,
 				current_tails, tail, diagnostics, allocator, work, depth + 1
 			);
 		default:
@@ -1834,9 +3297,207 @@ fn bool add_reverse_effect_edge(
 }
 
 
+fn void collect_callable_producer_edges(
+	EffectCallIndex* calls,
+	SurfaceExpr* producer,
+	EffectLexicalScope* producer_scope,
+	usz caller,
+	List{usz}[] callers,
+	EffectInferenceWork* work,
+	usz depth
+) @private
+{
+	if (!producer || depth >= MITOS_MAX_TYPE_FORMAT_DEPTH || !effect_charge(work)) return;
+	switch (producer.kind)
+	{
+		case SURFACE_VARIABLE:
+			SurfaceExpr* closure = null;
+			EffectLexicalScope* closure_scope = producer_scope;
+			SurfaceExpr* value = null;
+			EffectLexicalScope* value_scope = producer_scope;
+			if (effect_lexical_lookup(
+				producer_scope, producer.data.variable.name, work,
+				&closure, &closure_scope, &value, &value_scope
+			))
+			{
+				collect_callable_producer_edges(
+					calls, closure ? closure : value,
+					closure ? closure_scope : value_scope,
+					caller, callers, work, depth + 1
+				);
+			}
+		case SURFACE_LAMBDA:
+			EffectLexicalScope lambda_scope = {
+				.parent = producer_scope,
+				.names = producer.data.lambda.parameters,
+			};
+			collect_effect_call_edges(
+				calls, producer.data.lambda.body, &lambda_scope,
+				caller, callers, work, depth + 1
+			);
+		case SURFACE_APPLICATION:
+			ApplicationExpr* application = &producer.data.application;
+			SurfaceExpr* callable = null;
+			EffectLexicalScope* callable_scope = producer_scope;
+			String producer_name;
+			bool lexical = false;
+			if (application.callee && application.callee.kind == SURFACE_LAMBDA)
+			{
+				callable = application.callee;
+				lexical = true;
+			}
+			else if (application.callee && application.callee.kind == SURFACE_VARIABLE)
+			{
+				producer_name = application.callee.data.variable.name;
+				SurfaceExpr* callable_value = null;
+				EffectLexicalScope* callable_value_scope = producer_scope;
+				lexical = effect_lexical_lookup(
+					producer_scope, producer_name, work,
+					&callable, &callable_scope, &callable_value, &callable_value_scope
+				);
+				if (lexical && !callable)
+				{
+					callable = callable_value;
+					callable_scope = callable_value_scope;
+				}
+				effect_follow_callable_alias(
+					&callable, &callable_scope, &lexical, &producer_name,
+					work, 0
+				);
+				if (work.exhausted) return;
+				if (!lexical)
+				{
+					if (producer_name == "superpose")
+					{
+						foreach (alternative : application.arguments)
+						{
+							collect_callable_producer_edges(
+								calls, alternative, producer_scope,
+								caller, callers, work, depth + 1
+							);
+						}
+						return;
+					}
+					if (producer_name == "collapse" || producer_name == "typeOf"
+						|| producer_name == "assertType") return;
+					EffectCallGroup* group = effect_call_group(
+						calls, producer_name, application.arguments.len
+					);
+					if (group) foreach (target : group.targets)
+					{
+						if (!effect_charge(work)) return;
+						if (target >= calls.program.functions.len) continue;
+						FunctionDecl* function = &calls.program.functions[target];
+						EffectLexicalScope function_scope = {
+							.names = function.parameters,
+							.values = application.arguments,
+							.value_default_scope = producer_scope,
+							.calls = calls,
+						};
+						collect_callable_producer_edges(
+							calls, function.body, &function_scope,
+							caller, callers, work, depth + 1
+						);
+					}
+					return;
+				}
+			}
+			if (callable && callable.kind == SURFACE_LAMBDA)
+			{
+				EffectLexicalScope invocation_scope = {
+					.parent = callable_scope,
+					.names = callable.data.lambda.parameters,
+					.values = application.arguments,
+					.value_default_scope = producer_scope,
+				};
+				collect_callable_producer_edges(
+					calls, callable.data.lambda.body, &invocation_scope,
+					caller, callers, work, depth + 1
+				);
+			}
+			else if (callable)
+			{
+				collect_callable_producer_edges(
+					calls, callable, callable_scope, caller, callers, work, depth + 1
+				);
+			}
+		case SURFACE_DEFINITION:
+			DefinitionExpr* definition = &producer.data.definition;
+			String[1] definition_name = { definition.name };
+			SurfaceExpr*[1] definition_value = { definition.value };
+			EffectLexicalScope definition_scope = {
+				.parent = producer_scope,
+				.names = definition_name[..],
+				.values = definition_value[..],
+				.value_default_scope = producer_scope,
+			};
+			collect_callable_producer_edges(
+				calls, definition.body, &definition_scope,
+				caller, callers, work, depth + 1
+			);
+		case SURFACE_MATCH:
+			foreach (&arm : producer.data.match_expr.arms)
+			{
+				EffectLexicalScope arm_scope = {
+					.parent = producer_scope,
+					.names = arm.pattern.bindings,
+					.pattern_scrutinee = producer.data.match_expr.scrutinee,
+					.pattern_constructor = arm.pattern.constructor,
+					.pattern_scope = producer_scope,
+				};
+				collect_callable_producer_edges(
+					calls, arm.body, &arm_scope, caller, callers, work, depth + 1
+				);
+			}
+		case SURFACE_PARALLEL:
+			EffectLexicalScope parallel_scope = {
+				.parent = producer_scope,
+				.parallel_bindings = producer.data.parallel.bindings,
+				.calls = calls,
+			};
+			collect_callable_producer_edges(
+				calls, producer.data.parallel.result, &parallel_scope,
+				caller, callers, work, depth + 1
+			);
+		case SURFACE_RESUME:
+			collect_callable_producer_edges(
+				calls, producer.data.resume.value, producer_scope,
+				caller, callers, work, depth + 1
+			);
+		case SURFACE_HANDLER:
+			foreach (&clause : producer.data.handler.clauses)
+			{
+				EffectLexicalScope clause_scope = {
+					.parent = producer_scope,
+					.names = clause.parameters,
+					.calls = calls,
+				};
+				collect_callable_producer_edges(
+					calls, clause.body, &clause_scope,
+					caller, callers, work, depth + 1
+				);
+			}
+			String[1] return_name = { producer.data.handler.return_clause.parameter };
+			SurfaceExpr*[1] return_value = { producer.data.handler.handled };
+			EffectLexicalScope return_scope = {
+				.parent = producer_scope,
+				.names = return_name[..],
+				.values = return_value[..],
+				.value_default_scope = producer_scope,
+			};
+			collect_callable_producer_edges(
+				calls, producer.data.handler.return_clause.body, &return_scope,
+				caller, callers, work, depth + 1
+			);
+		default:
+	}
+}
+
+
 fn void collect_effect_call_edges(
 	EffectCallIndex* calls,
 	SurfaceExpr* expression,
+	EffectLexicalScope* scope,
 	usz caller,
 	List{usz}[] callers,
 	EffectInferenceWork* work,
@@ -1848,44 +3509,230 @@ fn void collect_effect_call_edges(
 	{
 		case SURFACE_LAMBDA: return;
 		case SURFACE_APPLICATION:
-			collect_effect_call_edges(calls, expression.data.application.callee, caller, callers, work, depth + 1);
-			foreach (argument : expression.data.application.arguments)
-				collect_effect_call_edges(calls, argument, caller, callers, work, depth + 1);
-			if (expression.data.application.callee && expression.data.application.callee.kind == SURFACE_VARIABLE)
-			{
-				EffectCallGroup* group = effect_call_group(
-					calls, expression.data.application.callee.data.variable.name,
-					expression.data.application.arguments.len
+			ApplicationExpr* application = &expression.data.application;
+			collect_effect_call_edges(
+				calls, application.callee, scope, caller, callers, work, depth + 1
+			);
+			foreach (argument : application.arguments)
+				collect_effect_call_edges(
+					calls, argument, scope, caller, callers, work, depth + 1
 				);
-				if (group) foreach (target : group.targets)
+			SurfaceExpr* applied_closure = null;
+			EffectLexicalScope* closure_scope = scope;
+			SurfaceExpr* applied_producer = null;
+			EffectLexicalScope* producer_scope = scope;
+			bool lexical_callee = false;
+			String callee_name;
+			if (application.callee && application.callee.kind == SURFACE_VARIABLE)
+			{
+				callee_name = application.callee.data.variable.name;
+				lexical_callee = effect_lexical_lookup(
+					scope, callee_name, work,
+					&applied_closure, &closure_scope,
+					&applied_producer, &producer_scope
+				);
+				if (lexical_callee && !applied_closure && applied_producer)
 				{
-					if (!add_reverse_effect_edge(&callers[target], caller, work)) break;
+					SurfaceExpr* resolved_callable = applied_producer;
+					EffectLexicalScope* resolved_scope = producer_scope;
+					bool resolved_lexical = true;
+					effect_follow_callable_alias(
+						&resolved_callable, &resolved_scope, &resolved_lexical,
+						&callee_name, work, 0
+					);
+					if (resolved_callable && resolved_callable.kind == SURFACE_LAMBDA)
+					{
+						applied_closure = resolved_callable;
+						closure_scope = resolved_scope;
+						applied_producer = null;
+					}
+					else if (!resolved_lexical)
+					{
+						applied_producer = null;
+						lexical_callee = false;
+					}
+					else
+					{
+						applied_producer = resolved_callable;
+						producer_scope = resolved_scope;
+					}
 				}
+				if (work.exhausted) return;
+				if (!lexical_callee)
+				{
+					EffectCallGroup* group = effect_call_group(
+						calls, callee_name, application.arguments.len
+					);
+					if (group)
+					{
+						bool specialize = false;
+						foreach (argument : application.arguments)
+						{
+							if (effect_producer_contains_closure(
+								calls, argument, scope, work, depth + 1
+							))
+							{
+								specialize = true;
+								break;
+							}
+						}
+						foreach (target : group.targets)
+						{
+							if (!effect_charge(work)) break;
+							if (specialize && target < calls.program.functions.len)
+							{
+								FunctionDecl* function = &calls.program.functions[target];
+								EffectLexicalScope function_scope = {
+									.names = function.parameters,
+									.values = application.arguments,
+									.value_default_scope = scope,
+									.calls = calls,
+								};
+								collect_effect_call_edges(
+									calls, function.body, &function_scope,
+									caller, callers, work, depth + 1
+								);
+								continue;
+							}
+							if (!add_reverse_effect_edge(&callers[target], caller, work)) break;
+						}
+					}
+				}
+			}
+			else if (application.callee && application.callee.kind == SURFACE_LAMBDA)
+			{
+				applied_closure = application.callee;
+			}
+			if (applied_closure && applied_closure.kind == SURFACE_LAMBDA)
+			{
+				EffectLexicalScope lambda_scope = {
+					.parent = closure_scope,
+					.names = applied_closure.data.lambda.parameters,
+					.values = application.arguments,
+					.value_default_scope = scope,
+				};
+				collect_effect_call_edges(
+					calls, applied_closure.data.lambda.body, &lambda_scope,
+					caller, callers, work, depth + 1
+				);
+			}
+			else if (lexical_callee && applied_producer)
+			{
+				collect_callable_producer_edges(
+					calls, applied_producer, producer_scope,
+					caller, callers, work, depth + 1
+				);
 			}
 		case SURFACE_EFFECT_OPERATION:
 			foreach (argument : expression.data.effect_operation.arguments)
-				collect_effect_call_edges(calls, argument, caller, callers, work, depth + 1);
+				collect_effect_call_edges(
+					calls, argument, scope, caller, callers, work, depth + 1
+				);
 		case SURFACE_BINARY:
-			collect_effect_call_edges(calls, expression.data.binary.left, caller, callers, work, depth + 1);
-			collect_effect_call_edges(calls, expression.data.binary.right, caller, callers, work, depth + 1);
+			collect_effect_call_edges(
+				calls, expression.data.binary.left, scope, caller, callers, work, depth + 1
+			);
+			collect_effect_call_edges(
+				calls, expression.data.binary.right, scope, caller, callers, work, depth + 1
+			);
 		case SURFACE_DEFINITION:
-			collect_effect_call_edges(calls, expression.data.definition.value, caller, callers, work, depth + 1);
-			collect_effect_call_edges(calls, expression.data.definition.body, caller, callers, work, depth + 1);
+			DefinitionExpr* definition = &expression.data.definition;
+			collect_effect_call_edges(
+				calls, definition.value, scope, caller, callers, work, depth + 1
+			);
+			SurfaceExpr* bound_closure = null;
+			EffectLexicalScope* bound_scope = scope;
+			if (definition.value && definition.value.kind == SURFACE_LAMBDA)
+			{
+				bound_closure = definition.value;
+			}
+			else if (definition.value && definition.value.kind == SURFACE_VARIABLE)
+			{
+				(void)effect_lexical_lookup(
+					scope, definition.value.data.variable.name, work,
+					&bound_closure, &bound_scope
+				);
+			}
+			String[1] definition_name = { definition.name };
+			SurfaceExpr*[1] definition_closure = { bound_closure };
+			EffectLexicalScope*[1] definition_capture = { bound_scope };
+			SurfaceExpr*[1] definition_value = { definition.value };
+			EffectLexicalScope definition_scope = {
+				.parent = scope,
+				.names = definition_name[..],
+				.closures = definition_closure[..],
+				.closure_scopes = definition_capture[..],
+				.values = definition_value[..],
+				.value_default_scope = scope,
+			};
+			collect_effect_call_edges(
+				calls, definition.body, &definition_scope, caller, callers, work, depth + 1
+			);
 		case SURFACE_MATCH:
-			collect_effect_call_edges(calls, expression.data.match_expr.scrutinee, caller, callers, work, depth + 1);
+			collect_effect_call_edges(
+				calls, expression.data.match_expr.scrutinee, scope,
+				caller, callers, work, depth + 1
+			);
 			foreach (&arm : expression.data.match_expr.arms)
-				collect_effect_call_edges(calls, arm.body, caller, callers, work, depth + 1);
+			{
+				EffectLexicalScope arm_scope = {
+					.parent = scope,
+					.names = arm.pattern.bindings,
+					.pattern_scrutinee = expression.data.match_expr.scrutinee,
+					.pattern_constructor = arm.pattern.constructor,
+					.pattern_scope = scope,
+				};
+				collect_effect_call_edges(
+					calls, arm.body, &arm_scope, caller, callers, work, depth + 1
+				);
+			}
 		case SURFACE_PARALLEL:
-			foreach (&binding : expression.data.parallel.bindings)
-				collect_effect_call_edges(calls, binding.value, caller, callers, work, depth + 1);
-			collect_effect_call_edges(calls, expression.data.parallel.result, caller, callers, work, depth + 1);
+			ParallelExpr* parallel = &expression.data.parallel;
+			foreach (&binding : parallel.bindings)
+			{
+				collect_effect_call_edges(
+					calls, binding.value, scope, caller, callers, work, depth + 1
+				);
+			}
+			EffectLexicalScope parallel_scope = {
+				.parent = scope,
+				.parallel_bindings = parallel.bindings,
+			};
+			collect_effect_call_edges(
+				calls, parallel.result, &parallel_scope, caller, callers, work, depth + 1
+			);
 		case SURFACE_HANDLER:
-			collect_effect_call_edges(calls, expression.data.handler.handled, caller, callers, work, depth + 1);
+			collect_effect_call_edges(
+				calls, expression.data.handler.handled, scope,
+				caller, callers, work, depth + 1
+			);
 			foreach (&clause : expression.data.handler.clauses)
-				collect_effect_call_edges(calls, clause.body, caller, callers, work, depth + 1);
-			collect_effect_call_edges(calls, expression.data.handler.return_clause.body, caller, callers, work, depth + 1);
+			{
+				EffectLexicalScope clause_scope = {
+					.parent = scope,
+					.names = clause.parameters,
+				};
+				collect_effect_call_edges(
+					calls, clause.body, &clause_scope, caller, callers, work, depth + 1
+				);
+			}
+			String[1] return_name = { expression.data.handler.return_clause.parameter };
+			SurfaceExpr*[1] return_value = { expression.data.handler.handled };
+			EffectLexicalScope return_scope = {
+				.parent = scope,
+				.names = return_name[..],
+				.values = return_value[..],
+				.value_default_scope = scope,
+			};
+			collect_effect_call_edges(
+				calls, expression.data.handler.return_clause.body, &return_scope,
+				caller, callers, work, depth + 1
+			);
 		case SURFACE_RESUME:
-			collect_effect_call_edges(calls, expression.data.resume.value, caller, callers, work, depth + 1);
+			collect_effect_call_edges(
+				calls, expression.data.resume.value, scope,
+				caller, callers, work, depth + 1
+			);
 		default:
 	}
 }
@@ -1896,6 +3743,7 @@ fn void collect_lambda_effect_info(
 	TypeRegistry* types,
 	EffectCallIndex* calls,
 	SurfaceExpr* expression,
+	EffectLexicalScope* scope,
 	List{EffectId}[] rows,
 	SymbolKey*[] row_tails,
 	List{LambdaEffectInfo}* lambdas,
@@ -1908,18 +3756,23 @@ fn void collect_lambda_effect_info(
 	if (!expression || depth >= MITOS_MAX_TYPE_FORMAT_DEPTH || !effect_charge(work)) return;
 	if (expression.kind == SURFACE_LAMBDA)
 	{
+		LambdaExpr* lambda = &expression.data.lambda;
+		EffectLexicalScope lambda_scope = {
+			.parent = scope,
+			.names = lambda.parameters,
+		};
 		List{EffectId} inferred;
 		List{EffectId} asserted;
 		inferred.init(allocator);
 		asserted.init(allocator);
 		SymbolKey* inferred_tail = null;
 		collect_expression_effects(
-			registry, calls, expression.data.lambda.body, &inferred, rows,
+			registry, calls, lambda.body, &lambda_scope, &inferred, rows,
 			row_tails, &inferred_tail, diagnostics, allocator, work, depth + 1
 		);
-		if (expression.data.lambda.effect_row)
+		if (lambda.effect_row)
 		{
-			foreach (effect_expr : expression.data.lambda.effect_row.effects)
+			foreach (effect_expr : lambda.effect_row.effects)
 			{
 				EffectId effect;
 				MitosDiagnostic diagnostic;
@@ -1947,42 +3800,41 @@ fn void collect_lambda_effect_info(
 						}
 					}
 				}
-				if (!declared && !expression.data.lambda.effect_row.has_tail)
+				if (!declared && !lambda.effect_row.has_tail)
 				{
 					effects_add_diagnostic(
 						diagnostics, allocator,
 						"lambda 'does' row omits an inferred transitive effect",
-						expression.data.lambda.effect_row.span
+						lambda.effect_row.span
 					);
 				}
 			}
 		}
 		EffectId[] inferred_ids = inferred.to_array(allocator);
 		EffectId[] asserted_ids = asserted.to_array(allocator);
-		SymbolKey* asserted_tail = expression.data.lambda.effect_row
-			&& expression.data.lambda.effect_row.has_tail
-			? &expression.data.lambda.effect_row.tail : null;
-		if (expression.data.lambda.effect_row && inferred_tail
+		SymbolKey* asserted_tail = lambda.effect_row && lambda.effect_row.has_tail
+			? &lambda.effect_row.tail : null;
+		if (lambda.effect_row && inferred_tail
 			&& (!asserted_tail || !symbol_key_equal(inferred_tail, asserted_tail)))
 		{
 			effects_add_diagnostic(
 				diagnostics, allocator,
 				"lambda 'does' row tail does not unify with its inferred open effect tail",
-				expression.data.lambda.effect_row.span
+				lambda.effect_row.span
 			);
 		}
 		lambdas.push({
 			.span = expression.span,
 			.inferred = normalize_effect_row(inferred_ids, inferred_tail, allocator),
 			.asserted = normalize_effect_row(asserted_ids, asserted_tail, allocator),
-			.has_assertion = expression.data.lambda.effect_row != null,
+			.has_assertion = lambda.effect_row != null,
 		});
 		alloc::free(allocator, inferred_ids);
 		alloc::free(allocator, asserted_ids);
 		inferred.free();
 		asserted.free();
 		collect_lambda_effect_info(
-			registry, types, calls, expression.data.lambda.body, rows, row_tails,
+			registry, types, calls, lambda.body, &lambda_scope, rows, row_tails,
 			lambdas, diagnostics, allocator, work, depth + 1
 		);
 		return;
@@ -1991,76 +3843,136 @@ fn void collect_lambda_effect_info(
 	{
 		case SURFACE_APPLICATION:
 			collect_lambda_effect_info(
-				registry, types, calls, expression.data.application.callee, rows, row_tails,
-				lambdas, diagnostics, allocator, work, depth + 1
+				registry, types, calls, expression.data.application.callee, scope,
+				rows, row_tails, lambdas, diagnostics, allocator, work, depth + 1
 			);
 			foreach (argument : expression.data.application.arguments)
 				collect_lambda_effect_info(
-					registry, types, calls, argument, rows, row_tails,
+					registry, types, calls, argument, scope, rows, row_tails,
 					lambdas, diagnostics, allocator, work, depth + 1
 				);
 		case SURFACE_EFFECT_OPERATION:
 			foreach (argument : expression.data.effect_operation.arguments)
 				collect_lambda_effect_info(
-					registry, types, calls, argument, rows, row_tails,
+					registry, types, calls, argument, scope, rows, row_tails,
 					lambdas, diagnostics, allocator, work, depth + 1
 				);
 		case SURFACE_BINARY:
 			collect_lambda_effect_info(
-				registry, types, calls, expression.data.binary.left, rows, row_tails,
-				lambdas, diagnostics, allocator, work, depth + 1
+				registry, types, calls, expression.data.binary.left, scope,
+				rows, row_tails, lambdas, diagnostics, allocator, work, depth + 1
 			);
 			collect_lambda_effect_info(
-				registry, types, calls, expression.data.binary.right, rows, row_tails,
-				lambdas, diagnostics, allocator, work, depth + 1
+				registry, types, calls, expression.data.binary.right, scope,
+				rows, row_tails, lambdas, diagnostics, allocator, work, depth + 1
 			);
 		case SURFACE_DEFINITION:
+			DefinitionExpr* definition = &expression.data.definition;
 			collect_lambda_effect_info(
-				registry, types, calls, expression.data.definition.value, rows, row_tails,
+				registry, types, calls, definition.value, scope, rows, row_tails,
 				lambdas, diagnostics, allocator, work, depth + 1
 			);
+			SurfaceExpr* bound_closure = null;
+			EffectLexicalScope* bound_scope = scope;
+			if (definition.value && definition.value.kind == SURFACE_LAMBDA)
+			{
+				bound_closure = definition.value;
+			}
+			else if (definition.value && definition.value.kind == SURFACE_VARIABLE)
+			{
+				(void)effect_lexical_lookup(
+					scope, definition.value.data.variable.name, work,
+					&bound_closure, &bound_scope
+				);
+			}
+			String[1] definition_name = { definition.name };
+			SurfaceExpr*[1] definition_closure = { bound_closure };
+			EffectLexicalScope*[1] definition_capture = { bound_scope };
+			SurfaceExpr*[1] definition_value = { definition.value };
+			EffectLexicalScope definition_scope = {
+				.parent = scope,
+				.names = definition_name[..],
+				.closures = definition_closure[..],
+				.closure_scopes = definition_capture[..],
+				.values = definition_value[..],
+				.value_default_scope = scope,
+			};
 			collect_lambda_effect_info(
-				registry, types, calls, expression.data.definition.body, rows, row_tails,
-				lambdas, diagnostics, allocator, work, depth + 1
+				registry, types, calls, definition.body, &definition_scope,
+				rows, row_tails, lambdas, diagnostics, allocator, work, depth + 1
 			);
 		case SURFACE_MATCH:
 			collect_lambda_effect_info(
-				registry, types, calls, expression.data.match_expr.scrutinee, rows, row_tails,
-				lambdas, diagnostics, allocator, work, depth + 1
+				registry, types, calls, expression.data.match_expr.scrutinee, scope,
+				rows, row_tails, lambdas, diagnostics, allocator, work, depth + 1
 			);
 			foreach (&arm : expression.data.match_expr.arms)
+			{
+				EffectLexicalScope arm_scope = {
+					.parent = scope,
+					.names = arm.pattern.bindings,
+					.pattern_scrutinee = expression.data.match_expr.scrutinee,
+					.pattern_constructor = arm.pattern.constructor,
+					.pattern_scope = scope,
+				};
 				collect_lambda_effect_info(
-					registry, types, calls, arm.body, rows, row_tails,
+					registry, types, calls, arm.body, &arm_scope, rows, row_tails,
 					lambdas, diagnostics, allocator, work, depth + 1
 				);
+			}
 		case SURFACE_PARALLEL:
-			foreach (&binding : expression.data.parallel.bindings)
+			ParallelExpr* parallel = &expression.data.parallel;
+			foreach (&binding : parallel.bindings)
+			{
 				collect_lambda_effect_info(
-					registry, types, calls, binding.value, rows, row_tails,
+					registry, types, calls, binding.value, scope, rows, row_tails,
 					lambdas, diagnostics, allocator, work, depth + 1
 				);
+			}
+			EffectLexicalScope parallel_scope = {
+				.parent = scope,
+				.parallel_bindings = parallel.bindings,
+			};
 			collect_lambda_effect_info(
-				registry, types, calls, expression.data.parallel.result, rows, row_tails,
-				lambdas, diagnostics, allocator, work, depth + 1
+				registry, types, calls, parallel.result, &parallel_scope,
+				rows, row_tails, lambdas, diagnostics, allocator, work, depth + 1
 			);
 		case SURFACE_HANDLER:
 			collect_lambda_effect_info(
-				registry, types, calls, expression.data.handler.handled, rows, row_tails,
-				lambdas, diagnostics, allocator, work, depth + 1
+				registry, types, calls, expression.data.handler.handled, scope,
+				rows, row_tails, lambdas, diagnostics, allocator, work, depth + 1
 			);
 			foreach (&clause : expression.data.handler.clauses)
+			{
+				EffectLexicalScope clause_scope = {
+					.parent = scope,
+					.names = clause.parameters,
+					.handler_effect_name = clause.effect_name,
+					.handler_operation_name = clause.operation_name,
+					.calls = calls,
+				};
 				collect_lambda_effect_info(
-					registry, types, calls, clause.body, rows, row_tails,
-					lambdas, diagnostics, allocator, work, depth + 1
+					registry, types, calls, clause.body, &clause_scope,
+					rows, row_tails, lambdas, diagnostics, allocator, work, depth + 1
 				);
+			}
+			String[1] return_name = { expression.data.handler.return_clause.parameter };
+			SurfaceExpr*[1] return_value = { expression.data.handler.handled };
+			EffectLexicalScope return_scope = {
+				.parent = scope,
+				.names = return_name[..],
+				.values = return_value[..],
+				.value_default_scope = scope,
+			};
 			collect_lambda_effect_info(
-				registry, types, calls, expression.data.handler.return_clause.body, rows, row_tails,
-				lambdas, diagnostics, allocator, work, depth + 1
+				registry, types, calls, expression.data.handler.return_clause.body,
+				&return_scope, rows, row_tails, lambdas, diagnostics, allocator,
+				work, depth + 1
 			);
 		case SURFACE_RESUME:
 			collect_lambda_effect_info(
-				registry, types, calls, expression.data.resume.value, rows, row_tails,
-				lambdas, diagnostics, allocator, work, depth + 1
+				registry, types, calls, expression.data.resume.value, scope,
+				rows, row_tails, lambdas, diagnostics, allocator, work, depth + 1
 			);
 		default:
 	}
@@ -2077,7 +3989,8 @@ fn EffectAnalysis infer_effect_rows(
 	EffectAnalysis analysis = { .allocator = allocator, .effect_epoch = registry.epoch };
 	List{MitosDiagnostic} diagnostics;
 	diagnostics.init(allocator);
-	EffectInferenceWork work = { .max = max_steps };
+	EffectInferenceWork work = { .allocator = allocator, .max = max_steps };
+	work.scopes.init(allocator);
 	EffectCallIndex calls = build_effect_call_index(program, &diagnostics, allocator);
 	defer calls.deinit();
 	List{EffectId}[] rows = alloc::new_array(allocator, List{EffectId}, program.functions.len);
@@ -2098,7 +4011,17 @@ fn EffectAnalysis infer_effect_rows(
 	foreach (&row : rows) row.init(allocator);
 	foreach (&edges : callers) edges.init(allocator);
 	foreach (function_index, &function : program.functions)
-		collect_effect_call_edges(&calls, function.body, (usz)function_index, callers, &work);
+	{
+		EffectLexicalScope function_scope = {
+			.names = function.parameters,
+			.calls = &calls,
+			.function_index_plus_one = (usz)function_index + 1,
+		};
+		collect_effect_call_edges(
+			&calls, function.body, &function_scope, (usz)function_index, callers, &work
+		);
+		effect_work_clear_scopes(&work);
+	}
 
 
 	List{usz} queue;
@@ -2117,10 +4040,17 @@ fn EffectAnalysis infer_effect_rows(
 		List{EffectId} collected;
 		collected.init(allocator);
 		SymbolKey* collected_tail = null;
+		EffectLexicalScope function_scope = {
+			.names = program.functions[function_index].parameters,
+			.calls = &calls,
+			.function_index_plus_one = function_index + 1,
+		};
 		collect_expression_effects(
-			registry, &calls, program.functions[function_index].body, &collected,
-			rows, propagated_tails, &collected_tail, &diagnostics, allocator, &work, 0
+			registry, &calls, program.functions[function_index].body, &function_scope,
+			&collected, rows, propagated_tails, &collected_tail, &diagnostics,
+			allocator, &work, 0
 		);
+		effect_work_clear_scopes(&work);
 		bool changed = false;
 		foreach (effect : collected)
 			if (inferred_row_add(&rows[function_index], effect, &work)) changed = true;
@@ -2154,11 +4084,19 @@ fn EffectAnalysis infer_effect_rows(
 	queue.free();
 	List{LambdaEffectInfo} lambdas;
 	lambdas.init(allocator);
-	foreach (&function : program.functions)
+	foreach (function_index, &function : program.functions)
+	{
+		EffectLexicalScope function_scope = {
+			.names = function.parameters,
+			.calls = &calls,
+			.function_index_plus_one = (usz)function_index + 1,
+		};
 		collect_lambda_effect_info(
-			registry, types, &calls, function.body, rows, propagated_tails,
-			&lambdas, &diagnostics, allocator, &work
+			registry, types, &calls, function.body, &function_scope,
+			rows, propagated_tails, &lambdas, &diagnostics, allocator, &work
 		);
+		effect_work_clear_scopes(&work);
+	}
 	analysis.lambdas = lambdas.to_array(allocator);
 	lambdas.free();
 	analysis.inference_steps = work.used;
@@ -2260,6 +4198,8 @@ fn EffectAnalysis infer_effect_rows(
 	alloc::free(allocator, inferred_tails);
 	alloc::free(allocator, propagated_tails);
 	alloc::free(allocator, queued);
+	effect_work_clear_scopes(&work);
+	work.scopes.free();
 	analysis.diagnostics = diagnostics.to_array(allocator);
 	analysis.effect_epoch = registry.epoch;
 	diagnostics.free();

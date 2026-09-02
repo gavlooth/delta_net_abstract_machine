@@ -55,6 +55,7 @@ struct StableSlotArena
 	SlotId next_id;
 	SlotId free_head;
 	usz live_count;
+	usz free_count;
 }
 
 fn bool slot_state_is_active(SlotState state) @private
@@ -115,6 +116,7 @@ fn void StableSlotArena.free(&self)
 	self.pages.free();
 	self.next_id = 0;
 	self.free_head = INVALID_SLOT_ID;
+	self.free_count = 0;
 	self.live_count = 0;
 	unlock_arena(self);
 	self.mutex.destroy();
@@ -129,12 +131,17 @@ fn SlotRef StableSlotArena.push(&self, Type value)
 
 	SlotId id;
 	StableSlot* slot;
+	assert((self.free_head == INVALID_SLOT_ID) == (self.free_count == 0),
+		"stable slot arena free-list metadata is inconsistent");
 	if (self.free_head != INVALID_SLOT_ID)
 	{
 		id = self.free_head;
 		slot = slot_unlocked(self, id);
 		assert(slot != null && slot.state == SLOT_STATE_FREE,
 			"stable slot arena free list is corrupt");
+		assert(self.free_count > 0,
+			"stable slot arena free count is corrupt");
+		self.free_count--;
 		self.free_head = slot.next_free;
 		assert(slot.generation < ulong::max,
 			"stable slot generation exhausted");
@@ -295,6 +302,8 @@ fn bool StableSlotArena.erase(&self, SlotRef reference)
 		|| slot.state == SLOT_STATE_FREE
 		|| slot.state == SLOT_STATE_CLAIMED) return false;
 
+	assert(self.free_count < usz::max,
+		"stable slot arena free count overflow");
 	if (slot.state == SLOT_STATE_LIVE)
 	{
 		assert(self.live_count > 0, "stable slot arena length underflow");
@@ -303,6 +312,7 @@ fn bool StableSlotArena.erase(&self, SlotRef reference)
 	slot.value = { };
 	slot.state = SLOT_STATE_FREE;
 	slot.next_free = self.free_head;
+	self.free_count++;
 	self.free_head = reference.id;
 	return true;
 }
@@ -313,6 +323,16 @@ fn usz StableSlotArena.len(&self) @operator(len)
 	lock_arena(self);
 	defer unlock_arena(self);
 	return self.live_count;
+}
+
+fn usz StableSlotArena.free_slots(&self)
+{
+	assert(self.allocator != null, "stable slot arena is not initialized");
+	lock_arena(self);
+	defer unlock_arena(self);
+	assert((self.free_head == INVALID_SLOT_ID) == (self.free_count == 0),
+		"stable slot arena free-list metadata is inconsistent");
+	return self.free_count;
 }
 
 fn bool StableSlotArena.is_empty(&self)

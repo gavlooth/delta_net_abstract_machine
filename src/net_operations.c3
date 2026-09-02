@@ -233,8 +233,47 @@ fn bool practical_agent_retire_storage(Net* net, NetRef practical_ref) @private
 }
 
 
-fn void practical_agent_free_allocations(PracticalAgent* practical) @private
+fn void net_account_node_payload_allocate(
+ Net* net,
+ Node* node,
+ usz bytes
+)
 {
+ if (!net.node_payload_bytes_accounted || !bytes) return;
+ assert(bytes <= usz::max - net.node_payload_bytes
+  && bytes <= usz::max - node.accounted_payload_bytes,
+  "net node payload byte accounting overflow");
+ net.node_payload_bytes += bytes;
+ node.accounted_payload_bytes += bytes;
+}
+
+fn void net_account_node_payload_free(Net* net, Node* node)
+{
+ usz bytes = node.accounted_payload_bytes;
+ if (!net.node_payload_bytes_accounted || !bytes) return;
+ assert(bytes <= net.node_payload_bytes,
+  "net node payload byte accounting underflow");
+ net.node_payload_bytes -= bytes;
+ node.accounted_payload_bytes = 0;
+}
+
+fn void net_account_node_references_allocate(
+ Net* net,
+ Node* node,
+ usz count
+)
+{
+ assert(count <= usz::max / (usz)NetRef::size,
+  "net node reference byte accounting overflow");
+ net_account_node_payload_allocate(
+  net, node, count * (usz)NetRef::size
+ );
+}
+
+fn void practical_agent_free_allocations(Net* net, Node* node) @private
+{
+ PracticalAgent* practical = &node.agent.practical;
+ net_account_node_payload_free(net, node);
  mem::free(practical.auxiliaries);
  practical.auxiliaries = { };
  if (practical.owns_text) mem::free(practical.text);
@@ -250,7 +289,7 @@ fn bool practical_agent_drop(Net* net, NetRef practical_ref)
 {
  if (!practical_agent_retire_storage(net, practical_ref)) return false;
  Node* node = net.nodes.get_ref(practical_ref);
- practical_agent_free_allocations(&node.agent.practical);
+ practical_agent_free_allocations(net, node);
  return true;
 }
 
@@ -306,12 +345,14 @@ fn void practical_continuation_index_invalidate(Net* net) @private
 
 fn Net* Net.init(&self)
 {
+ *self = { };
  self.ports.init();
  self.wires.init();
  self.nodes.init();
  self.interfaces.init();
  self.effects.continuations.init();
  self.effects.continuation_index = { };
+ self.node_payload_bytes_accounted = true;
  self.effects.continuation_shape_version = 1;
  self.storage.init();
  return self;
@@ -328,6 +369,7 @@ fn void Net.free(&self)
   Node* node = self.nodes.get_ref(node_ref);
   if (node.type == REPLICATOR)
   {
+   net_account_node_payload_free(self, node);
    mem::free(node.agent.replicator.auxiliaries);
   }
   else if (is_practical_agent_type(node.type))
@@ -335,7 +377,7 @@ fn void Net.free(&self)
    if (!practical_agent_drop(self, node_ref))
    {
     // Bulk storage teardown below remains authoritative for a malformed lease.
-    practical_agent_free_allocations(&node.agent.practical);
+    practical_agent_free_allocations(self, node);
    }
   }
  }
@@ -348,6 +390,8 @@ fn void Net.free(&self)
  mem::free(self.effects.commits);
  self.effects = { };
  self.storage.free();
+ self.node_payload_bytes = 0;
+ self.node_payload_bytes_accounted = false;
 }
 
 fn NetRef clone_port_value(Net* net, Port source, NetRef node_id) @private
@@ -367,6 +411,10 @@ fn NetRef[] clone_ports(Net* net, NetRef[] source_port_ids,
  NetRef node_id)
 {
  NetRef[] clones = mem::alloc_array(NetRef, source_port_ids.len);
+ Node* owner = net.nodes.get_ref(node_id);
+ net_account_node_references_allocate(
+  net, owner, (usz)source_port_ids.len
+ );
  foreach (idx, source_port_id : source_port_ids)
  {
   clones[idx] = clone_port(net, source_port_id, node_id);
@@ -458,6 +506,9 @@ fn NetRef new_replicator(Net* net, ulong level, long[] ordered_deltas,
   }},
   .type = REPLICATOR
  });
+ net_account_node_references_allocate(
+  net, net.nodes.get_ref(node_id), (usz)ordered_deltas.len
+ );
  net.ports.get_ref(principal).node_id = node_id;
  foreach (idx, delta : ordered_deltas)
  {
@@ -517,6 +568,9 @@ fn NetRef new_practical_agent(
   }},
   .type = type
  });
+ net_account_node_references_allocate(
+  net, net.nodes.get_ref(node_id), arity
+ );
  net.ports.get_ref(principal).node_id = node_id;
  foreach (index, &auxiliary : auxiliaries)
  {
@@ -691,6 +745,7 @@ fn bool destroy_node_record(Net* net, NetRef node_id)
  Node* node = net.nodes.get_ref(node_id);
  if (node.type == REPLICATOR)
  {
+  net_account_node_payload_free(net, node);
   mem::free(node.agent.replicator.auxiliaries);
  }
  else if (is_practical_agent_type(node.type)
@@ -738,6 +793,7 @@ fn void destroy_node(Net* net, NetRef node_id)
   {
    destroy_port(net, auxiliary);
   }
+  net_account_node_payload_free(net, &node);
   mem::free(node.agent.replicator.auxiliaries);
  default:
   if (!is_practical_agent_type(node.type)) unreachable("Unknown node type");

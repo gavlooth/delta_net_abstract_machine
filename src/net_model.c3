@@ -296,6 +296,8 @@ struct EffectNetMetadata
  StableSlotArena{EffectContinuation} continuations;
  OrderedEffectCommit[] commits;
  usz committed;
+ // Physical allocation count may exceed commits.len after in-place compaction.
+ usz commit_allocation_count;
  ulong program_epoch;
  ulong execution_epoch;
  ulong continuation_shape_version;
@@ -313,6 +315,7 @@ struct Node
 {
  Agent agent;
  AgentType type;
+ usz accounted_payload_bytes;
 }
 
 struct Net
@@ -322,5 +325,8 @@ struct Net
  StableSlotArena{Node} nodes;
  StableSlotArena{InterfacePort} interfaces;
  EffectNetMetadata effects;
+ // Heap payloads embedded in live nodes; arena pages are accounted separately.
+ usz node_payload_bytes;
+ bool node_payload_bytes_accounted;
  mitos_storage::StorageRuntime storage;
 }

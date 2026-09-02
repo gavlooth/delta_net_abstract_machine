@@ -75,6 +75,7 @@ struct LoweredValue
 	MirScope* closure_environment;
 	bool pending_effect;
 	usz effect_operation;
+	mitos::EffectId effect_instance;
 	mitos::DeltaNodeId effect_node;
 	ulong effect_epoch;
 	usz effect_source_order;
@@ -912,6 +913,14 @@ fn LoweredValue assert_runtime_type(
 	{
 		lowerer.fail("MIR runtime assertion references an invalid TypeId");
 		return { };
+	}
+	if (value.provenance_only
+		&& mitos::type_id_is_valid(&lowerer.source.types, value.type_id)
+		&& mitos::type_is_subtype(&lowerer.source.types, value.type_id, expected))
+	{
+		// Typed symbolic provenance already proves this assertion. Preserve it
+		// so exact closure identity survives constructor return and matching.
+		return value;
 	}
 	value = materialize_runtime_value(lowerer, value, depth + 1);
 	if (lowerer.failed || value.pending_effect) return value;
@@ -2151,8 +2160,9 @@ fn LoweredValue lower_handle_request(
 	bool handles_effect = false;
 	foreach (&clause : handler.clauses)
 	{
-		if (clause.effect == operation.effect) handles_effect = true;
-		if (clause.effect == operation.effect && clause.operation == operation.id)
+		if (clause.effect == request.effect_instance) handles_effect = true;
+		if (clause.effect == request.effect_instance
+			&& clause.operation == operation.id)
 		{
 			selected = clause;
 			break;
@@ -3598,6 +3608,7 @@ fn LoweredValue lower_node(
 				.type_id = node.result_type ? node.result_type : node.types[node.inputs.len],
 				.pending_effect = true,
 				.effect_operation = node.descriptor,
+				.effect_instance = (mitos::EffectId)node.integer,
 				.effect_node = node_id,
 				.effect_epoch = lowerer.source.effects.epoch,
 				.effect_source_order = lowerer.current_source_order,
@@ -4292,8 +4303,8 @@ fn LoweredValue materialize_external_effect(
 	mitos::TypeId lowered_result_type = lifted
 		? intern_superposition_type(lowerer, result_type) : result_type;
 	if (lowerer.failed) return { };
-	mitos::EffectId effect = effect_node ? (mitos::EffectId)effect_node.integer : operation.effect;
-	ulong packed = ((ulong)effect << 32) | (ulong)(uint)result_type;
+	ulong packed = ((ulong)request.effect_instance << 32)
+		| (ulong)(uint)result_type;
 	uint destination = new_register(lowerer);
 	emit(lowerer, {
 		.opcode = EXTERNAL_EFFECT,

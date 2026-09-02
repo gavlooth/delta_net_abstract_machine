@@ -150,7 +150,7 @@ fn bool AotWriter.claim_decode_bytes(&self, usz bytes)
 	return true;
 }
 
-fn void AotWriter.count(
+fn bool AotWriter.count(
 	&self,
 	usz value,
 	usz maximum,
@@ -162,9 +162,10 @@ fn void AotWriter.count(
 		|| !self.claim_decode_bytes(value * allocation_item_size))
 	{
 		self.failed = true;
-		return;
+		return false;
 	}
 	self.u32((uint)value);
+	return !self.failed;
 }
 
 fn void AotWriter.patch_u64(&self, usz offset, ulong value)
@@ -430,7 +431,9 @@ fn void aot_write_span(AotWriter* writer, mitos::MitosSpan span)
 
 fn void aot_write_type_ids(AotWriter* writer, mitos::TypeId[] values)
 {
-	writer.count(values.len, mitos::MITOS_DEFAULT_MAX_TYPES, mitos::TypeId::size);
+	if (!writer.count(
+		values.len, mitos::MITOS_DEFAULT_MAX_TYPES, mitos::TypeId::size
+	)) return;
 	foreach (value : values) writer.u32((uint)value);
 }
 
@@ -464,7 +467,7 @@ fn mitos::TypeId[] aot_read_node_type_ids(
 
 fn void aot_write_strings(AotWriter* writer, String[] values)
 {
-	writer.count(values.len, mitos::MITOS_MAX_METHODS, String::size);
+	if (!writer.count(values.len, mitos::MITOS_MAX_METHODS, String::size)) return;
 	foreach (value : values) writer.string(value);
 }
 
@@ -473,6 +476,7 @@ fn String[] aot_read_strings(AotReader* reader)
 	uint count = reader.u32();
 	if (!reader.count(count, mitos::MITOS_MAX_METHODS, 4, String::size)) return { };
 	String[] values = alloc::new_array(reader.allocator, String, count);
+	foreach (&value : values) *value = { };
 	foreach (&value : values) *value = reader.string();
 	return values;
 }
@@ -482,6 +486,7 @@ fn String[] aot_read_identifiers(AotReader* reader)
 	uint count = reader.u32();
 	if (!reader.count(count, mitos::MITOS_MAX_METHODS, 4, String::size)) return { };
 	String[] values = alloc::new_array(reader.allocator, String, count);
+	foreach (&value : values) *value = { };
 	foreach (&value : values) *value = reader.identifier();
 	return values;
 }
@@ -582,17 +587,17 @@ fn void aot_write_pattern(AotWriter* writer, mitos::MethodTypePattern* pattern, 
 	writer.string(pattern.name);
 	writer.u32((uint)pattern.type_id);
 	aot_write_span(writer, pattern.span);
-	writer.count(
+	if (!writer.count(
 		pattern.arguments.len,
 		mitos::MITOS_MAX_METHOD_VARIABLES,
 		mitos::MethodTypePattern::size
-	);
+	)) return;
 	foreach (&argument : pattern.arguments) aot_write_pattern(writer, argument, depth + 1);
 }
 
 fn mitos::MethodTypePattern aot_read_pattern(AotReader* reader, uint depth = 0)
 {
-	mitos::MethodTypePattern pattern;
+	mitos::MethodTypePattern pattern = { };
 	if (depth >= mitos::MITOS_MAX_TYPE_FORMAT_DEPTH)
 	{
 		reader.fail("AOT v4 method pattern nesting is too deep");
@@ -611,6 +616,7 @@ fn mitos::MethodTypePattern aot_read_pattern(AotReader* reader, uint depth = 0)
 		return pattern;
 	}
 	pattern.arguments = alloc::new_array(reader.allocator, mitos::MethodTypePattern, count);
+	foreach (&argument : pattern.arguments) *argument = { };
 	foreach (&argument : pattern.arguments) *argument = aot_read_pattern(reader, depth + 1);
 	return pattern;
 }
@@ -626,11 +632,11 @@ fn void aot_write_type_pattern(AotWriter* writer, mitos::TypePattern* pattern, u
 	writer.string(pattern.variable);
 	writer.u32((uint)pattern.constructor);
 	aot_write_span(writer, pattern.span);
-	writer.count(
+	if (!writer.count(
 		pattern.arguments.len,
 		mitos::MITOS_MAX_METHOD_VARIABLES,
 		mitos::TypePattern::size
-	);
+	)) return;
 	foreach (&argument : pattern.arguments)
 	{
 		aot_write_type_pattern(writer, argument, depth + 1);
@@ -639,7 +645,7 @@ fn void aot_write_type_pattern(AotWriter* writer, mitos::TypePattern* pattern, u
 
 fn mitos::TypePattern aot_read_type_pattern(AotReader* reader, uint depth = 0)
 {
-	mitos::TypePattern pattern;
+	mitos::TypePattern pattern = { };
 	if (depth >= mitos::MITOS_MAX_TYPE_FORMAT_DEPTH)
 	{
 		reader.fail("AOT v4 type pattern nesting is too deep");
@@ -658,6 +664,7 @@ fn mitos::TypePattern aot_read_type_pattern(AotReader* reader, uint depth = 0)
 		return pattern;
 	}
 	pattern.arguments = alloc::new_array(reader.allocator, mitos::TypePattern, count);
+	foreach (&argument : pattern.arguments) *argument = { };
 	foreach (&argument : pattern.arguments)
 	{
 		*argument = aot_read_type_pattern(reader, depth + 1);
@@ -670,11 +677,11 @@ fn void aot_write_types(AotWriter* writer, mitos::DeltaProgram* program)
 	aot_write_module_key(writer, &program.types.module_key);
 	writer.u64(program.types.epoch);
 	writer.u64((ulong)program.types.max_types);
-	writer.count(
+	if (!writer.count(
 		(usz)program.types.descriptors.len(),
 		mitos::MITOS_DEFAULT_MAX_TYPES,
 		mitos::TypeDescriptor::size
-	);
+	)) return;
 	foreach (&descriptor : program.types.descriptors)
 	{
 		aot_write_symbol_key(writer, &descriptor.key);
@@ -684,11 +691,11 @@ fn void aot_write_types(AotWriter* writer, mitos::DeltaProgram* program)
 		writer.u32((uint)descriptor.nominal_parent); writer.u32((uint)descriptor.constructor);
 		aot_write_type_ids(writer, descriptor.arguments); writer.u64((ulong)descriptor.arity);
 		aot_write_span(writer, descriptor.span);
-		writer.count(
+		if (!writer.count(
 			descriptor.fields.len,
 			mitos::MITOS_MAX_TYPE_FIELDS,
 			mitos::TypeFieldDescriptor::size
-		);
+		)) return;
 		foreach (&field : descriptor.fields)
 		{
 			writer.string(field.name); writer.string(field.type_pattern); writer.u32((uint)field.declared_type);
@@ -743,6 +750,7 @@ fn void aot_read_types(AotReader* reader, mitos::DeltaProgram* program)
 			return;
 		}
 		descriptor.fields = alloc::new_array(reader.allocator, mitos::TypeFieldDescriptor, field_count);
+		foreach (&field : descriptor.fields) *field = { };
 		foreach (&field : descriptor.fields)
 		{
 			field.name = reader.identifier();
@@ -765,32 +773,32 @@ fn void aot_write_methods(AotWriter* writer, mitos::DeltaProgram* program)
 	aot_write_module_key(writer, &program.methods.module_key);
 	writer.u64((ulong)program.methods.max_generics); writer.u64((ulong)program.methods.max_methods);
 	writer.u64((ulong)program.methods.method_count);
-	writer.count(
+	if (!writer.count(
 		(usz)program.methods.generics.len(),
 		mitos::MITOS_MAX_GENERIC_FUNCTIONS,
 		mitos::GenericFunction::size
-	);
+	)) return;
 	foreach (&generic : program.methods.generics)
 	{
 		aot_write_symbol_key(writer, &generic.key);
 		aot_write_module_key(writer, &generic.owner);
 		writer.string(generic.name); writer.u64((ulong)generic.arity); writer.u64(generic.epoch);
-		writer.count(
+		if (!writer.count(
 			(usz)generic.methods.len(),
 			mitos::MITOS_MAX_METHODS,
 			mitos::MethodDescriptor::size
-		);
+		)) return;
 		foreach (&method : generic.methods)
 		{
 			aot_write_symbol_key(writer, &method.key);
 			aot_write_symbol_key(writer, &method.generic_key);
 			aot_write_module_key(writer, &method.owner);
 			writer.u64((ulong)method.function_index);
-			writer.count(
+			if (!writer.count(
 				method.parameters.len,
 				mitos::MITOS_MAX_METHOD_VARIABLES,
 				mitos::MethodTypePattern::size
-			);
+			)) return;
 			foreach (&parameter : method.parameters) aot_write_pattern(writer, parameter);
 			aot_write_pattern(writer, &method.result); aot_write_strings(writer, method.type_variables);
 			writer.u64((ulong)method.source_order); aot_write_span(writer, method.span);
@@ -858,6 +866,7 @@ fn void aot_read_methods(AotReader* reader, mitos::DeltaProgram* program)
 				mitos::MethodTypePattern::size
 			)) return;
 			method.parameters = alloc::new_array(reader.allocator, mitos::MethodTypePattern, parameter_count);
+			foreach (&parameter : method.parameters) *parameter = { };
 			foreach (&parameter : method.parameters) *parameter = aot_read_pattern(reader);
 			method.result = aot_read_pattern(reader);
 			method.type_variables = aot_read_identifiers(reader);
@@ -874,11 +883,11 @@ fn void aot_read_methods(AotReader* reader, mitos::DeltaProgram* program)
 
 fn void aot_write_constructors(AotWriter* writer, mitos::DeltaProgram* program)
 {
-	writer.count(
+	if (!writer.count(
 		program.constructors.len,
 		MITOS_AOT_MAX_CONSTRUCTORS,
 		mitos::DeltaConstructorDescriptor::size
-	);
+	)) return;
 	foreach (&constructor : program.constructors)
 	{
 		aot_write_symbol_key(writer, &constructor.key);
@@ -886,11 +895,11 @@ fn void aot_write_constructors(AotWriter* writer, mitos::DeltaProgram* program)
 		writer.u32((uint)constructor.runtime_type); writer.u32((uint)constructor.type_constructor);
 		aot_write_strings(writer, constructor.parameters);
 		aot_write_strings(writer, constructor.fields); aot_write_type_ids(writer, constructor.field_types);
-		writer.count(
+		if (!writer.count(
 			constructor.field_patterns.len,
 			mitos::MITOS_MAX_TYPE_FIELDS,
 			mitos::TypePattern::size
-		);
+		)) return;
 		foreach (&pattern : constructor.field_patterns) aot_write_type_pattern(writer, pattern);
 		aot_write_span(writer, constructor.span);
 	}
@@ -904,6 +913,7 @@ fn void aot_read_constructors(AotReader* reader, mitos::DeltaProgram* program)
 		return;
 	}
 	program.constructors = alloc::new_array(reader.allocator, mitos::DeltaConstructorDescriptor, count);
+	foreach (&constructor : program.constructors) *constructor = { };
 	foreach (&constructor : program.constructors)
 	{
 		constructor.key = aot_read_symbol_key(reader);
@@ -925,6 +935,7 @@ fn void aot_read_constructors(AotReader* reader, mitos::DeltaProgram* program)
 			mitos::TypePattern,
 			pattern_count
 		);
+		foreach (&pattern : constructor.field_patterns) *pattern = { };
 		foreach (&pattern : constructor.field_patterns)
 		{
 			*pattern = aot_read_type_pattern(reader);
@@ -935,11 +946,11 @@ fn void aot_read_constructors(AotReader* reader, mitos::DeltaProgram* program)
 
 fn void aot_write_primitives(AotWriter* writer, mitos::DeltaProgram* program)
 {
-	writer.count(
+	if (!writer.count(
 		program.primitives.len,
 		MITOS_AOT_MAX_PRIMITIVES,
 		mitos::DeltaPrimitiveDescriptor::size
-	);
+	)) return;
 	foreach (&primitive : program.primitives)
 	{
 		aot_write_symbol_key(writer, &primitive.key);
@@ -956,6 +967,7 @@ fn void aot_read_primitives(AotReader* reader, mitos::DeltaProgram* program)
 		return;
 	}
 	program.primitives = alloc::new_array(reader.allocator, mitos::DeltaPrimitiveDescriptor, count);
+	foreach (&primitive : program.primitives) *primitive = { };
 	foreach (&primitive : program.primitives)
 	{
 		primitive.key = aot_read_symbol_key(reader);
@@ -971,11 +983,11 @@ fn void aot_read_primitives(AotReader* reader, mitos::DeltaProgram* program)
 
 fn void aot_write_nodes(AotWriter* writer, mitos::DeltaProgram* program)
 {
-	writer.count(
+	if (!writer.count(
 		program.image.nodes.len,
 		MITOS_AOT_MAX_NODES,
 		mitos::DeltaNode::size
-	);
+	)) return;
 	foreach (&node : program.image.nodes)
 	{
 		aot_write_symbol_key(writer, &node.key);
@@ -990,17 +1002,17 @@ fn void aot_write_nodes(AotWriter* writer, mitos::DeltaProgram* program)
 		aot_write_strings(writer, node.names); aot_write_type_ids(writer, node.types);
 		writer.u32((uint)node.runtime_type); writer.u32((uint)node.result_type);
 		aot_write_effect_row(writer, &node.effect_row);
-		writer.count(
+		if (!writer.count(
 			node.inputs.len,
 			MITOS_AOT_MAX_EDGES,
 			mitos::DeltaNodeId::size
-		);
+		)) return;
 		foreach (input : node.inputs) writer.u32((uint)input);
-		writer.count(
+		if (!writer.count(
 			node.branches.len,
 			mitos::MITOS_MAX_MATCH_ARMS,
 			mitos::DeltaMatchBranch::size
-		);
+		)) return;
 		foreach (&branch : node.branches)
 		{
 			writer.u32(branch.wildcard ? 1 : 0); writer.u32(branch.constructor);
@@ -1018,6 +1030,7 @@ fn void aot_read_nodes(AotReader* reader, mitos::DeltaProgram* program)
 		return;
 	}
 	program.image.nodes = alloc::new_array(reader.allocator, mitos::DeltaNode, count);
+	foreach (&node : program.image.nodes) *node = { };
 	foreach (&node : program.image.nodes)
 	{
 		node.key = aot_read_symbol_key(reader);
@@ -1086,6 +1099,7 @@ fn void aot_read_nodes(AotReader* reader, mitos::DeltaProgram* program)
 			return;
 		}
 		node.branches = alloc::new_array(reader.allocator, mitos::DeltaMatchBranch, branch_count);
+		foreach (&branch : node.branches) *branch = { };
 		foreach (&branch : node.branches)
 		{
 			branch.wildcard = reader.boolean(); branch.constructor = reader.u32();
@@ -1096,34 +1110,34 @@ fn void aot_read_nodes(AotReader* reader, mitos::DeltaProgram* program)
 
 fn void aot_write_graph(AotWriter* writer, mitos::DeltaProgram* program)
 {
-	writer.count(
+	if (!writer.count(
 		program.image.edges.len,
 		MITOS_AOT_MAX_EDGES,
 		mitos::DeltaEdge::size
-	);
+	)) return;
 	foreach (&edge : program.image.edges) { writer.u32((uint)edge.producer); writer.u32((uint)edge.consumer); writer.u64((ulong)edge.input); }
-	writer.count(
+	if (!writer.count(
 		program.image.interfaces.len,
 		MITOS_AOT_MAX_INTERFACES,
 		mitos::DeltaInterface::size
-	);
+	)) return;
 	foreach (&boundary : program.image.interfaces)
 	{
 		aot_write_symbol_key(writer, &boundary.key);
 		writer.u32((uint)boundary.kind); writer.string(boundary.name); writer.u32((uint)boundary.root); writer.u64((ulong)boundary.source_order);
 	}
-	writer.count(
+	if (!writer.count(
 		program.image.parallel_regions.len,
 		MITOS_AOT_MAX_PARALLEL_REGIONS,
 		mitos::DeltaParallelRegion::size
-	);
+	)) return;
 	foreach (&region : program.image.parallel_regions)
 	{
-		writer.count(
+		if (!writer.count(
 			region.roots.len,
 			mitos::MITOS_MAX_PARALLEL_BINDINGS,
 			mitos::DeltaNodeId::size
-		);
+		)) return;
 		foreach (root : region.roots) writer.u32((uint)root);
 		writer.u32((uint)region.join); writer.u64((ulong)region.source_order);
 	}
@@ -1143,6 +1157,7 @@ fn void aot_read_graph(AotReader* reader, mitos::DeltaProgram* program)
 	uint interface_count = reader.u32();
 	if (!reader.count(interface_count, MITOS_AOT_MAX_INTERFACES, 20, mitos::DeltaInterface::size)) return;
 	program.image.interfaces = alloc::new_array(reader.allocator, mitos::DeltaInterface, interface_count);
+	foreach (&boundary : program.image.interfaces) *boundary = { };
 	foreach (&boundary : program.image.interfaces)
 	{
 		boundary.key = aot_read_symbol_key(reader);
@@ -1161,6 +1176,7 @@ fn void aot_read_graph(AotReader* reader, mitos::DeltaProgram* program)
 		mitos::DeltaParallelRegion::size
 	)) return;
 	program.image.parallel_regions = alloc::new_array(reader.allocator, mitos::DeltaParallelRegion, region_count);
+	foreach (&region : program.image.parallel_regions) *region = { };
 	foreach (&region : program.image.parallel_regions)
 	{
 		uint root_count = reader.u32();
@@ -1179,22 +1195,22 @@ fn void aot_read_graph(AotReader* reader, mitos::DeltaProgram* program)
 fn void aot_write_roots(AotWriter* writer, mitos::DeltaProgram* program)
 {
 	writer.u32((uint)program.entry);
-	writer.count(
+	if (!writer.count(
 		program.method_roots.len,
 		mitos::MITOS_MAX_METHODS,
 		mitos::DeltaMethodRoot::size
-	);
+	)) return;
 	foreach (&root : program.method_roots)
 	{
 		aot_write_symbol_key(writer, &root.key);
 		aot_write_symbol_key(writer, &root.generic_key);
 		writer.u64((ulong)root.function_index); writer.u64((ulong)root.generic_index); writer.u64((ulong)root.method_index);
 		writer.u32((uint)root.root); aot_write_strings(writer, root.parameters); aot_write_type_ids(writer, root.parameter_types);
-		writer.count(
+		if (!writer.count(
 			root.parameter_patterns.len,
 			mitos::MITOS_MAX_METHOD_VARIABLES,
 			mitos::MethodTypePattern::size
-		);
+		)) return;
 		foreach (&pattern : root.parameter_patterns) aot_write_pattern(writer, pattern);
 		writer.u32((uint)root.result_type); aot_write_pattern(writer, &root.result_pattern);
 		aot_write_effect_row(writer, &root.effect_row); writer.u64((ulong)root.source_order);
@@ -1207,6 +1223,7 @@ fn void aot_read_roots(AotReader* reader, mitos::DeltaProgram* program)
 	uint count = reader.u32();
 	if (!reader.count(count, mitos::MITOS_MAX_METHODS, 48, mitos::DeltaMethodRoot::size)) return;
 	program.method_roots = alloc::new_array(reader.allocator, mitos::DeltaMethodRoot, count);
+	foreach (&root : program.method_roots) *root = { };
 	foreach (&root : program.method_roots)
 	{
 		root.key = aot_read_symbol_key(reader);
@@ -1226,6 +1243,7 @@ fn void aot_read_roots(AotReader* reader, mitos::DeltaProgram* program)
 			mitos::MethodTypePattern,
 			pattern_count
 		);
+		foreach (&pattern : root.parameter_patterns) *pattern = { };
 		foreach (&pattern : root.parameter_patterns) *pattern = aot_read_pattern(reader);
 		root.result_type = (mitos::TypeId)reader.u32();
 		root.result_pattern = aot_read_pattern(reader);
@@ -1236,11 +1254,11 @@ fn void aot_read_roots(AotReader* reader, mitos::DeltaProgram* program)
 
 fn void aot_write_spans(AotWriter* writer, mitos::DeltaProgram* program)
 {
-	writer.count(
+	if (!writer.count(
 		program.spans.len,
 		MITOS_AOT_MAX_SPANS,
 		mitos::MitosSpan::size
-	);
+	)) return;
 	foreach (span : program.spans) aot_write_span(writer, span);
 }
 
@@ -1254,11 +1272,11 @@ fn void aot_read_spans(AotReader* reader, mitos::DeltaProgram* program)
 
 fn void aot_write_effect_ids(AotWriter* writer, mitos::EffectId[] values)
 {
-	writer.count(
+	if (!writer.count(
 		values.len,
 		mitos::MITOS_MAX_EFFECT_INSTANCES,
 		mitos::EffectId::size
-	);
+	)) return;
 	foreach (value : values) writer.u32((uint)value);
 }
 
@@ -1275,59 +1293,59 @@ fn void aot_write_effects(AotWriter* writer, mitos::DeltaProgram* program)
 {
 	writer.u32((uint)program.effects.next_effect_id); writer.u32((uint)program.effects.next_operation_id);
 	writer.u64(program.effects.epoch);
-	writer.count(
+	if (!writer.count(
 		program.effects.effects.len,
 		mitos::MITOS_MAX_EFFECTS,
 		mitos::DeltaEffectDescriptor::size
-	);
+	)) return;
 	foreach (&effect : program.effects.effects)
 	{
 		aot_write_symbol_key(writer, &effect.key);
 		writer.u32((uint)effect.id); writer.string(effect.name); writer.u32(effect.multi ? 1 : 0);
 		aot_write_strings(writer, effect.parameters);
-		writer.count(
+		if (!writer.count(
 			effect.operations.len,
 			mitos::MITOS_MAX_EFFECT_OPERATIONS,
 			mitos::OperationId::size
-		);
+		)) return;
 		foreach (operation : effect.operations) writer.u32((uint)operation);
 		writer.u32(effect.span);
 	}
-	writer.count(
+	if (!writer.count(
 		program.effects.operations.len,
 		MITOS_AOT_MAX_EFFECT_OPERATIONS,
 		mitos::DeltaOperationDescriptor::size
-	);
+	)) return;
 	foreach (&operation : program.effects.operations)
 	{
 		aot_write_symbol_key(writer, &operation.key);
 		writer.u32((uint)operation.id); writer.u32((uint)operation.effect); writer.string(operation.name);
 		aot_write_strings(writer, operation.parameter_patterns);
-		writer.count(
+		if (!writer.count(
 			operation.parameter_types.len,
 			mitos::MITOS_MAX_EFFECT_OPERATIONS,
 			mitos::TypePattern::size
-		);
+		)) return;
 		foreach (&pattern : operation.parameter_types) aot_write_type_pattern(writer, pattern);
 		writer.string(operation.result_pattern); aot_write_type_pattern(writer, &operation.result_type);
 		writer.u32(operation.span); writer.u32((uint)operation.host_kind); writer.u32(operation.ordered ? 1 : 0);
 	}
-	writer.count(
+	if (!writer.count(
 		program.effects.instances.len,
 		mitos::MITOS_MAX_EFFECT_INSTANCES,
 		mitos::DeltaEffectInstanceDescriptor::size
-	);
+	)) return;
 	foreach (&instance : program.effects.instances)
 	{
 		aot_write_symbol_key(writer, &instance.key);
 		writer.u32((uint)instance.id); writer.u32((uint)instance.constructor);
 		aot_write_type_ids(writer, instance.arguments);
 	}
-	writer.count(
+	if (!writer.count(
 		program.effects.rows.len,
 		mitos::MITOS_MAX_METHODS,
 		mitos::DeltaEffectRowDescriptor::size
-	);
+	)) return;
 	foreach (&row : program.effects.rows)
 	{
 		aot_write_symbol_key(writer, &row.key);
@@ -1335,20 +1353,20 @@ fn void aot_write_effects(AotWriter* writer, mitos::DeltaProgram* program)
 		aot_write_effect_row(writer, &row.asserted);
 		writer.u32(row.has_assertion ? 1 : 0); writer.u64(row.effect_epoch);
 	}
-	writer.count(
+	if (!writer.count(
 		program.effects.handlers.len,
 		MITOS_AOT_MAX_HANDLERS,
 		mitos::DeltaHandlerDescriptor::size
-	);
+	)) return;
 	foreach (&handler : program.effects.handlers)
 	{
 		writer.u32(handler.stable_id);
 		writer.u32((uint)handler.handled);
-		writer.count(
+		if (!writer.count(
 			handler.clauses.len,
 			mitos::MITOS_MAX_HANDLER_CLAUSES,
 			mitos::DeltaHandlerClauseDescriptor::size
-		);
+		)) return;
 		foreach (&clause : handler.clauses)
 		{
 			aot_write_symbol_key(writer, &clause.key);
@@ -1374,6 +1392,7 @@ fn void aot_read_effects(AotReader* reader, mitos::DeltaProgram* program)
 		return;
 	}
 	program.effects.effects = alloc::new_array(reader.allocator, mitos::DeltaEffectDescriptor, effect_count);
+	foreach (&effect : program.effects.effects) *effect = { };
 	foreach (&effect : program.effects.effects)
 	{
 		effect.key = aot_read_symbol_key(reader);
@@ -1398,6 +1417,7 @@ fn void aot_read_effects(AotReader* reader, mitos::DeltaProgram* program)
 		mitos::DeltaOperationDescriptor::size
 	)) return;
 	program.effects.operations = alloc::new_array(reader.allocator, mitos::DeltaOperationDescriptor, operation_count);
+	foreach (&operation : program.effects.operations) *operation = { };
 	foreach (&operation : program.effects.operations)
 	{
 		operation.key = aot_read_symbol_key(reader);
@@ -1415,6 +1435,7 @@ fn void aot_read_effects(AotReader* reader, mitos::DeltaProgram* program)
 			mitos::TypePattern,
 			pattern_count
 		);
+		foreach (&pattern : operation.parameter_types) *pattern = { };
 		foreach (&pattern : operation.parameter_types) *pattern = aot_read_type_pattern(reader);
 		operation.result_pattern = reader.string();
 		operation.result_type = aot_read_type_pattern(reader);
@@ -1435,6 +1456,7 @@ fn void aot_read_effects(AotReader* reader, mitos::DeltaProgram* program)
 	program.effects.instances = alloc::new_array(
 		reader.allocator, mitos::DeltaEffectInstanceDescriptor, instance_count
 	);
+	foreach (&instance : program.effects.instances) *instance = { };
 	foreach (&instance : program.effects.instances)
 	{
 		instance.key = aot_read_symbol_key(reader);
@@ -1448,6 +1470,7 @@ fn void aot_read_effects(AotReader* reader, mitos::DeltaProgram* program)
 		return;
 	}
 	program.effects.rows = alloc::new_array(reader.allocator, mitos::DeltaEffectRowDescriptor, row_count);
+	foreach (&row : program.effects.rows) *row = { };
 	foreach (&row : program.effects.rows)
 	{
 		row.key = aot_read_symbol_key(reader);
@@ -1463,6 +1486,7 @@ fn void aot_read_effects(AotReader* reader, mitos::DeltaProgram* program)
 		mitos::DeltaHandlerDescriptor::size
 	)) return;
 	program.effects.handlers = alloc::new_array(reader.allocator, mitos::DeltaHandlerDescriptor, handler_count);
+	foreach (&handler : program.effects.handlers) *handler = { };
 	foreach (&handler : program.effects.handlers)
 	{
 		handler.stable_id = reader.u32(); handler.handled = (mitos::DeltaNodeId)reader.u32();
@@ -1474,6 +1498,7 @@ fn void aot_read_effects(AotReader* reader, mitos::DeltaProgram* program)
 			mitos::DeltaHandlerClauseDescriptor::size
 		)) return;
 		handler.clauses = alloc::new_array(reader.allocator, mitos::DeltaHandlerClauseDescriptor, clause_count);
+		foreach (&clause : handler.clauses) *clause = { };
 		foreach (&clause : handler.clauses)
 		{
 			clause.key = aot_read_symbol_key(reader);
@@ -1526,17 +1551,17 @@ fn void aot_write_manifest(AotWriter* writer, mitos::DeltaProgram* program)
 	writer.u32(program.schema.minor);
 	writer.u64((ulong)program.feature_manifest.required);
 	writer.u64((ulong)program.feature_manifest.optional);
-	writer.count(
+	if (!writer.count(
 		(usz)mitos::DELTA_RECORD_LAST_CORE,
 		MITOS_AOT_MAX_RECORDS,
 		uint::size
-	);
+	)) return;
 	for (uint tag = (uint)mitos::DELTA_RECORD_MANIFEST;
 		tag <= (uint)mitos::DELTA_RECORD_LAST_CORE; tag++)
 	{
 		writer.u32(tag);
 	}
-	writer.count(0, MITOS_AOT_MAX_RECORDS, uint::size);
+	if (!writer.count(0, MITOS_AOT_MAX_RECORDS, uint::size)) return;
 }
 
 fn uint[] aot_read_manifest_tags(AotReader* reader)
@@ -1675,46 +1700,57 @@ fn void aot_serialize_program(
 	defer record.deinit();
 	aot_write_manifest(&record, program);
 	artifact.record(AOT_MANIFEST, mitos::DELTA_RECORD_REQUIRED, &record);
+	if (artifact.failed) return;
 	record.deinit();
 	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_module(&record, program);
 	artifact.record(AOT_MODULE, mitos::DELTA_RECORD_REQUIRED, &record);
+	if (artifact.failed) return;
 	record.deinit();
 	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_types(&record, program);
 	artifact.record(AOT_TYPES, mitos::DELTA_RECORD_REQUIRED, &record);
+	if (artifact.failed) return;
 	record.deinit();
 	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_methods(&record, program);
 	artifact.record(AOT_METHODS, mitos::DELTA_RECORD_REQUIRED, &record);
+	if (artifact.failed) return;
 	record.deinit();
 	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_constructors(&record, program);
 	artifact.record(AOT_CONSTRUCTORS, mitos::DELTA_RECORD_REQUIRED, &record);
+	if (artifact.failed) return;
 	record.deinit();
 	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_primitives(&record, program);
 	artifact.record(AOT_PRIMITIVES, mitos::DELTA_RECORD_REQUIRED, &record);
+	if (artifact.failed) return;
 	record.deinit();
 	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_nodes(&record, program);
 	artifact.record(AOT_NODES, mitos::DELTA_RECORD_REQUIRED, &record);
+	if (artifact.failed) return;
 	record.deinit();
 	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_graph(&record, program);
 	artifact.record(AOT_GRAPH, mitos::DELTA_RECORD_REQUIRED, &record);
+	if (artifact.failed) return;
 	record.deinit();
 	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_roots(&record, program);
 	artifact.record(AOT_ROOTS, mitos::DELTA_RECORD_REQUIRED, &record);
+	if (artifact.failed) return;
 	record.deinit();
 	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_spans(&record, program);
 	artifact.record(AOT_SPANS, mitos::DELTA_RECORD_REQUIRED, &record);
+	if (artifact.failed) return;
 	record.deinit();
 	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_effects(&record, program);
 	artifact.record(AOT_EFFECTS, mitos::DELTA_RECORD_REQUIRED, &record);
+	if (artifact.failed) return;
 	record.deinit();
 	record.init(allocator, artifact.decode_budget, artifact.sizing);
 	aot_write_helper_abi(&record, program);
@@ -3536,6 +3572,18 @@ fn mitos::TypeId aot_node_metadata_type(
 		? node.result_type
 		: (node.runtime_type ? node.runtime_type : node.static_type);
 }
+
+fn bool aot_primitive_node_type_is_exact(
+	mitos::DeltaPrimitiveDescriptor* primitive,
+	mitos::DeltaNode* node
+)
+{
+	return node.static_type == primitive.result
+		&& (!node.runtime_type || node.runtime_type == primitive.result)
+		&& (!node.result_type || node.result_type == primitive.result)
+		&& node.inputs.len == primitive.parameters.len;
+}
+
 fn bool aot_match_scrutinee_type_is_compatible(
 	mitos::DeltaProgram* program,
 	mitos::DeltaNodeId scrutinee,
@@ -4091,6 +4139,828 @@ fn bool aot_routing_is_canonical(mitos::DeltaProgram* program)
 	return true;
 }
 
+struct AotEffectGraphVerifier
+{
+	mitos::DeltaProgram* program;
+	mitos::DeltaHandlerDescriptor*[] active_handlers;
+	mitos::DeltaApplyProvenanceSummary[] apply_provenance;
+	usz work;
+	bool failed;
+}
+
+fn bool aot_effect_charge(AotEffectGraphVerifier* verifier, usz amount = 1)
+{
+	if (verifier.failed
+		|| amount > (usz)mitos::DELTA_MAX_EVALUATION_STEPS - verifier.work)
+	{
+		verifier.failed = true;
+		return false;
+	}
+	verifier.work += amount;
+	return true;
+}
+
+fn bool aot_handler_covers_effect(
+	AotEffectGraphVerifier* verifier,
+	mitos::DeltaHandlerDescriptor* handler,
+	mitos::EffectId concrete
+)
+{
+	mitos::DeltaEffectInstanceDescriptor* instance =
+		aot_effect_instance(verifier.program, concrete);
+	mitos::EffectId constructor_id = instance ? instance.constructor : concrete;
+	mitos::DeltaEffectDescriptor* effect =
+		aot_effect_descriptor(verifier.program, constructor_id);
+	if (!effect) return false;
+	foreach (operation_id : effect.operations)
+	{
+		if (!aot_effect_charge(verifier)) return false;
+		bool covered = false;
+		foreach (&clause : handler.clauses)
+		{
+			if (!aot_effect_charge(verifier)) return false;
+			if (clause.effect == concrete && clause.operation == operation_id)
+			{
+				covered = true;
+				break;
+			}
+		}
+		if (!covered) return false;
+	}
+	return true;
+}
+
+fn bool aot_effect_is_handled(
+	AotEffectGraphVerifier* verifier,
+	mitos::EffectId effect,
+	usz active_count
+)
+{
+	for (usz index = active_count; index > 0; index--)
+	{
+		if (!aot_effect_charge(verifier)) return false;
+		if (aot_handler_covers_effect(
+			verifier, verifier.active_handlers[index - 1], effect
+		)) return true;
+	}
+	return false;
+}
+
+fn bool aot_effect_row_fits_scope(
+	AotEffectGraphVerifier* verifier,
+	mitos::ResolvedEffectRow* candidate,
+	mitos::ResolvedEffectRow* expected,
+	usz active_count
+)
+{
+	foreach (effect : candidate.required)
+	{
+		if (!aot_effect_charge(verifier)) return false;
+		if (!aot_effect_is_handled(verifier, effect, active_count)
+			&& !mitos::resolved_effect_row_contains(expected, effect)) return false;
+	}
+	return !candidate.has_tail
+		|| (expected.has_tail
+			&& mitos::symbol_key_equal(&candidate.tail, &expected.tail));
+}
+
+struct AotCallableBindings
+{
+	AotCallableBindings* parent;
+	String[] names;
+	mitos::DeltaNodeId[] values;
+	mitos::TypeId[] types;
+	AotCallableBindings* value_bindings;
+}
+
+struct AotCallableValue
+{
+	mitos::DeltaNodeId node;
+	mitos::TypeId type;
+	AotCallableBindings* bindings;
+}
+
+struct AotCallableApplication
+{
+	mitos::DeltaNode* node;
+	AotCallableBindings* bindings;
+	AotCallableApplication* next;
+}
+
+fn bool aot_callable_lookup(
+	AotEffectGraphVerifier* verifier,
+	AotCallableBindings* bindings,
+	String name,
+	AotCallableValue* result
+)
+{
+	*result = { };
+	for (AotCallableBindings* current = bindings; current; current = current.parent)
+	{
+		if (!aot_effect_charge(verifier)) return false;
+		for (usz index = current.names.len; index > 0; index--)
+		{
+			if (!aot_effect_charge(verifier)) return false;
+			usz candidate = index - 1;
+			if (current.names[candidate] != name) continue;
+			if (current.values.len == current.names.len)
+			{
+				result.node = current.values[candidate];
+				result.bindings = current.value_bindings;
+			}
+			if (current.types.len == current.names.len)
+			{
+				result.type = current.types[candidate];
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
+
+fn bool aot_callable_type_fits(
+	AotEffectGraphVerifier* verifier,
+	mitos::TypeId type_id,
+	mitos::ResolvedEffectRow* expected,
+	usz active_count
+)
+{
+	mitos::TypeDescriptor* descriptor =
+		mitos::type_descriptor(&verifier.program.types, type_id);
+	return descriptor
+		&& descriptor.kind
+			== mitos::TypeDescriptorKind.TYPE_DESCRIPTOR_FUNCTION_INSTANCE
+		&& aot_effect_row_fits_scope(
+			verifier, &descriptor.function_effects, expected, active_count
+		);
+}
+
+fn bool aot_apply_provenance_fits(
+	AotEffectGraphVerifier* verifier,
+	mitos::DeltaNodeId application,
+	mitos::ResolvedEffectRow* expected,
+	usz active_count,
+	bool* seen
+)
+{
+	*seen = false;
+	if (!application || (usz)application > verifier.apply_provenance.len)
+	{
+		return false;
+	}
+	mitos::DeltaApplyProvenanceSummary* summary =
+		&verifier.apply_provenance[(usz)application - 1];
+	if (!summary.seen) return true;
+	*seen = true;
+	mitos::DeltaNodeId[2] candidates = {
+		summary.first_lambda,
+		summary.second_lambda,
+	};
+	foreach (candidate : candidates)
+	{
+		if (!candidate) continue;
+		mitos::DeltaNode* lambda = mitos::delta_node(
+			verifier.program, candidate
+		);
+		if (!lambda || lambda.kind != mitos::DeltaNodeKind.DELTA_LAMBDA
+			|| !aot_effect_row_fits_scope(
+				verifier, &lambda.effect_row, expected, active_count
+			)) return false;
+	}
+	bool requires_feature =
+		(summary.many && summary.has_effectful_closure)
+		|| summary.uncertain_effectful_closure;
+	if (requires_feature
+		&& !(verifier.program.feature_manifest.required
+			& mitos::DELTA_FEATURE_DYNAMIC_EFFECT_CLOSURES)) return false;
+	return summary.first_lambda || summary.uncertain_closure;
+}
+
+fn bool aot_verify_callable_effects(
+	AotEffectGraphVerifier* verifier,
+	mitos::DeltaNodeId node_id,
+	AotCallableBindings* bindings,
+	mitos::ResolvedEffectRow* expected,
+	usz active_count,
+	usz depth,
+	AotCallableApplication* application = null
+)
+{
+	if (depth >= mitos::DELTA_MAX_EVALUATION_DEPTH
+		|| !aot_effect_charge(verifier)) return false;
+	mitos::DeltaNode* node = mitos::delta_node(verifier.program, node_id);
+	if (!node) return false;
+	switch (node.kind)
+	{
+		case DELTA_LAMBDA:
+			if (!application)
+			{
+				return aot_effect_row_fits_scope(
+					verifier, &node.effect_row, expected, active_count
+				);
+			}
+			if (node.inputs.len != 1
+				|| node.names.len + 1 != application.node.inputs.len)
+			{
+				return false;
+			}
+			AotCallableBindings lambda_bindings = {
+				.parent = bindings,
+				.names = node.names,
+				.values = application.node.inputs[1..],
+				.types = node.types,
+				.value_bindings = application.bindings,
+			};
+			return aot_verify_callable_effects(
+				verifier,
+				node.inputs[0],
+				&lambda_bindings,
+				expected,
+				active_count,
+				depth + 1,
+				application.next
+			);
+		case DELTA_MATCH:
+			if (!node.branches.len || node.inputs.len != 1) return false;
+			mitos::DeltaNodeId scrutinee_id = node.inputs[0];
+			AotCallableBindings* scrutinee_bindings = bindings;
+			for (usz hop = 0; hop < mitos::DELTA_MAX_EVALUATION_DEPTH; hop++)
+			{
+				mitos::DeltaNode* scrutinee = mitos::delta_node(
+					verifier.program, scrutinee_id
+				);
+				if (!scrutinee
+					|| scrutinee.kind != mitos::DeltaNodeKind.DELTA_LOCAL) break;
+				AotCallableValue source;
+				if (!aot_callable_lookup(
+					verifier, scrutinee_bindings, scrutinee.name, &source
+				) || !source.node) break;
+				scrutinee_id = source.node;
+				scrutinee_bindings = source.bindings;
+			}
+			mitos::DeltaNode* scrutinee = mitos::delta_node(
+				verifier.program, scrutinee_id
+			);
+			if (scrutinee
+				&& scrutinee.kind == mitos::DeltaNodeKind.DELTA_CONSTRUCTOR
+				&& scrutinee.descriptor < verifier.program.constructors.len)
+			{
+				mitos::DeltaMatchBranch* selected = null;
+				foreach (&branch : node.branches)
+				{
+					if (!aot_effect_charge(verifier)) return false;
+					if (branch.wildcard || branch.constructor == scrutinee.descriptor)
+					{
+						selected = branch;
+						if (!branch.wildcard) break;
+					}
+				}
+				if (!selected) return false;
+				mitos::DeltaConstructorDescriptor* constructor =
+					&verifier.program.constructors[scrutinee.descriptor];
+				AotCallableBindings branch_bindings = {
+					.parent = bindings,
+					.names = selected.bindings,
+					.values = scrutinee.inputs,
+					.types = constructor.field_types,
+					.value_bindings = scrutinee_bindings,
+				};
+				return aot_verify_callable_effects(
+					verifier,
+					selected.body,
+					&branch_bindings,
+					expected,
+					active_count,
+					depth + 1,
+					application
+				);
+			}
+			foreach (&branch : node.branches)
+			{
+				mitos::TypeId[] branch_types;
+				if (!branch.wildcard
+					&& branch.constructor < verifier.program.constructors.len)
+				{
+					branch_types =
+						verifier.program.constructors[branch.constructor].field_types;
+				}
+				AotCallableBindings branch_bindings = {
+					.parent = bindings,
+					.names = branch.bindings,
+					.types = branch_types,
+				};
+				if (!aot_verify_callable_effects(
+					verifier,
+					branch.body,
+					&branch_bindings,
+					expected,
+					active_count,
+					depth + 1,
+					application
+				)) return false;
+			}
+			return true;
+		case DELTA_LET:
+		case DELTA_PARALLEL_JOIN:
+			if (!node.names.len || node.inputs.len != node.names.len + 1)
+			{
+				return false;
+			}
+			AotCallableBindings result_bindings = {
+				.parent = bindings,
+				.names = node.names,
+				.values = node.inputs[:(sz)node.names.len],
+				.types = node.types,
+				.value_bindings = bindings,
+			};
+			return aot_verify_callable_effects(
+				verifier,
+				node.inputs[node.inputs.len - 1],
+				&result_bindings,
+				expected,
+				active_count,
+				depth + 1,
+				application
+			);
+		case DELTA_TYPE_ASSERT:
+			if (node.inputs.len != 1) return false;
+			return aot_verify_callable_effects(
+				verifier,
+				node.inputs[0],
+				bindings,
+				expected,
+				active_count,
+				depth + 1,
+				application
+			);
+		case DELTA_LOCAL:
+			AotCallableValue value;
+			if (aot_callable_lookup(verifier, bindings, node.name, &value))
+			{
+				if (value.node)
+				{
+					return aot_verify_callable_effects(
+						verifier,
+						value.node,
+						value.bindings,
+						expected,
+						active_count,
+						depth + 1,
+						application
+					);
+				}
+				if (!application && value.type)
+				{
+					if (value.type == mitos::TYPE_ID_FUNCTION) return true;
+					return aot_callable_type_fits(
+						verifier, value.type, expected, active_count
+					);
+				}
+			}
+			if (application) return false;
+			mitos::TypeId metadata = aot_node_metadata_type(
+				verifier.program, node_id
+			);
+			if (metadata == mitos::TYPE_ID_FUNCTION) return true;
+			return aot_callable_type_fits(
+				verifier, metadata, expected, active_count
+			);
+		case DELTA_GENERIC_CALL:
+			if (node.descriptor >= (usz)verifier.program.methods.generics.len())
+			{
+				return false;
+			}
+			mitos::GenericFunction* generic =
+				&verifier.program.methods.generics[(sz)node.descriptor];
+			if (!generic.methods.len()) return false;
+			foreach (&method : generic.methods)
+			{
+				if (!aot_effect_charge(verifier)
+					|| method.function_index >= verifier.program.method_roots.len)
+				{
+					return false;
+				}
+				mitos::DeltaMethodRoot* root =
+					&verifier.program.method_roots[method.function_index];
+				if (root.parameters.len != node.inputs.len) return false;
+				AotCallableBindings method_bindings = {
+					.names = root.parameters,
+					.values = node.inputs,
+					.types = root.parameter_types,
+					.value_bindings = bindings,
+				};
+				if (!aot_verify_callable_effects(
+					verifier,
+					root.root,
+					&method_bindings,
+					expected,
+					active_count,
+					depth + 1,
+					application
+				)) return false;
+			}
+			return true;
+		case DELTA_APPLY:
+			if (!node.inputs.len) return false;
+			AotCallableApplication pending = {
+				.node = node,
+				.bindings = bindings,
+				.next = application,
+			};
+			return aot_verify_callable_effects(
+				verifier,
+				node.inputs[0],
+				bindings,
+				expected,
+				active_count,
+				depth + 1,
+				&pending
+			);
+		case DELTA_HANDLER:
+			if (node.descriptor >= verifier.program.effects.handlers.len)
+			{
+				return false;
+			}
+			mitos::DeltaHandlerDescriptor* handler =
+				&verifier.program.effects.handlers[node.descriptor];
+			String[1] return_names = { handler.return_parameter };
+			mitos::TypeId[1] return_types = { handler.return_type };
+			mitos::DeltaNodeId[1] return_values = { handler.handled };
+			AotCallableBindings return_bindings = {
+				.parent = bindings,
+				.names = return_names[..],
+				.types = return_types[..],
+				.values = return_values[..],
+				.value_bindings = bindings,
+			};
+			if (!aot_verify_callable_effects(
+				verifier,
+				handler.return_body,
+				&return_bindings,
+				expected,
+				active_count,
+				depth + 1,
+				application
+			)) return false;
+			foreach (&clause : handler.clauses)
+			{
+				AotCallableBindings clause_bindings = {
+					.parent = bindings,
+					.names = clause.parameters,
+					.types = clause.parameter_types,
+				};
+				if (!aot_verify_callable_effects(
+					verifier,
+					clause.body,
+					&clause_bindings,
+					expected,
+					active_count,
+					depth + 1,
+					application
+				)) return false;
+			}
+			return true;
+		default:
+			if (application) return false;
+			return aot_callable_type_fits(
+				verifier,
+				aot_node_metadata_type(verifier.program, node_id),
+				expected,
+				active_count
+			);
+	}
+}
+
+fn bool aot_verify_node_effects(
+	AotEffectGraphVerifier* verifier,
+	mitos::DeltaNodeId node_id,
+	AotCallableBindings* bindings,
+	mitos::ResolvedEffectRow* expected,
+	usz active_count,
+	usz depth
+)
+{
+	if (depth >= mitos::DELTA_MAX_EVALUATION_DEPTH
+		|| !aot_effect_charge(verifier)) return false;
+	mitos::DeltaNode* node = mitos::delta_node(verifier.program, node_id);
+	if (!node) return false;
+
+	switch (node.kind)
+	{
+		case DELTA_LAMBDA:
+			return true;
+		case DELTA_MATCH:
+			if (!node.branches.len || node.inputs.len != 1
+				|| !aot_verify_node_effects(
+					verifier,
+					node.inputs[0],
+					bindings,
+					expected,
+					active_count,
+					depth + 1
+				)) return false;
+			mitos::DeltaNodeId scrutinee_id = node.inputs[0];
+			AotCallableBindings* scrutinee_bindings = bindings;
+			for (usz hop = 0; hop < mitos::DELTA_MAX_EVALUATION_DEPTH; hop++)
+			{
+				mitos::DeltaNode* scrutinee = mitos::delta_node(
+					verifier.program, scrutinee_id
+				);
+				if (!scrutinee
+					|| scrutinee.kind != mitos::DeltaNodeKind.DELTA_LOCAL) break;
+				AotCallableValue source;
+				if (!aot_callable_lookup(
+					verifier, scrutinee_bindings, scrutinee.name, &source
+				) || !source.node) break;
+				scrutinee_id = source.node;
+				scrutinee_bindings = source.bindings;
+			}
+			mitos::DeltaNode* scrutinee = mitos::delta_node(
+				verifier.program, scrutinee_id
+			);
+			if (scrutinee
+				&& scrutinee.kind == mitos::DeltaNodeKind.DELTA_CONSTRUCTOR
+				&& scrutinee.descriptor < verifier.program.constructors.len)
+			{
+				mitos::DeltaMatchBranch* selected = null;
+				foreach (&branch : node.branches)
+				{
+					if (!aot_effect_charge(verifier)) return false;
+					if (branch.wildcard || branch.constructor == scrutinee.descriptor)
+					{
+						selected = branch;
+						if (!branch.wildcard) break;
+					}
+				}
+				if (!selected) return false;
+				mitos::DeltaConstructorDescriptor* constructor =
+					&verifier.program.constructors[scrutinee.descriptor];
+				AotCallableBindings branch_bindings = {
+					.parent = bindings,
+					.names = selected.bindings,
+					.values = scrutinee.inputs,
+					.types = constructor.field_types,
+					.value_bindings = scrutinee_bindings,
+				};
+				return aot_verify_node_effects(
+					verifier,
+					selected.body,
+					&branch_bindings,
+					expected,
+					active_count,
+					depth + 1
+				);
+			}
+			foreach (&branch : node.branches)
+			{
+				mitos::TypeId[] branch_types;
+				if (!branch.wildcard
+					&& branch.constructor < verifier.program.constructors.len)
+				{
+					branch_types =
+						verifier.program.constructors[branch.constructor].field_types;
+				}
+				AotCallableBindings branch_bindings = {
+					.parent = bindings,
+					.names = branch.bindings,
+					.types = branch_types,
+				};
+				if (!aot_verify_node_effects(
+					verifier,
+					branch.body,
+					&branch_bindings,
+					expected,
+					active_count,
+					depth + 1
+				)) return false;
+			}
+			return true;
+		case DELTA_HANDLER:
+			if (node.descriptor >= verifier.program.effects.handlers.len
+				|| active_count >= verifier.active_handlers.len) return false;
+			mitos::DeltaHandlerDescriptor* handler =
+				&verifier.program.effects.handlers[node.descriptor];
+			verifier.active_handlers[active_count] = handler;
+			if (!aot_verify_node_effects(
+				verifier,
+				handler.handled,
+				bindings,
+				expected,
+				active_count + 1,
+				depth + 1
+			)) return false;
+			foreach (&clause : handler.clauses)
+			{
+				AotCallableBindings clause_bindings = {
+					.parent = bindings,
+					.names = clause.parameters,
+					.types = clause.parameter_types,
+				};
+				if (!aot_verify_node_effects(
+					verifier,
+					clause.body,
+					&clause_bindings,
+					expected,
+					active_count,
+					depth + 1
+				)) return false;
+			}
+			String[1] return_names = { handler.return_parameter };
+			mitos::TypeId[1] return_types = { handler.return_type };
+			mitos::DeltaNodeId[1] return_values = { handler.handled };
+			AotCallableBindings return_bindings = {
+				.parent = bindings,
+				.names = return_names[..],
+				.types = return_types[..],
+				.values = return_values[..],
+				.value_bindings = bindings,
+			};
+			return aot_verify_node_effects(
+				verifier,
+				handler.return_body,
+				&return_bindings,
+				expected,
+				active_count,
+				depth + 1
+			);
+		case DELTA_EFFECT:
+			foreach (input : node.inputs)
+			{
+				if (!aot_verify_node_effects(
+					verifier, input, bindings, expected, active_count, depth + 1
+				)) return false;
+			}
+			mitos::EffectId concrete = (mitos::EffectId)node.integer;
+			return aot_effect_is_handled(verifier, concrete, active_count)
+				|| mitos::resolved_effect_row_contains(expected, concrete);
+		case DELTA_GENERIC_CALL:
+			foreach (input : node.inputs)
+			{
+				if (!aot_verify_node_effects(
+					verifier, input, bindings, expected, active_count, depth + 1
+				)) return false;
+			}
+			if (node.descriptor >= (usz)verifier.program.methods.generics.len())
+			{
+				return false;
+			}
+			mitos::GenericFunction* generic =
+				&verifier.program.methods.generics[(sz)node.descriptor];
+			foreach (&method : generic.methods)
+			{
+				if (!aot_effect_charge(verifier)) return false;
+				if (method.function_index >= verifier.program.effects.rows.len)
+				{
+					return false;
+				}
+				mitos::DeltaEffectRowDescriptor* row =
+					&verifier.program.effects.rows[method.function_index];
+				mitos::ResolvedEffectRow* selected =
+					row.has_assertion ? &row.asserted : &row.inferred;
+				if (!aot_effect_row_fits_scope(
+					verifier, selected, expected, active_count
+				)) return false;
+			}
+			return true;
+		case DELTA_APPLY:
+			foreach (input : node.inputs)
+			{
+				if (!aot_verify_node_effects(
+					verifier, input, bindings, expected, active_count, depth + 1
+				)) return false;
+			}
+			if (!aot_effect_row_fits_scope(
+				verifier, &node.effect_row, expected, active_count
+			)) return false;
+			mitos::TypeId callee_type =
+				aot_node_metadata_type(verifier.program, node.inputs[0]);
+			mitos::TypeDescriptor* callee =
+				mitos::type_descriptor(&verifier.program.types, callee_type);
+			if (callee
+				&& callee.kind
+					== mitos::TypeDescriptorKind.TYPE_DESCRIPTOR_FUNCTION_INSTANCE)
+			{
+				return mitos::resolved_effect_row_equal(
+					&node.effect_row, &callee.function_effects
+				);
+			}
+			bool provenance_seen;
+			if (!aot_apply_provenance_fits(
+				verifier, node_id, expected, active_count, &provenance_seen
+			)) return false;
+			if (provenance_seen) return true;
+			return aot_verify_callable_effects(
+				verifier,
+				node.inputs[0],
+				bindings,
+				expected,
+				active_count,
+				0
+			);
+		case DELTA_LET:
+		case DELTA_PARALLEL_JOIN:
+			if (!node.names.len || node.inputs.len != node.names.len + 1)
+			{
+				return false;
+			}
+			foreach (input : node.inputs[:(sz)node.names.len])
+			{
+				if (!aot_verify_node_effects(
+					verifier, input, bindings, expected, active_count, depth + 1
+				)) return false;
+			}
+			AotCallableBindings result_bindings = {
+				.parent = bindings,
+				.names = node.names,
+				.values = node.inputs[:(sz)node.names.len],
+				.types = node.types,
+				.value_bindings = bindings,
+			};
+			return aot_verify_node_effects(
+				verifier,
+				node.inputs[node.inputs.len - 1],
+				&result_bindings,
+				expected,
+				active_count,
+				depth + 1
+			);
+		default:
+			foreach (input : node.inputs)
+			{
+				if (!aot_verify_node_effects(
+					verifier, input, bindings, expected, active_count, depth + 1
+				)) return false;
+			}
+			foreach (&branch : node.branches)
+			{
+				AotCallableBindings branch_bindings = {
+					.parent = bindings,
+					.names = branch.bindings,
+				};
+				if (!aot_verify_node_effects(
+					verifier,
+					branch.body,
+					&branch_bindings,
+					expected,
+					active_count,
+					depth + 1
+				)) return false;
+			}
+			return true;
+	}
+}
+
+fn bool aot_executable_effect_rows_are_coherent(
+	mitos::DeltaProgram* program,
+	Allocator allocator
+)
+{
+	mitos::DeltaApplyProvenanceResult apply_provenance =
+		mitos::delta_program_apply_provenance(program, allocator);
+	defer apply_provenance.deinit();
+	if (apply_provenance.by_node.len != program.image.nodes.len) return false;
+	mitos::DeltaHandlerDescriptor*[] active_handlers = alloc::new_array(
+		allocator,
+		mitos::DeltaHandlerDescriptor*,
+		(sz)mitos::DELTA_MAX_EVALUATION_DEPTH
+	);
+	defer alloc::free(allocator, active_handlers);
+	AotEffectGraphVerifier verifier = {
+		.program = program,
+		.active_handlers = active_handlers,
+		.apply_provenance = apply_provenance.by_node,
+	};
+	foreach (&root : program.method_roots)
+	{
+		AotCallableBindings root_bindings = {
+			.names = root.parameters,
+			.types = root.parameter_types,
+		};
+		if (!aot_verify_node_effects(
+			&verifier, root.root, &root_bindings, &root.effect_row, 0, 0
+		) || verifier.failed) return false;
+	}
+	foreach (&node : program.image.nodes)
+	{
+		if (node.kind != mitos::DeltaNodeKind.DELTA_LAMBDA) continue;
+		AotCallableBindings lambda_bindings = {
+			.names = node.names,
+			.types = node.types,
+		};
+		if (node.inputs.len != 1
+			|| !aot_verify_node_effects(
+				&verifier,
+				node.inputs[0],
+				&lambda_bindings,
+				&node.effect_row,
+				0,
+				0
+			) || verifier.failed) return false;
+	}
+	return true;
+}
+
 fn bool validate_aot_delta_program(mitos::DeltaProgram* program)
 {
 	if (!program || !program.module_key.canonical.len
@@ -4337,6 +5207,8 @@ fn bool validate_aot_delta_program(mitos::DeltaProgram* program)
 		mitos::ModuleKey core = {
 			.canonical = mitos::MITOS_CORE_MODULE_CANONICAL
 		};
+		mitos::TypeId expected_result = index >= 5
+			? mitos::TYPE_ID_BOOL : mitos::TYPE_ID_I64;
 		if (primitive.id != (uint)index + 1 || !primitive.name.len
 			|| primitive.name != primitive_names[(usz)index]
 			|| !aot_valid_key(program, &primitive.key)
@@ -4345,13 +5217,12 @@ fn bool validate_aot_delta_program(mitos::DeltaProgram* program)
 			|| primitive.key.arity != (uint)primitive.arity
 			|| primitive.key.canonical_signature != "primitive"
 			|| !mitos::module_key_equal(&primitive.key.owner, &core)
-			|| primitive.operation
-				!= (mitos::DeltaPrimitiveOp)index
+			|| primitive.operation != (mitos::DeltaPrimitiveOp)index
 			|| primitive.arity != 2
 			|| primitive.parameters.len != 2
-			|| !aot_valid_type(program, primitive.result)) return false;
-		foreach (type_id : primitive.parameters)
-			if (!aot_valid_type(program, type_id)) return false;
+			|| primitive.parameters[0] != mitos::TYPE_ID_I64
+			|| primitive.parameters[1] != mitos::TYPE_ID_I64
+			|| primitive.result != expected_result) return false;
 	}
 	foreach (index, &node : program.image.nodes)
 	{
@@ -4526,12 +5397,13 @@ fn bool validate_aot_delta_program(mitos::DeltaProgram* program)
 			case DELTA_TYPE_OF:
 				if (node.inputs.len != 1 || node.static_type != mitos::TYPE_ID_TYPE) return false;
 			case DELTA_PRIMITIVE:
-				if (node.descriptor >= program.primitives.len
-					|| !mitos::symbol_key_equal(
-						&node.key, &program.primitives[node.descriptor].key
-					)
-					|| node.inputs.len
-						!= program.primitives[node.descriptor].arity) return false;
+				if (node.descriptor >= program.primitives.len) return false;
+				mitos::DeltaPrimitiveDescriptor* primitive =
+					&program.primitives[node.descriptor];
+				if (!mitos::symbol_key_equal(&node.key, &primitive.key)
+					|| !aot_primitive_node_type_is_exact(
+						primitive, node
+					)) return false;
 			case DELTA_PARALLEL_ROOT:
 				if (node.inputs.len != 1
 					|| !mitos::source_identifier_is_valid(node.name)) return false;
@@ -4673,10 +5545,19 @@ fn bool validate_aot_delta_program(mitos::DeltaProgram* program)
 			|| !aot_valid_effect_row(program, &row.inferred)
 			|| !aot_valid_effect_row(program, &row.asserted)
 			|| (!row.has_assertion
-				&& (row.asserted.required.len || row.asserted.has_tail)))
+				&& (row.asserted.required.len || row.asserted.has_tail))
+			|| (row.has_assertion
+				&& !mitos::resolved_effect_row_satisfies(
+					&row.inferred, &row.asserted
+				)))
 		{
 			return false;
 		}
+		mitos::ResolvedEffectRow* executable = row.has_assertion
+			? &row.asserted : &row.inferred;
+		if (!mitos::resolved_effect_row_equal(
+			executable, &program.method_roots[row.function_index].effect_row
+		)) return false;
 	}
 	usz[] operation_counts = alloc::new_array(
 		program.allocator, usz, (sz)program.effects.effects.len
@@ -4858,7 +5739,7 @@ fn bool validate_aot_delta_program(mitos::DeltaProgram* program)
 			}
 		}
 	}
-	return true;
+	return aot_executable_effect_rows_are_coherent(program, program.allocator);
 }
 
 fn mitos::MitosSpan aot_operation_span(
@@ -4919,7 +5800,12 @@ fn MitosAotResult execute_mitos_aot(String path, Allocator allocator = mem)
 		return aot_error(allocator, "unsupported AOT artifact major version; expected AOT v4");
 	}
 	uint container_minor = header.u32();
-	(void)container_minor;
+	if (container_minor != mitos::DELTA_AOT_CONTAINER_MINOR)
+	{
+		return aot_error(
+			allocator, "unsupported AOT artifact minor version; expected AOT v4.0"
+		);
+	}
 	uint header_length = header.u32();
 	ulong artifact_length = header.u64();
 	if (header.failed || header_length != MITOS_AOT_HEADER_LENGTH

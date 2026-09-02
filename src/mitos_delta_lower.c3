@@ -438,6 +438,21 @@ fn DeltaNodeId delta_lower_handler(
 			alloc::free(lowerer.allocator, parameter_types);
 			continue;
 		}
+		foreach (parameter_index, &parameter_annotation : clause.parameter_annotations)
+		{
+			if (parameter_index >= parameter_types.len || !parameter_annotation.value) continue;
+			TypeId annotated_type = delta_resolve_annotation(
+				lowerer, parameter_annotation, true
+			);
+			MitosDiagnostic parameter_diagnostic;
+			if (!validate_runtime_annotation(
+				&lowerer.program.types, parameter_types[parameter_index],
+				annotated_type, &parameter_diagnostic, parameter_annotation.span
+			))
+			{
+				lowerer.diagnostics.push(parameter_diagnostic);
+			}
+		}
 		foreach (parameter_index, parameter : clause.parameters)
 			parameters[parameter_index] = parameter.copy(lowerer.allocator);
 		usz resume_count = delta_count_resumes(clause.body);
@@ -554,8 +569,9 @@ fn DeltaNodeId delta_lower_application(
 	if (application.callee && application.callee.kind == SURFACE_VARIABLE)
 	{
 		String name = application.callee.data.variable.name;
+		bool lexical_callee = delta_scope_contains(scope, name);
 		sz constructor = delta_constructor_index(lowerer.program, name);
-		if (constructor >= 0)
+		if (constructor >= 0 && !lexical_callee)
 		{
 			DeltaConstructorDescriptor* descriptor = &lowerer.program.constructors[(usz)constructor];
 			if (descriptor.fields.len != arity)
@@ -602,7 +618,7 @@ fn DeltaNodeId delta_lower_application(
 				.inputs = inputs,
 			}, expression.span);
 		}
-		if (name == "superpose")
+		if (!lexical_callee && name == "superpose")
 		{
 			if (!arity)
 			{
@@ -650,7 +666,7 @@ fn DeltaNodeId delta_lower_application(
 				.inputs = inputs,
 			}, expression.span);
 		}
-		if (name == "collapse" && arity == 1)
+		if (!lexical_callee && name == "collapse" && arity == 1)
 		{
 			DeltaNodeId[] inputs = alloc::new_array(lowerer.allocator, DeltaNodeId, 1);
 			inputs[0] = delta_lower_expression(lowerer, application.arguments[0], scope);
@@ -679,12 +695,12 @@ fn DeltaNodeId delta_lower_application(
 				.inputs = inputs,
 			}, expression.span);
 		}
-		if (name == "collapse")
+		if (!lexical_callee && name == "collapse")
 		{
 			delta_lower_error(lowerer, "collapse expects exactly one argument", expression.span);
 			return DELTA_NODE_INVALID;
 		}
-		if (name == "typeOf" && arity == 1)
+		if (!lexical_callee && name == "typeOf" && arity == 1)
 		{
 			DeltaNodeId[] inputs = alloc::new_array(lowerer.allocator, DeltaNodeId, 1);
 			inputs[0] = delta_lower_expression(lowerer, application.arguments[0], scope);
@@ -692,7 +708,7 @@ fn DeltaNodeId delta_lower_application(
 				.kind = DELTA_TYPE_OF, .static_type = TYPE_ID_TYPE, .inputs = inputs,
 			}, expression.span);
 		}
-		if (name == "assertType" && arity == 2)
+		if (!lexical_callee && name == "assertType" && arity == 2)
 		{
 			SurfaceExpr* type_expression = application.arguments[1];
 			TypeId asserted = TYPE_ID_INVALID;
@@ -714,7 +730,7 @@ fn DeltaNodeId delta_lower_application(
 			}, expression.span);
 		}
 		sz generic = delta_generic_index(lowerer.program, name, arity);
-		if (generic >= 0 && !delta_scope_contains(scope, name))
+		if (generic >= 0 && !lexical_callee)
 		{
 			DeltaNodeId[] inputs = alloc::new_array(lowerer.allocator, DeltaNodeId, (sz)arity);
 			foreach (index, argument : application.arguments) inputs[index] = delta_lower_expression(lowerer, argument, scope);

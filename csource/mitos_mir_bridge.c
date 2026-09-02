@@ -147,6 +147,7 @@ typedef struct Runtime {
     EffectInstanceEntry *effect_instance_index;
     size_t effect_instance_index_capacity;
     ExecutionControl *execution;
+    ParallelJob *parallel_job;
     uint64_t source_order;
     EffectOccurrenceScope **effect_occurrence_buckets;
     size_t effect_occurrence_capacity;
@@ -156,6 +157,7 @@ typedef struct Runtime {
     unsigned owns_indexes : 1;
     unsigned owns_nullary_values : 1;
     unsigned is_parallel_worker : 1;
+    unsigned deterministic_parallel : 1;
     unsigned budget_exhausted : 1;
     MitosMirSpan diagnostic_span;
     char diagnostic[MITOS_DIAGNOSTIC_BYTES];
@@ -2274,6 +2276,7 @@ struct ParallelJob {
     uint32_t argument_count;
     Value *result;
     ParallelJob *next;
+    ParallelJob *parent;
     uint64_t registration_order;
     uint64_t source_order;
     uint64_t site_order;
@@ -2289,6 +2292,7 @@ struct ParallelJob {
     uint32_t entry_call_depth;
     int budget_reserved;
     int child_released;
+    int replay_prune;
 };
 
 static int parallel_job_run(ParallelJob *job) {
@@ -2431,6 +2435,23 @@ static int parallel_job_wait(ParallelJob *job) {
     mtx_unlock(&control->mutex);
     return 1;
 }
+static int parallel_job_start_inline(ParallelJob *job) {
+    ExecutionControl *control = job->control;
+    if (mtx_lock(&control->mutex) != thrd_success) return 0;
+    if (job->start_state != PARALLEL_JOB_STARTING) {
+        mtx_unlock(&control->mutex);
+        return 1;
+    }
+    job->start_state = PARALLEL_JOB_INLINE_RUNNING;
+    cnd_broadcast(&control->completed);
+    mtx_unlock(&control->mutex);
+    (void) parallel_job_main(job);
+    if (mtx_lock(&control->mutex) != thrd_success) return 0;
+    job->start_state = PARALLEL_JOB_INLINE_DONE;
+    cnd_broadcast(&control->completed);
+    mtx_unlock(&control->mutex);
+    return 1;
+}
 static int parallel_start_pending(ExecutionControl *control) {
     ParallelJob *cursor = NULL;
     for (;;) {
@@ -2447,12 +2468,15 @@ static int parallel_start_pending(ExecutionControl *control) {
             mtx_unlock(&control->mutex);
             continue;
         }
-        workers = atomic_load_explicit(
-            &control->active_workers, memory_order_relaxed);
-        while (workers < control->max_workers
-               && !atomic_compare_exchange_weak_explicit(
-                   &control->active_workers, &workers, workers + 1u,
-                   memory_order_acq_rel, memory_order_relaxed)) { }
+        workers = control->max_workers;
+        if (!job->child.deterministic_parallel) {
+            workers = atomic_load_explicit(
+                &control->active_workers, memory_order_relaxed);
+            while (workers < control->max_workers
+                   && !atomic_compare_exchange_weak_explicit(
+                       &control->active_workers, &workers, workers + 1u,
+                       memory_order_acq_rel, memory_order_relaxed)) { }
+        }
         if (workers < control->max_workers) {
             job->worker_slot_reserved = 1;
             if (thrd_create(&job->thread, parallel_job_main, job)
@@ -2554,8 +2578,10 @@ static void parallel_job_reset_child(ParallelJob *job) {
     child->effect_instance_index = effect_instance_index;
     child->effect_instance_index_capacity = effect_instance_index_capacity;
     child->execution = job->control;
+    child->parallel_job = job;
     child->source_order = job->source_order;
     child->is_parallel_worker = 1;
+    child->deterministic_parallel = 1;
     child->nullary_values = nullary_values;
     child->call_depth = job->entry_call_depth;
     job->thread_result = 0;
@@ -2573,6 +2599,57 @@ static int parallel_job_source_compare(const void *left, const void *right) {
         : a->registration_order != b->registration_order;
 }
 
+static int parallel_discard_replayed_descendants(
+    ExecutionControl *control
+) {
+    ParallelJob *job;
+    ParallelJob *previous = NULL;
+    ParallelJob *discarded = NULL;
+    if (mtx_lock(&control->mutex) != thrd_success) return 0;
+    job = control->jobs;
+    while (job != NULL) {
+        ParallelJob *next = job->next;
+        if (job->parent == NULL) {
+            previous = job;
+        } else {
+            job->replay_prune = job->parent->replay_prune;
+            if (!job->replay_prune) {
+                previous = job;
+            } else {
+                if (job->child.call_fuel_count != 0)
+                    (void) atomic_fetch_sub_explicit(
+                        &control->call_fuel,
+                        job->child.call_fuel_count,
+                        memory_order_relaxed);
+                if (previous == NULL)
+                    control->jobs = next;
+                else
+                    previous->next = next;
+                job->next = discarded;
+                discarded = job;
+            }
+        }
+        job = next;
+    }
+    control->jobs_tail = previous;
+    for (job = control->jobs; job != NULL; job = job->next)
+        job->replay_prune = 0;
+    mtx_unlock(&control->mutex);
+    while (discarded != NULL) {
+        ParallelJob *next = discarded->next;
+        if (!discarded->child_released) runtime_free(&discarded->child);
+        runtime_free(&discarded->result_snapshot);
+        runtime_free(&discarded->argument_snapshot);
+        if (discarded->budget_reserved)
+            execution_budget_release_control(
+                control, 1u, sizeof(*discarded));
+        free(discarded);
+        discarded = next;
+    }
+    return 1;
+}
+
+
 static int parallel_replay_budget_failures(ExecutionControl *control) {
     ParallelJob *job;
     ParallelJob **ordered;
@@ -2587,12 +2664,13 @@ static int parallel_replay_budget_failures(ExecutionControl *control) {
     }
     for (job = control->jobs; job != NULL; job = job->next) {
         if (job->child_released) continue;
-        ++count;
         if (job->child.budget_exhausted
             || job->result_snapshot.budget_exhausted) exhausted = 1;
+        if (job->parent == NULL) ++count;
     }
     mtx_unlock(&control->mutex);
     if (!exhausted) return 1;
+    if (count == 0) return 1;
     if (count > SIZE_MAX / sizeof(*ordered)) return 0;
     ordered = (ParallelJob **) malloc(count * sizeof(*ordered));
     if (ordered == NULL) return 0;
@@ -2600,10 +2678,17 @@ static int parallel_replay_budget_failures(ExecutionControl *control) {
         free(ordered);
         return 0;
     }
-    for (job = control->jobs; job != NULL; job = job->next)
-        if (!job->child_released) ordered[index++] = job;
+    for (job = control->jobs; job != NULL; job = job->next) {
+        if (job->child_released || job->parent != NULL) continue;
+        job->replay_prune = 1;
+        ordered[index++] = job;
+    }
     mtx_unlock(&control->mutex);
     if (index != count) {
+        free(ordered);
+        return 0;
+    }
+    if (!parallel_discard_replayed_descendants(control)) {
         free(ordered);
         return 0;
     }
@@ -2714,16 +2799,22 @@ static int64_t rt_parallel_call(int64_t function_index, int64_t raw_arguments,
     job->child.effect_instance_index_capacity =
         active_runtime->effect_instance_index_capacity;
     job->child.execution = control;
+    job->child.parallel_job = job;
     job->child.is_parallel_worker = 1;
+    job->child.deterministic_parallel =
+        active_runtime->deterministic_parallel;
     job->child.nullary_values = active_runtime->nullary_values;
     job->child.call_depth = active_runtime->call_depth;
     job->entry_call_depth = active_runtime->call_depth;
     job->wrapper = (NativeWrapper) active_runtime->function_wrappers[function_index];
     job->argument_count = (uint32_t) count;
+    job->parent = active_runtime->parallel_job;
     if (!snapshot_parallel_arguments(
             &job->argument_snapshot, active_runtime,
             (Value **) (intptr_t) raw_arguments, job->argument_count,
             &job->arguments)) {
+        if (job->argument_snapshot.budget_exhausted)
+            active_runtime->budget_exhausted = 1;
         if (active_runtime->diagnostic[0] == '\0')
             fail(active_runtime, "%s",
                  job->argument_snapshot.diagnostic[0] == '\0'
@@ -2783,7 +2874,10 @@ static int64_t rt_parallel_join(int64_t raw_future, int64_t u1,
     job = (ParallelJob *) future->function;
     future->function = NULL;
     if (active_runtime->is_parallel_worker) {
-        if (!parallel_start_pending(job->control)
+        if ((active_runtime->deterministic_parallel
+                && !parallel_job_start_inline(job))
+            || (!active_runtime->deterministic_parallel
+                && !parallel_start_pending(job->control))
             || !parallel_job_wait(job)) {
             fail(active_runtime,
                  "parallel MIR workers could not be deterministically completed");
@@ -2803,6 +2897,9 @@ static int64_t rt_parallel_join(int64_t raw_future, int64_t u1,
         failed = parallel_first_failed(job->control);
     }
     if (failed != NULL) {
+        if (failed->child.budget_exhausted
+            || failed->result_snapshot.budget_exhausted)
+            active_runtime->budget_exhausted = 1;
         if (active_runtime->diagnostic[0] == '\0')
             active_runtime->diagnostic_span = failed->child.diagnostic_span;
         fail(active_runtime, "%s", failed->child.diagnostic[0] != '\0'

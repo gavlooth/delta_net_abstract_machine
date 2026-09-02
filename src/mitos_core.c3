@@ -1041,10 +1041,33 @@ fn void add_validation_error(
 }
 
 
+struct ValidationLexicalScope
+{
+	ValidationLexicalScope* parent;
+	String[] names;
+	ParallelBinding[] parallel_bindings;
+}
+
+fn bool validation_scope_contains(
+	ValidationLexicalScope* scope,
+	String name
+) @private
+{
+	for (ValidationLexicalScope* current = scope; current; current = current.parent)
+	{
+		foreach (candidate : current.names) if (candidate == name) return true;
+		foreach (&binding : current.parallel_bindings)
+			if (binding.name == name) return true;
+	}
+	return false;
+}
+
+
 fn void validate_application(
 	Program* program,
 	ValidationConstructorIndex* constructors,
 	SurfaceExpr* expression,
+	ValidationLexicalScope* scope,
 	List{MitosDiagnostic}* diagnostics,
 	Allocator allocator
 ) @private
@@ -1054,20 +1077,21 @@ fn void validate_application(
 	if (application.callee && application.callee.kind == SURFACE_VARIABLE)
 	{
 		String callee_name = application.callee.data.variable.name;
-		if (callee_name == "superpose" && !application.arguments.len)
+		bool lexical_callee = validation_scope_contains(scope, callee_name);
+		if (!lexical_callee && callee_name == "superpose" && !application.arguments.len)
 		{
 			add_validation_error(
 				diagnostics, allocator, "superpose requires at least one branch", expression.span
 			);
 		}
-		if (callee_name == "collapse" && application.arguments.len != 1)
+		if (!lexical_callee && callee_name == "collapse" && application.arguments.len != 1)
 		{
 			add_validation_error(
 				diagnostics, allocator, "collapse expects exactly one argument", expression.span
 			);
 		}
-		ConstructorRef reference = constructors.find(application.callee.data.variable.name);
-		if (reference.found)
+		ConstructorRef reference = constructors.find(callee_name);
+		if (reference.found && !lexical_callee)
 		{
 			constructor_call = true;
 			VariantDecl* variant = &program.enums[(usz)reference.enum_index].variants[(usz)reference.variant_index];
@@ -1084,22 +1108,26 @@ fn void validate_application(
 	}
 	if (!constructor_call)
 	{
-		validate_expression(program, constructors, application.callee, diagnostics, allocator);
+		validate_expression(
+			program, constructors, application.callee, scope, diagnostics, allocator
+		);
 	}
 	foreach (argument : application.arguments)
-		validate_expression(program, constructors, argument, diagnostics, allocator);
+		validate_expression(program, constructors, argument, scope, diagnostics, allocator);
 }
 
 fn void validate_match(
 	Program* program,
 	ValidationConstructorIndex* constructors,
 	SurfaceExpr* expression,
+	ValidationLexicalScope* scope,
 	List{MitosDiagnostic}* diagnostics,
 	Allocator allocator
 ) @private
 {
 	validate_expression(
-		program, constructors, expression.data.match_expr.scrutinee, diagnostics, allocator
+		program, constructors, expression.data.match_expr.scrutinee, scope,
+		diagnostics, allocator
 	);
 	sz matched_enum = -1;
 	bool wildcard   =  false;
@@ -1184,7 +1212,13 @@ fn void validate_match(
 				}
 			}
 		}
-		validate_expression(program, constructors, arm.body, diagnostics, allocator);
+		ValidationLexicalScope arm_scope = {
+			.parent = scope,
+			.names = arm.pattern.bindings,
+		};
+		validate_expression(
+			program, constructors, arm.body, &arm_scope, diagnostics, allocator
+		);
 	}
 	if (matched_enum < 0)
 	{
@@ -1213,6 +1247,7 @@ fn void validate_expression(
 	Program* program,
 	ValidationConstructorIndex* constructors,
 	SurfaceExpr* expression,
+	ValidationLexicalScope* scope,
 	List{MitosDiagnostic}* diagnostics,
 	Allocator allocator
 ) @private
@@ -1221,9 +1256,11 @@ fn void validate_expression(
 	switch (expression.kind)
 	{
 		case SURFACE_VARIABLE:
-			ConstructorRef reference = constructors.find(expression.data.variable.name);
-			if (reference.found
-				&& program.enums[(usz)reference.enum_index].variants[(usz)reference.variant_index].parameters.len != 0)
+			String variable_name = expression.data.variable.name;
+			ConstructorRef reference = constructors.find(variable_name);
+			if (reference.found && !validation_scope_contains(scope, variable_name)
+				&& program.enums[(usz)reference.enum_index]
+					.variants[(usz)reference.variant_index].parameters.len != 0)
 			{
 				add_validation_error(
 					diagnostics,
@@ -1255,31 +1292,43 @@ fn void validate_expression(
 				break;
 			}
 		case SURFACE_LAMBDA:
+			ValidationLexicalScope lambda_scope = {
+				.parent = scope,
+				.names = expression.data.lambda.parameters,
+			};
 			validate_expression(
-				program, constructors, expression.data.lambda.body, diagnostics, allocator
+				program, constructors, expression.data.lambda.body, &lambda_scope,
+				diagnostics, allocator
 			);
 		case SURFACE_APPLICATION:
-			validate_application(program, constructors, expression, diagnostics, allocator);
+			validate_application(
+				program, constructors, expression, scope, diagnostics, allocator
+			);
 		case SURFACE_EFFECT_OPERATION:
 			foreach (argument : expression.data.effect_operation.arguments)
 			{
-				validate_expression(program, constructors, argument, diagnostics, allocator);
+				validate_expression(
+					program, constructors, argument, scope, diagnostics, allocator
+				);
 			}
 		case SURFACE_BINARY:
 			validate_expression(
-				program, constructors, expression.data.binary.left, diagnostics, allocator
+				program, constructors, expression.data.binary.left, scope,
+				diagnostics, allocator
 			);
 			validate_expression(
-				program, constructors, expression.data.binary.right, diagnostics, allocator
+				program, constructors, expression.data.binary.right, scope,
+				diagnostics, allocator
 			);
 		case SURFACE_DEFINITION:
+			DefinitionExpr* definition = &expression.data.definition;
 			for (
-				SurfaceExpr* nested = expression.data.definition.body;
+				SurfaceExpr* nested = definition.body;
 				nested && nested.kind == SURFACE_DEFINITION;
 				nested = nested.data.definition.body
 			)
 			{
-				if (nested.data.definition.name == expression.data.definition.name)
+				if (nested.data.definition.name == definition.name)
 				{
 					add_validation_error(
 						diagnostics,
@@ -1290,13 +1339,21 @@ fn void validate_expression(
 				}
 			}
 			validate_expression(
-				program, constructors, expression.data.definition.value, diagnostics, allocator
+				program, constructors, definition.value, scope, diagnostics, allocator
 			);
+			String[1] definition_name = { definition.name };
+			ValidationLexicalScope definition_scope = {
+				.parent = scope,
+				.names = definition_name[..],
+			};
 			validate_expression(
-				program, constructors, expression.data.definition.body, diagnostics, allocator
+				program, constructors, definition.body, &definition_scope,
+				diagnostics, allocator
 			);
 		case SURFACE_MATCH:
-			validate_match(program, constructors, expression, diagnostics, allocator);
+			validate_match(
+				program, constructors, expression, scope, diagnostics, allocator
+			);
 		case SURFACE_PARALLEL:
 			if (expression.data.parallel.bindings.len < 2)
 			{
@@ -1307,6 +1364,7 @@ fn void validate_expression(
 					expression.span
 				);
 			}
+			ParallelBinding[] parallel_bindings = expression.data.parallel.bindings;
 			foreach (binding_index, &binding : expression.data.parallel.bindings)
 			{
 				for (sz previous_index = 0; previous_index < binding_index; previous_index++)
@@ -1321,14 +1379,22 @@ fn void validate_expression(
 						);
 					}
 				}
-				validate_expression(program, constructors, binding.value, diagnostics, allocator);
+				validate_expression(
+					program, constructors, binding.value, scope, diagnostics, allocator
+				);
 			}
+			ValidationLexicalScope parallel_scope = {
+				.parent = scope,
+				.parallel_bindings = parallel_bindings,
+			};
 			validate_expression(
-				program, constructors, expression.data.parallel.result, diagnostics, allocator
+				program, constructors, expression.data.parallel.result, &parallel_scope,
+				diagnostics, allocator
 			);
 		case SURFACE_HANDLER:
 			validate_expression(
-				program, constructors, expression.data.handler.handled, diagnostics, allocator
+				program, constructors, expression.data.handler.handled, scope,
+				diagnostics, allocator
 			);
 			foreach (clause_index, &clause : expression.data.handler.clauses)
 			{
@@ -1341,7 +1407,14 @@ fn void validate_expression(
 						add_validation_error(diagnostics, allocator, "duplicate handler operation clause", clause.span);
 					}
 				}
-				validate_expression(program, constructors, clause.body, diagnostics, allocator);
+				ValidationLexicalScope clause_scope = {
+					.parent = scope,
+					.names = clause.parameters,
+				};
+				validate_expression(
+					program, constructors, clause.body, &clause_scope,
+					diagnostics, allocator
+				);
 			}
 			if (!expression.data.handler.return_clause.body)
 			{
@@ -1349,14 +1422,23 @@ fn void validate_expression(
 			}
 			else
 			{
+				String[1] return_name = {
+					expression.data.handler.return_clause.parameter,
+				};
+				ValidationLexicalScope return_scope = {
+					.parent = scope,
+					.names = return_name[..],
+				};
 				validate_expression(
 					program, constructors,
-					expression.data.handler.return_clause.body, diagnostics, allocator
+					expression.data.handler.return_clause.body, &return_scope,
+					diagnostics, allocator
 				);
 			}
 		case SURFACE_RESUME:
 			validate_expression(
-				program, constructors, expression.data.resume.value, diagnostics, allocator
+				program, constructors, expression.data.resume.value, scope,
+				diagnostics, allocator
 			);
 		default:
 	}
@@ -1605,7 +1687,10 @@ fn MitosDiagnostic[] validate_program(Program* program, Allocator allocator = me
 				add_validation_error(&diagnostics, allocator, "main must have no parameters", function.span);
 			}
 		}
-		validate_expression(program, &constructors, function.body, &diagnostics, allocator);
+		ValidationLexicalScope function_scope = { .names = function.parameters };
+		validate_expression(
+			program, &constructors, function.body, &function_scope, &diagnostics, allocator
+		);
 	}
 	if (!found_main)
 	{

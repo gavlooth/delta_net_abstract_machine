@@ -1795,7 +1795,7 @@ main():
     Pick.choose(): resume(A)
     return(value of Choice): value
   end
-  handle Relay.invoke(match choice:
+  handle handle Relay.invoke(match choice:
     A:
       do() of I64 does Reader:
         Reader.read()
@@ -1806,6 +1806,9 @@ main():
       end
   end):
     Relay.invoke(g of Function): g()
+    return(value of I64): value
+  end:
+    Reader.read(): resume(42)
     return(value of I64): value
   end
 end
@@ -5391,3 +5394,722 @@ end
 }
 
 
+fn void repeated_builtin_registry_and_lowering_preserve_declaration_identity() @test
+{
+	MitosParseResult parsed = mitos::parse_program(
+		"type I64\nmain():\n  1\nend\n", mem
+	);
+	defer parsed.deinit();
+	assert(parsed.ok());
+	assert(parsed.program.types.len == 1);
+	mitos::SymbolKey original = mitos::clone_symbol_key(
+		&parsed.program.types[0].key, mem
+	);
+	defer original.deinit(mem);
+
+	for (usz iteration = 0; iteration < 2; iteration++)
+	{
+		TypeRegistryBuildResult types =
+			mitos::build_type_registry(&parsed.program, mem);
+		assert(types.ok());
+		assert(mitos::find_type(&types.registry, "I64")
+			== mitos::TYPE_ID_I64);
+		assert(mitos::symbol_key_equal(
+			&parsed.program.types[0].key, &original
+		));
+		types.deinit();
+
+		DeltaProgramBuildResult lowered =
+			mitos::lower_delta_program(&parsed.program, mem);
+		assert(lowered.ok());
+		assert(mitos::symbol_key_equal(
+			&parsed.program.types[0].key, &original
+		));
+		lowered.deinit();
+	}
+}
+
+
+fn void lexical_factories_and_patterns_preserve_closure_provenance() @test
+{
+	String[4] sources = {
+		`enum Token:
+  Box(value of I64)
+end
+main():
+  Box := do(value of I64) of I64:
+    value + 1
+  end
+  typeOf := do(value of I64) of I64:
+    value + 2
+  end
+  Box(19) + typeOf(20)
+end
+`,
+		`effect Reader:
+  read() of I64
+end
+main():
+  make := do(offset of I64):
+    do() of I64 does Reader:
+      Reader.read() + offset
+    end
+  end
+  f := make(1)
+  handle f():
+    Reader.read(): resume(41)
+    return(value of I64): value
+  end
+end
+`,
+		`enum Box:
+  Box(value)
+end
+factory(value of T):
+  Box(do() of T:
+    value
+  end)
+end
+main():
+  match factory(42):
+    Box(f): f()
+  end
+end
+`,
+		`enum Token:
+  Box(value)
+  Other(value)
+end
+effect Reader:
+  read() of I64
+end
+main():
+  Box := do(f of Function) of Token:
+    Other(f)
+  end
+  token := Box(do() of I64 does Reader:
+    Reader.read()
+  end)
+  match token:
+    Other(f):
+      handle f():
+        Reader.read(): resume(42)
+        return(value of I64): value
+      end
+    Box(f): 0
+  end
+end
+`,
+	};
+	foreach (source : sources) assert_generic_and_jit_result(source, "42");
+}
+
+
+fn void unreachable_effectful_callsite_does_not_pollute_pure_higher_order_call() @test
+{
+	assert_generic_and_jit_result(
+		`effect Reader:
+  read() of I64
+end
+apply(f of Function) of I64:
+  f()
+end
+pure() of I64:
+  apply(do() of I64:
+    42
+  end)
+end
+impure() of I64:
+  apply(do() of I64 does Reader:
+    Reader.read()
+  end)
+end
+main():
+  pure()
+end
+`,
+		"42"
+	);
+}
+
+
+fn void closure_producers_reach_handler_completeness() @test
+{
+	String[4] sources = {
+		`effect Reader:
+  read() of I64
+end
+invoke(f of Function) of I64:
+  handle f():
+    return(value of I64): value
+  end
+end
+main():
+  f := do() of I64 does Reader:
+    Reader.read()
+  end
+  invoke(f)
+end
+`,
+		`effect Reader:
+  read() of I64
+end
+make():
+  do() of I64 does Reader:
+    Reader.read()
+  end
+end
+invoke(f of Function) of I64:
+  handle f():
+    return(value of I64): value
+  end
+end
+main():
+  invoke(make())
+end
+`,
+		`effect Reader:
+  read() of I64
+end
+invoke(f of Function) of I64:
+  handle f():
+    return(value of I64): value
+  end
+end
+main():
+  first := do() of I64 does Reader:
+    Reader.read()
+  end
+  second := do() of I64 does Reader:
+    Reader.read() + 1
+  end
+  invoke(superpose(first, second))
+end
+`,
+		`effect Reader:
+  read() of I64
+end
+make():
+  parallel:
+    f := do() of I64:
+      leaf()
+    end
+    zero := 0
+    f
+  end
+end
+invoke(f of Function) of I64:
+  handle f():
+    return(value of I64): value
+  end
+end
+main():
+  invoke(make())
+end
+leaf() of I64:
+  Reader.read()
+end
+`,
+	};
+	foreach (source : sources)
+	{
+		MitosParseResult parsed = mitos::parse_program(source, mem);
+		assert(parsed.ok());
+		DeltaProgramBuildResult rejected =
+			mitos::lower_delta_program(&parsed.program, mem);
+		assert(!rejected.ok());
+		bool missing = false;
+		foreach (&diagnostic : rejected.diagnostics)
+		{
+			if (diagnostic.message == "handler is missing an operation clause")
+			{
+				missing = true;
+			}
+		}
+		assert(missing);
+		rejected.deinit();
+		parsed.deinit();
+	}
+}
+
+
+fn void handler_parameter_annotations_are_validated() @test
+{
+	String[2] sources = {
+		`effect Reader:
+  read(value of I64) of I64
+end
+main():
+  handle Reader.read(1):
+    Reader.read(value of String): resume(42)
+    return(value of I64): value
+  end
+end
+`,
+		`effect Reader:
+  read(value of I64) of I64
+end
+main():
+  handle Reader.read(1):
+    Reader.read(value of MissingType): resume(42)
+    return(value of I64): value
+  end
+end
+`,
+	};
+	String[2] expected = {
+		"type assertion failed: expected String, received I64",
+		"unknown nominal type",
+	};
+	foreach (index, source : sources)
+	{
+		MitosParseResult parsed = mitos::parse_program(source, mem);
+		assert(parsed.ok());
+		DeltaProgramBuildResult rejected =
+			mitos::lower_delta_program(&parsed.program, mem);
+		assert(!rejected.ok());
+		bool found = false;
+		foreach (&diagnostic : rejected.diagnostics)
+		{
+			if (diagnostic.message == expected[index]) found = true;
+		}
+		assert(found);
+		rejected.deinit();
+		parsed.deinit();
+	}
+}
+
+
+fn void mir_matches_concrete_parameterized_effect_instances() @test
+{
+	assert_generic_and_jit_result(
+		`effect Echo of T:
+  echo(value of T) of T
+end
+main() does Echo of I64:
+  handle Echo.echo(1):
+    Echo.echo(value of I64): resume(value + 41)
+    return(value of I64): value
+  end
+end
+`,
+		"42"
+	);
+}
+
+
+fn void aot_container_nested_decode_and_typed_metadata_fail_closed() @test
+{
+	char[160] artifact_buffer;
+	char[160] writer_buffer;
+	char[160] forged_buffer;
+	String artifact_path = unique_aot_test_path(
+		artifact_buffer[..], "typed-mutations-valid"
+	);
+	String writer_path = unique_aot_test_path(
+		writer_buffer[..], "typed-mutations-writer"
+	);
+	String forged_path = unique_aot_test_path(
+		forged_buffer[..], "typed-mutations-forged"
+	);
+	reserve_aot_test_path(artifact_path);
+	reserve_aot_test_path(writer_path);
+	reserve_aot_test_path(forged_path);
+	defer (void)libc::remove(artifact_path.zstr_tcopy());
+	defer (void)libc::remove(writer_path.zstr_tcopy());
+	defer (void)libc::remove(forged_path.zstr_tcopy());
+
+	String source = `type InnerDecode of T:
+  value of T
+end
+type OuterDecode of T:
+  value of T
+end
+effect Reader:
+  read() of I64
+end
+ask() of I64:
+  Reader.read()
+end
+combine(value of OuterDecode of InnerDecode of I64, spare of I64) of I64:
+  spare + 1
+end
+main():
+  ignored := handle ask():
+    Reader.read(): resume(0)
+    return(value of I64): value
+  end
+  combine(OuterDecode(InnerDecode(1)), 41)
+end
+`;
+	MitosParseResult parsed = mitos::parse_program(source, mem);
+	defer parsed.deinit();
+	assert(parsed.ok());
+	DeltaProgramBuildResult lowered =
+		mitos::lower_delta_program(&parsed.program, mem);
+	defer lowered.deinit();
+	assert(lowered.ok());
+	MitosAotResult written = delta_net_abstract_machine::write_mitos_aot(
+		&lowered.program, artifact_path, mem
+	);
+	assert(written.status == mitos_mir::MirStatus.NATIVE);
+	written.free();
+	MitosAotResult valid = delta_net_abstract_machine::execute_mitos_aot(
+		artifact_path, mem
+	);
+	assert(valid.status == mitos_mir::MirStatus.NATIVE);
+	assert(valid.result == "42");
+	valid.free();
+
+	char[] emitted = file::load(mem, artifact_path)!!;
+	defer alloc::free(mem, emitted);
+	char[] forged = alloc::new_array(mem, char, (sz)emitted.len);
+	defer alloc::free(mem, forged);
+	foreach (index, byte : emitted) forged[(usz)index] = byte;
+	test_write_u32_le(forged, 12, 1);
+	file::save(forged_path, forged)!!;
+	MitosAotResult future_minor =
+		delta_net_abstract_machine::execute_mitos_aot(forged_path, mem);
+	assert(future_minor.status == mitos_mir::MirStatus.ERROR);
+	assert(future_minor.diagnostic
+		== "unsupported AOT artifact minor version; expected AOT v4.0");
+	future_minor.free();
+
+	usz types_record = 0;
+	usz types_payload = 0;
+	usz types_length = 0;
+	usz record_offset = 28;
+	while (record_offset <= emitted.len && emitted.len - record_offset >= 16)
+	{
+		ulong payload_u64 = test_u64_le(emitted, record_offset + 8);
+		assert(payload_u64 <= (ulong)usz::max);
+		usz payload_length = (usz)payload_u64;
+		assert(payload_length <= emitted.len - record_offset - 16);
+		if (test_u32_le_equals(
+			emitted, record_offset, (uint)mitos::DELTA_RECORD_TYPES
+		))
+		{
+			types_record = record_offset;
+			types_payload = record_offset + 16;
+			types_length = payload_length;
+			break;
+		}
+		record_offset += 16 + payload_length;
+	}
+	assert(types_record != 0 && types_payload != 0 && types_length > 1);
+	usz removed_byte = types_payload + types_length - 1;
+	assert(removed_byte < emitted.len);
+	char[] partial_bytes = alloc::new_array(
+		mem, char, (sz)(emitted.len - 1)
+	);
+	defer alloc::free(mem, partial_bytes);
+	for (usz index = 0; index < removed_byte; index++)
+	{
+		partial_bytes[index] = emitted[index];
+	}
+	for (usz index = removed_byte; index < partial_bytes.len; index++)
+	{
+		partial_bytes[index] = emitted[index + 1];
+	}
+	test_write_u64_le(partial_bytes, 20, (ulong)partial_bytes.len);
+	test_write_u64_le(
+		partial_bytes, types_record + 8, (ulong)(types_length - 1)
+	);
+	file::save(forged_path, partial_bytes)!!;
+	TrackingAllocator tracker;
+	tracker.init(mem);
+	MitosAotResult partial =
+		delta_net_abstract_machine::execute_mitos_aot(forged_path, &tracker);
+	assert(partial.status == mitos_mir::MirStatus.ERROR);
+	partial.free();
+	assert(tracker.allocation_count() == 0);
+	assert(!tracker.has_leaks());
+	tracker.free();
+
+	assert(lowered.program.primitives.len > 0);
+	mitos::DeltaPrimitiveDescriptor* primitive =
+		&lowered.program.primitives[0];
+	assert(primitive.name == "add");
+	assert(primitive.parameters.len == 2);
+	mitos::TypeId original_parameter = primitive.parameters[0];
+	primitive.parameters[0] = mitos::TYPE_ID_BOOL;
+	MitosAotResult primitive_type =
+		delta_net_abstract_machine::write_mitos_aot(
+			&lowered.program, writer_path, mem
+		);
+	primitive.parameters[0] = original_parameter;
+	assert(primitive_type.status == mitos_mir::MirStatus.ERROR);
+	assert(primitive_type.diagnostic
+		== "AOT v4 requires a valid complete DeltaProgram");
+	primitive_type.free();
+
+	mitos::DeltaNode* primitive_node = null;
+	foreach (&node : lowered.program.image.nodes)
+	{
+		if (node.kind == mitos::DeltaNodeKind.DELTA_PRIMITIVE)
+		{
+			primitive_node = node;
+			break;
+		}
+	}
+	assert(primitive_node != null);
+	mitos::TypeId original_static_type = primitive_node.static_type;
+	assert(original_static_type != mitos::TYPE_ID_BOOL);
+	primitive_node.static_type = mitos::TYPE_ID_BOOL;
+	MitosAotResult primitive_node_type =
+		delta_net_abstract_machine::write_mitos_aot(
+			&lowered.program, writer_path, mem
+		);
+	primitive_node.static_type = original_static_type;
+	assert(primitive_node_type.status == mitos_mir::MirStatus.ERROR);
+	assert(primitive_node_type.diagnostic
+		== "AOT v4 requires a valid complete DeltaProgram");
+	primitive_node_type.free();
+
+	mitos::DeltaMethodRoot* effectful_root = null;
+	foreach (&root : lowered.program.method_roots)
+	{
+		if (root.effect_row.required.len)
+		{
+			effectful_root = root;
+			break;
+		}
+	}
+	assert(effectful_root != null);
+	assert(effectful_root.function_index < lowered.program.effects.rows.len);
+	mitos::DeltaEffectRowDescriptor* effect_row =
+		&lowered.program.effects.rows[effectful_root.function_index];
+	assert(!effect_row.has_assertion && effect_row.inferred.required.len);
+
+	mitos::ResolvedEffectRow original_method_row = effectful_root.effect_row;
+	effectful_root.effect_row = { };
+	MitosAotResult method_row =
+		delta_net_abstract_machine::write_mitos_aot(
+			&lowered.program, writer_path, mem
+		);
+	effectful_root.effect_row = original_method_row;
+	assert(method_row.status == mitos_mir::MirStatus.ERROR);
+	assert(method_row.diagnostic
+		== "AOT v4 requires a valid complete DeltaProgram");
+	method_row.free();
+
+	mitos::ResolvedEffectRow original_inferred = effect_row.inferred;
+	effect_row.inferred = { };
+	MitosAotResult forged_effect_row =
+		delta_net_abstract_machine::write_mitos_aot(
+			&lowered.program, writer_path, mem
+		);
+	effect_row.inferred = original_inferred;
+	assert(forged_effect_row.status == mitos_mir::MirStatus.ERROR);
+	assert(forged_effect_row.diagnostic
+		== "AOT v4 requires a valid complete DeltaProgram");
+	forged_effect_row.free();
+}
+
+
+fn void aot_roundtrips_static_apply_provenance_and_rejects_forged_rows() @test
+{
+	char[160] factory_buffer;
+	char[160] parameter_buffer;
+	String factory_path = unique_aot_test_path(
+		factory_buffer[..], "apply-factory"
+	);
+	String parameter_path = unique_aot_test_path(
+		parameter_buffer[..], "apply-parameter"
+	);
+	reserve_aot_test_path(factory_path);
+	reserve_aot_test_path(parameter_path);
+	defer (void)libc::remove(factory_path.zstr_tcopy());
+	defer (void)libc::remove(parameter_path.zstr_tcopy());
+	String[2] sources = {
+		`effect Reader:
+  read() of I64
+end
+make():
+  do() of I64 does Reader:
+    Reader.read()
+  end
+end
+main():
+  f := make()
+  handle f():
+    Reader.read(): resume(42)
+    return(value of I64): value
+  end
+end
+`,
+		`effect Reader:
+  read() of I64
+end
+run(f of Function) of I64:
+  f()
+end
+main():
+  handle run(do() of I64 does Reader:
+    Reader.read()
+  end):
+    Reader.read(): resume(42)
+    return(value of I64): value
+  end
+end
+`,
+	};
+	String[2] paths = { factory_path, parameter_path };
+	foreach (source_index, source : sources)
+	{
+		MitosParseResult parsed = mitos::parse_program(source, mem);
+		assert(parsed.ok());
+		DeltaProgramBuildResult lowered =
+			mitos::lower_delta_program(&parsed.program, mem);
+		assert(lowered.ok());
+		assert(!(lowered.program.feature_manifest.required
+			& mitos::DELTA_FEATURE_DYNAMIC_EFFECT_CLOSURES));
+		MitosAotResult written =
+			delta_net_abstract_machine::write_mitos_aot(
+				&lowered.program, paths[source_index], mem
+			);
+		assert(written.status == mitos_mir::MirStatus.NATIVE);
+		written.free();
+		MitosAotResult executed =
+			delta_net_abstract_machine::execute_mitos_aot(
+				paths[source_index], mem
+			);
+		assert(executed.status == mitos_mir::MirStatus.NATIVE);
+		assert(executed.result == "42");
+		executed.free();
+
+		if (source_index == 1)
+		{
+			mitos::DeltaMethodRoot* run_root = null;
+			foreach (&root : lowered.program.method_roots)
+			{
+				if (root.key.name == "run")
+				{
+					run_root = root;
+					break;
+				}
+			}
+			assert(run_root != null);
+			assert(run_root.function_index < lowered.program.effects.rows.len);
+			assert(run_root.effect_row.required.len == 1);
+			mitos::DeltaEffectRowDescriptor* row =
+				&lowered.program.effects.rows[run_root.function_index];
+			assert(row.inferred.required.len == 1);
+			bool has_apply = false;
+			foreach (&node : lowered.program.image.nodes)
+			{
+				if (node.kind == mitos::DeltaNodeKind.DELTA_APPLY)
+				{
+					has_apply = true;
+					break;
+				}
+			}
+			assert(has_apply);
+
+			mitos::ResolvedEffectRow original_root_row =
+				run_root.effect_row;
+			mitos::DeltaEffectRowDescriptor original_descriptor = *row;
+			run_root.effect_row = { };
+			row.inferred = { };
+			row.asserted = { };
+			row.has_assertion = false;
+			MitosAotResult forged =
+				delta_net_abstract_machine::write_mitos_aot(
+					&lowered.program, paths[source_index], mem
+				);
+			run_root.effect_row = original_root_row;
+			*row = original_descriptor;
+			assert(forged.status == mitos_mir::MirStatus.ERROR);
+			assert(forged.diagnostic
+				== "AOT v4 requires a valid complete DeltaProgram");
+			forged.free();
+
+			MitosAotResult retained =
+				delta_net_abstract_machine::execute_mitos_aot(
+					paths[source_index], mem
+				);
+			assert(retained.status == mitos_mir::MirStatus.NATIVE);
+			assert(retained.result == "42");
+			retained.free();
+		}
+		lowered.deinit();
+		parsed.deinit();
+	}
+}
+
+
+fn void aot_effect_operation_limit_is_symmetric_and_fail_closed() @test
+{
+	char[160] path_buffer;
+	String path = unique_aot_test_path(
+		path_buffer[..], "effect-operation-limit"
+	);
+	reserve_aot_test_path(path);
+	defer (void)libc::remove(path.zstr_tcopy());
+
+	DString source;
+	source.init(mem);
+	defer source.free();
+	source.append_string("effect Many:\n");
+	usz operation_limit = (usz)mitos::MITOS_MAX_EFFECT_OPERATIONS;
+	for (usz index = 0; index < operation_limit; index++)
+	{
+		char[64] operation;
+		source.append_string((String)io::bprintf(
+			&operation, "  op%d() of I64\n", (long)index
+		)!!);
+	}
+	source.append_string("end\nmain():\n  42\nend\n");
+
+	MitosParseResult parsed = mitos::parse_program(source.str_view(), mem);
+	assert(parsed.ok());
+	DeltaProgramBuildResult lowered =
+		mitos::lower_delta_program(&parsed.program, mem);
+	assert(lowered.ok());
+	assert(lowered.program.effects.effects.len == 1);
+	mitos::DeltaEffectDescriptor* effect =
+		&lowered.program.effects.effects[0];
+	assert(effect.operations.len == operation_limit);
+
+	MitosAotResult written = delta_net_abstract_machine::write_mitos_aot(
+		&lowered.program, path, mem
+	);
+	assert(written.status == mitos_mir::MirStatus.NATIVE);
+	written.free();
+	MitosAotResult boundary = delta_net_abstract_machine::execute_mitos_aot(
+		path, mem
+	);
+	assert(boundary.status == mitos_mir::MirStatus.NATIVE);
+	assert(boundary.result == "42");
+	boundary.free();
+	char[] canonical = file::load(mem, path)!!;
+	defer alloc::free(mem, canonical);
+
+	mitos::OperationId[] original_operations = effect.operations;
+	mitos::OperationId[] oversized = alloc::new_array(
+		mem, mitos::OperationId, (sz)(operation_limit + 1)
+	);
+	defer alloc::free(mem, oversized);
+	foreach (index, &operation : oversized)
+	{
+		*operation = original_operations[
+			(usz)index < operation_limit ? (usz)index : operation_limit - 1
+		];
+	}
+	effect.operations = oversized;
+	MitosAotResult rejected = delta_net_abstract_machine::write_mitos_aot(
+		&lowered.program, path, mem
+	);
+	effect.operations = original_operations;
+	assert(rejected.status == mitos_mir::MirStatus.ERROR);
+	assert(rejected.diagnostic
+		== "AOT v4 program exceeds its cardinality, string, or cumulative byte limits");
+	rejected.free();
+
+	char[] retained = file::load(mem, path)!!;
+	defer alloc::free(mem, retained);
+	assert(retained.len == canonical.len);
+	foreach (index, byte : retained) assert(byte == canonical[index]);
+	lowered.deinit();
+	parsed.deinit();
+}
